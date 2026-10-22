@@ -1,0 +1,4 @@
+# Windows PowerShell 5.1 scripts: keep CRLF (and the UTF-8 BOM the script is saved with)
+*.ps1 text eol=crlf
+*.md  text eol=crlf
+*.png binary
