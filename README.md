@@ -34,9 +34,10 @@ studies split across folders, duplicated images, incomplete series and copies in
   a hash of the StudyInstanceUID, so the same study always has the same tag in every folder and run.
 - **Problems** (appended to the comments with `⚠`, and listed in the tree's *Problems* window):
   - **Study split across folders**: the same study in more than one separate folder.
-  - **Duplicated files**: same StudyInstanceUID and SOPInstanceUID, then same size and SHA-256, then a
-    full byte-by-byte comparison, so a hash collision can never produce a false duplicate. Copies with
-    different contents are reported apart.
+  - **Duplicated files**: same StudyInstanceUID and SOPInstanceUID, then same size, then a full
+    byte-by-byte comparison (all the copies read side by side in a single pass, stopping at the first
+    difference), so two different files can never produce a false duplicate. Copies with different
+    contents are reported apart.
   - **Incomplete series**: a folder missing InstanceNumbers of a series, compared with the whole tree
     (e.g. a partial copy of a series that is complete elsewhere).
   - **Copies in other counted locations**: every count keeps an index of its files (path, size, date

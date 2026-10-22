@@ -266,7 +266,23 @@ namespace DicomStudyCount
         public const string NoDicomText = "No DICOMs.";
         public const string EmptyText = "---";
         const string Marker = "DicomStudyCount";
-        static readonly object sync = new object();
+
+        // One lock per folder (striped by path), not one for all: different folders are written in
+        // parallel, which is several times faster (the shell API takes ~7 ms per folder)
+        static readonly object[] locks = CreateLocks(256);
+
+        static object[] CreateLocks(int n)
+        {
+            var l = new object[n];
+            for (int i = 0; i < n; i++) l[i] = new object();
+            return l;
+        }
+
+        static object LockFor(string dir)
+        {
+            int h = StringComparer.OrdinalIgnoreCase.GetHashCode(dir.TrimEnd('\\'));
+            return locks[(h & 0x7FFFFFFF) % locks.Length];
+        }
 
         public const char Warning = '⚠';
 
@@ -318,7 +334,7 @@ namespace DicomStudyCount
         public static void Set(string dir, string text)
         {
             string ini = Path.Combine(dir, "desktop.ini");
-            lock (sync)
+            lock (LockFor(dir))
             {
                 var before = File.GetAttributes(dir);
                 bool hadMarker = File.Exists(ini) && Native.ReadIni(ini, Marker, "Generated") != "";
@@ -365,7 +381,7 @@ namespace DicomStudyCount
         public static bool Clear(string dir)
         {
             string ini = Path.Combine(dir, "desktop.ini");
-            lock (sync)
+            lock (LockFor(dir))
             {
                 if (!File.Exists(ini) || Native.ReadIni(ini, Marker, "Generated") == "") return false;
                 Native.SetFolderInfoTip(dir, "");       // clears the column in Explorer
@@ -593,40 +609,56 @@ namespace DicomStudyCount
         }
     }
 
-    // Byte-exact comparison of two files: same size, then same SHA-256 (a quick filter that rejects
-    // different files without comparing them), then a full byte-by-byte comparison, so a hash
-    // collision can never make two different files look identical
+    // Byte-exact comparison: same size, then a full byte-by-byte comparison of the contents, so two
+    // different files can never look identical. All the files of a group are read side by side in a
+    // single pass: every byte is read once, and the comparison stops at the first difference.
     public static class FileCompare
     {
+        const int BlockSize = 262144;
+        const int Batch = 16;       // files compared at a time with the first one (open files, memory)
+
+        [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)]
+        static extern int memcmp(byte[] a, byte[] b, UIntPtr count);
+
         public static bool Identical(string a, string b)
+        {
+            return AllIdentical(new[] { a, b });
+        }
+
+        public static bool AllIdentical(IList<string> files)
         {
             try
             {
-                if (new FileInfo(a).Length != new FileInfo(b).Length) return false;
-                if (Sha256(a) != Sha256(b)) return false;
-                using (var sa = new FileStream(a, FileMode.Open, FileAccess.Read, FileShare.Read, 65536))
-                using (var sb = new FileStream(b, FileMode.Open, FileAccess.Read, FileShare.Read, 65536))
+                long size = new FileInfo(files[0]).Length;
+                for (int i = 1; i < files.Count; i++)
+                    if (new FileInfo(files[i]).Length != size) return false;
+                for (int start = 1; start < files.Count; start += Batch)
                 {
-                    var ba = new byte[65536];
-                    var bb = new byte[65536];
-                    while (true)
+                    int count = Math.Min(Batch, files.Count - start);
+                    var streams = new FileStream[count + 1];
+                    try
                     {
-                        int na = ReadFull(sa, ba);
-                        int nb = ReadFull(sb, bb);
-                        if (na != nb) return false;
-                        if (na == 0) return true;
-                        for (int i = 0; i < na; i++) if (ba[i] != bb[i]) return false;
+                        for (int i = 0; i <= count; i++)
+                            streams[i] = new FileStream(i == 0 ? files[0] : files[start + i - 1], FileMode.Open,
+                                                        FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan);
+                        var first = new byte[BlockSize];
+                        var other = new byte[BlockSize];
+                        while (true)
+                        {
+                            int n = ReadFull(streams[0], first);
+                            for (int i = 1; i <= count; i++)
+                                if (ReadFull(streams[i], other) != n || memcmp(first, other, (UIntPtr)n) != 0) return false;
+                            if (n == 0) break;
+                        }
+                    }
+                    finally
+                    {
+                        foreach (var s in streams) if (s != null) s.Dispose();
                     }
                 }
+                return true;
             }
             catch (Exception) { return false; }
-        }
-
-        static string Sha256(string path)
-        {
-            using (var sha = System.Security.Cryptography.SHA256.Create())
-            using (var s = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536))
-                return Convert.ToBase64String(sha.ComputeHash(s));
         }
 
         static int ReadFull(Stream s, byte[] buffer)
@@ -695,12 +727,14 @@ namespace DicomStudyCount
                 p.CountingShown = true;
                 var deeper = nodes.FindAll(n => n.Depth >= 2);
                 deeper.Sort((a, b) => a.Depth.CompareTo(b.Depth));     // the order within a level does not matter
+                // A few threads, so the marking does not take them all from the reading
+                var markOpts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads / 4) };
                 marker = Task.Factory.StartNew(() =>
-                {
-                    foreach (var n in deeper)
+                    Parallel.ForEach(Partitioner.Create(deeper, true), markOpts, n =>
+                    {
                         lock (n.CommentSync)
                             if (!n.Finished) TrySetComment(n.Path, FolderComments.CountingText, p);
-                }, TaskCreationOptions.LongRunning);
+                    }), TaskCreationOptions.LongRunning);
             }
 
             // A folder is finished once all its files and subfolders are finished
@@ -880,7 +914,7 @@ namespace DicomStudyCount
             // Same image copied (identical bytes) or re-processed/anonymized (different bytes)?
             // (candidates already share StudyInstanceUID and SOPInstanceUID)
             var identical = new ConcurrentDictionary<string, bool>();
-            Parallel.ForEach(copies, kv => identical[kv.Key] = AllIdentical(kv.Value));
+            Parallel.ForEach(copies, kv => identical[kv.Key] = FileCompare.AllIdentical(kv.Value));
 
             var sets = new Dictionary<string, DuplicateSet>(StringComparer.OrdinalIgnoreCase);
             int duplicatedFiles = 0;
@@ -939,6 +973,7 @@ namespace DicomStudyCount
             }
 
             if (!writeComments) return;
+            var rewrites = new List<KeyValuePair<string, string>>();    // folder -> comment with warnings
             foreach (var n in nodes)
             {
                 if (n.BaseComment == null) continue;
@@ -975,8 +1010,9 @@ namespace DicomStudyCount
                     warn.Append("  " + FolderComments.Warning + " " + n.ExternalFiles + " also in other locations");
                     if (n.ExternalDifferent > 0) warn.Append(" (" + n.ExternalDifferent + " differ)");
                 }
-                if (warn.Length > 0 || changed) TrySetComment(n.Path, n.BaseComment + warn, p);
+                if (warn.Length > 0 || changed) rewrites.Add(new KeyValuePair<string, string>(n.Path, n.BaseComment + warn));
             }
+            Parallel.ForEach(rewrites, kv => TrySetComment(kv.Key, kv.Value, p));
         }
 
         // Incomplete series: for every series, the range of InstanceNumbers seen in the whole tree
@@ -1137,14 +1173,6 @@ namespace DicomStudyCount
             GlobalIndex.Save(ownIndex, root, entries);
             result.External = new List<ExternalCopySet>(sets.Values);
             result.External.Sort((a, b) => b.Files.CompareTo(a.Files));
-        }
-
-        // True if all the files have exactly the same contents (see FileCompare.Identical)
-        static bool AllIdentical(List<string> files)
-        {
-            for (int i = 1; i < files.Count; i++)
-                if (!FileCompare.Identical(files[0], files[i])) return false;
-            return true;
         }
 
         // The folder whose study is most "at home" there: the one whose topmost single-study
