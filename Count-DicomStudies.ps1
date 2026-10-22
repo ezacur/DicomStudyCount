@@ -264,6 +264,7 @@ namespace DicomStudyCount
     {
         public const string CountingText = "Counting StudyUIDs...";
         public const string NoDicomText = "No DICOMs found";
+        public const string EmptyText = "Empty";
         const string Marker = "DicomStudyCount";
         static readonly object sync = new object();
 
@@ -660,27 +661,54 @@ namespace DicomStudyCount
             var sopFirstFile = new ConcurrentDictionary<string, string>();         // "StudyUID|SOPInstanceUID" -> first file seen
             var sopCopies = new ConcurrentBag<KeyValuePair<string, string>>();     // same key, another file with it
 
-            // 1) Full folder tree (pre-order) and list of files grouped by folder
+            // 1) Mark as "counting" what Explorer is showing (the folder and its subfolders) before
+            //    anything else: marking costs ~10 ms per folder, too slow for the whole tree up front
+            var marked = System.Diagnostics.Stopwatch.StartNew();
+            if (writeComments)
+            {
+                TrySetComment(root, FolderComments.CountingText, p);
+                try
+                {
+                    foreach (var d in Directory.GetDirectories(root))
+                        if (!string.Equals(Path.GetFileName(d), "_DicomQuarantine", StringComparison.OrdinalIgnoreCase))
+                            TrySetComment(d, FolderComments.CountingText, p);
+                }
+                catch (Exception) { }   // reported as inaccessible by BuildTree
+            }
+
+            // 2) Full folder tree (pre-order) and list of files grouped by folder
             List<FolderNode> nodes = BuildTree(root, p.InaccessibleDirs);
             var work = new List<KeyValuePair<FolderNode, string>>();
             foreach (var n in nodes)
                 foreach (var f in n.Files) work.Add(new KeyValuePair<FolderNode, string>(n, f));
             p.TotalFiles = work.Count;
 
-            // 2) Mark every folder as "counting"
+            // The deeper folders are marked in the background while counting, shallowest first;
+            // the folders already finished are skipped
+            Task marker = null;
             if (writeComments)
             {
-                foreach (var n in nodes) TrySetComment(n.Path, FolderComments.CountingText, p);
                 // Explorer only repaints after ~0.6 s without change notifications; without this
                 // pause "Counting..." would run straight into the results and never be shown
-                Thread.Sleep(1000);
+                int wait = 1000 - (int)marked.ElapsedMilliseconds;
+                if (wait > 0) Thread.Sleep(wait);
                 p.CountingShown = true;
+                var deeper = nodes.FindAll(n => n.Depth >= 2);
+                deeper.Sort((a, b) => a.Depth.CompareTo(b.Depth));     // the order within a level does not matter
+                marker = Task.Factory.StartNew(() =>
+                {
+                    foreach (var n in deeper)
+                        lock (n.CommentSync)
+                            if (!n.Finished) TrySetComment(n.Path, FolderComments.CountingText, p);
+                }, TaskCreationOptions.LongRunning);
             }
 
             // A folder is finished once all its files and subfolders are finished
             Action<FolderNode> finish = null;
             finish = node =>
             {
+                // From here on the background marking no longer writes "Counting..." over it
+                lock (node.CommentSync) node.Finished = true;
                 string single = null;
                 foreach (var u in node.Uids) { single = u; break; }
                 node.FinalStudies = node.Uids.Count;
@@ -696,12 +724,9 @@ namespace DicomStudyCount
                 });
                 if (writeComments)
                 {
-                    // Without DICOM: the folder that was counted says so; subfolders stay empty
+                    // Without DICOM: "Empty" when the whole subtree has no files at all
                     if (node.Uids.Count == 0)
-                    {
-                        if (node.Parent == null) TrySetComment(node.Path, FolderComments.NoDicomText, p);
-                        else TryClearComment(node.Path, p);
-                    }
+                        TrySetComment(node.Path, node.TotalFiles == 0 ? FolderComments.EmptyText : FolderComments.NoDicomText, p);
                     else
                     {
                         string seriesNumber = null, seriesDescription = null;
@@ -797,6 +822,8 @@ namespace DicomStudyCount
                 Interlocked.Increment(ref p.Files);
                 if (Interlocked.Decrement(ref node.Pending) == 0) finish(node);
             });
+            // Every folder is finished by now, so the marking only has skips left
+            if (marker != null) marker.Wait();
 
             var list = new List<Study>();
             foreach (var agg in studies.Values) list.Add(agg.ToStudy());
@@ -1148,12 +1175,6 @@ namespace DicomStudyCount
             catch (Exception) { Interlocked.Increment(ref p.CommentErrors); }
         }
 
-        static void TryClearComment(string dir, ScanProgress p)
-        {
-            try { FolderComments.Clear(dir); }
-            catch (Exception) { Interlocked.Increment(ref p.CommentErrors); }
-        }
-
         static List<FolderNode> BuildTree(string root, List<string> inaccessible)
         {
             var nodes = new List<FolderNode>();
@@ -1184,6 +1205,7 @@ namespace DicomStudyCount
                 // Pushed in reverse so the stack pops them in alphabetical order
                 for (int i = dirs.Length - 1; i >= 0; i--)
                     stack.Push(new KeyValuePair<FolderNode, int>(new FolderNode(dirs[i], node), item.Value + 1));
+                node.Depth = item.Value;
                 node.ChildCount = dirs.Length;
                 node.Pending = node.Files.Length + dirs.Length;
                 node.TotalFiles = node.Files.Length;     // subfolders are added as they finish
@@ -1197,6 +1219,9 @@ namespace DicomStudyCount
         public readonly string Path;
         public readonly FolderNode Parent;
         public string[] Files = new string[0];
+        public int Depth;           // 0 = the counted folder
+        public bool Finished;       // its final comment is (being) written; guarded by CommentSync
+        public readonly object CommentSync = new object();
         public int ChildCount;
         public int Pending;         // files + subfolders still to finish
         public int DicomFiles;      // DICOM files with StudyInstanceUID in the whole subtree
@@ -1618,7 +1643,28 @@ namespace DicomStudyCount
 '@
 
 if (-not ('DicomStudyCount.Scanner' -as [type])) {
-    Add-Type -TypeDefinition $source -Language CSharp
+    # Compiling takes ~2 s, so the DLL is kept in %LOCALAPPDATA%, named after a hash of the source
+    $binDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\bin'
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($source))[0..7] | ForEach-Object { $_.ToString('x2') })
+    $dll = Join-Path $binDir "DicomStudyCount-$hash.dll"
+    try {
+        if (-not (Test-Path -LiteralPath $dll)) {
+            New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+            # Compiled under a temporary name and renamed, in case two counts start at the same time
+            $tmp = Join-Path $binDir ([Guid]::NewGuid().ToString('N') + '.dll')
+            Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $tmp -OutputType Library
+            try { Move-Item -LiteralPath $tmp -Destination $dll -ErrorAction Stop }
+            catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            # DLLs of older versions of the script (the ones still loaded are left for the next time)
+            Get-ChildItem -LiteralPath $binDir -Filter '*.dll' | Where-Object { $_.FullName -ne $dll } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+        Add-Type -LiteralPath $dll
+    }
+    catch {
+        if (-not ('DicomStudyCount.Scanner' -as [type])) { Add-Type -TypeDefinition $source -Language CSharp }
+    }
 }
 
 # Problems reports (split studies, duplicated files) live outside the scanned folders,
