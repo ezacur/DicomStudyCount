@@ -263,8 +263,8 @@ namespace DicomStudyCount
     public static class FolderComments
     {
         public const string CountingText = "Counting StudyUIDs...";
-        public const string NoDicomText = "No DICOMs found";
-        public const string EmptyText = "Empty";
+        public const string NoDicomText = "No DICOMs.";
+        public const string EmptyText = "---";
         const string Marker = "DicomStudyCount";
         static readonly object sync = new object();
 
@@ -724,7 +724,7 @@ namespace DicomStudyCount
                 });
                 if (writeComments)
                 {
-                    // Without DICOM: "Empty" when the whole subtree has no files at all
+                    // Without DICOM: "---" when the whole subtree has no files at all
                     if (node.Uids.Count == 0)
                         TrySetComment(node.Path, node.TotalFiles == 0 ? FolderComments.EmptyText : FolderComments.NoDicomText, p);
                     else
