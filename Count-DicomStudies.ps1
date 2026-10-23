@@ -1141,7 +1141,8 @@ try {
     # From the context menu a drive root arrives as 'D:"' because of the trailing backslash escaping
     $Path = $Path.Trim().Trim('"')
     if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
-    $root = (Resolve-Path -LiteralPath $Path).ProviderPath
+    # Long form: the same folder through an 8.3 short name ("ERNEST~1") must be the same location
+    $root = [DicomStudyCount.Paths]::Long((Resolve-Path -LiteralPath $Path).ProviderPath)
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "Not a folder: $root" }
 
     if ($ShowTree) {

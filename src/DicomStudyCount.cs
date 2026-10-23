@@ -740,6 +740,20 @@ namespace DicomStudyCount
 
     public static class Paths
     {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint size);
+
+        // The long form of a path ("C:\Users\ERNEST~1\x" -> "C:\Users\ErnestoCorify\x"): the same folder
+        // reached through its 8.3 short name would otherwise be another location in the index (and its
+        // files copies of themselves). The path as it is if Windows cannot tell.
+        public static string Long(string path)
+        {
+            var sb = new StringBuilder(1024);
+            uint n = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+            if (n > sb.Capacity) { sb = new StringBuilder((int)n); n = GetLongPathNameW(path, sb, (uint)sb.Capacity); }
+            return n == 0 || n > sb.Capacity ? path : sb.ToString();
+        }
+
         // The path is the folder itself or inside it
         public static bool IsUnder(string path, string folder)
         {
