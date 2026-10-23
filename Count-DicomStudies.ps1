@@ -51,6 +51,11 @@ param(
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$ClearComments,
 
+    # Shows the DICOM columns of the files in the Explorer windows open on the folder (or on its
+    # parent folder), or hides them if any is visible
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch]$ToggleColumns,
+
     # Opens a window with the folder tree and the comment of every folder (reads desktop.ini only)
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$ShowTree,
@@ -76,19 +81,52 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Context menu: a "DICOM" submenu with fixed entries (the menu cannot depend on whether the folder
+# was counted: Explorer does not read desktop.ini when it builds it). Key names set the order.
+$menuName = 'DicomStudyCount'
 $menuEntries = @(
-    @{ Name = 'CountDicomStudies'; Label = 'Count DICOM studies'; Args = '-WriteComments' },
-    @{ Name = 'ShowDicomTree'; Label = 'Show DICOM tree'; Args = '-ShowTree' },
-    @{ Name = 'CleanDicomInfo'; Label = 'Clean DICOM info'; Args = '-Clean' }
+    @{ Name = '1Count'; Label = 'Count studies'; Args = '-WriteComments' },
+    @{ Name = '2Tree'; Label = 'Show tree'; Args = '-ShowTree' },
+    @{ Name = '3Clean'; Label = 'Clean'; Args = '-Clean' },
+    @{ Name = '4Columns'; Label = 'Show/hide DICOM columns'; Args = '-ToggleColumns' }
 )
+# The DICOM columns of the files (shellext\DicomStudyCount.propdesc), in the order they are shown
+$dicomColumns = 'StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber', 'SeriesDescription',
+    'Plane', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness', 'Frames',
+    'ImageType', 'ObjectType', 'Compression', 'Protocol', 'Manufacturer', 'FrameOfReference', 'StudyDate',
+    'PatientID', 'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' |
+    ForEach-Object { "DicomStudyCount.$_" }
 $menuParents = @(
     'HKCU:\Software\Classes\Directory\shell',
     'HKCU:\Software\Classes\Directory\Background\shell'
 )
+# Entries of earlier versions, directly in the context menu
+$oldMenuNames = 'CountDicomStudies', 'ShowDicomTree', 'CleanDicomInfo'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runName = 'DicomStudyCountWatcher'
 # conhost --headless runs PowerShell without opening a console window
 $watchCommand = 'conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Watch' -f $PSCommandPath
+
+# Runs a script with administrator rights (UAC prompt unless already elevated) and shows its output
+function Invoke-Elevated([string]$script, [string[]]$arguments) {
+    # Parameter names as they are, values quoted
+    $quoted = ($arguments | ForEach-Object { if ($_ -match '^-\w+$') { $_ } else { "'" + ($_ -replace "'", "''") + "'" } }) -join ' '
+    $principal = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Invoke-Expression "& '$script' $quoted"
+        return
+    }
+    $log = [IO.Path]::GetTempFileName()
+    $command = "try { & '$script' $quoted *>&1 | Out-File -LiteralPath '$log' } catch { `$_ | Out-String | Add-Content -LiteralPath '$log'; exit 1 }"
+    try {
+        $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command
+        Get-Content -LiteralPath $log | ForEach-Object { Write-Host $_ }
+        if ($p.ExitCode -ne 0) { Write-Host "Failed: $script" -ForegroundColor Yellow }
+    }
+    catch { Write-Host "Not done (administrator rights refused): $script" -ForegroundColor Yellow }
+    finally { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue }
+}
 
 function Stop-Watcher {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
@@ -101,17 +139,43 @@ if ($Install) {
     Stop-Watcher
     Start-Process conhost.exe -ArgumentList ($watchCommand -replace '^conhost\.exe ', '')
     foreach ($parent in $menuParents) {
+        foreach ($old in $oldMenuNames) {
+            if (Test-Path -LiteralPath "$parent\$old") { Remove-Item -LiteralPath "$parent\$old" -Recurse -Force }
+        }
+        $menu = "$parent\$menuName"
+        if (Test-Path -LiteralPath $menu) { Remove-Item -LiteralPath $menu -Recurse -Force }
+        New-Item -Path $menu -Force | Out-Null
+        Set-ItemProperty -LiteralPath $menu -Name 'MUIVerb' -Value 'DICOM'
+        Set-ItemProperty -LiteralPath $menu -Name 'Icon' -Value 'imageres.dll,-68'
+        # An empty SubCommands makes it a submenu with the verbs of its "shell" subkey
+        Set-ItemProperty -LiteralPath $menu -Name 'SubCommands' -Value ''
         foreach ($entry in $menuEntries) {
-            $key = "$parent\$($entry.Name)"
+            $key = "$menu\shell\$($entry.Name)"
             # conhost --headless runs PowerShell without opening a console window
             $command = 'conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Path "%V" {1}' -f $PSCommandPath, $entry.Args
             New-Item -Path "$key\command" -Force | Out-Null
-            Set-ItemProperty -LiteralPath $key -Name '(default)' -Value $entry.Label
-            Set-ItemProperty -LiteralPath $key -Name 'Icon' -Value 'imageres.dll,-68'
+            Set-ItemProperty -LiteralPath $key -Name 'MUIVerb' -Value $entry.Label
             Set-ItemProperty -LiteralPath "$key\command" -Name '(default)' -Value $command
         }
     }
-    Write-Host 'Installed. Right-click a folder:'
+    # Icons of the DICOM files: optional, it needs the icon handler built (shellext\Build-DicomIcons.ps1)
+    $iconDll = Join-Path $PSScriptRoot 'shellext\bin\DicomIcons.dll'
+    if (Test-Path -LiteralPath $iconDll) {
+        & (Join-Path $PSScriptRoot 'shellext\Register-DicomIcons.ps1') -Dll $iconDll
+        # The columns of the DICOM files: Windows takes property handlers from HKLM only. No UAC
+        # prompt when the DLL and the column schema installed are already these ones.
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $dllHash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($iconDll))[0..7] | ForEach-Object { $_.ToString('x2') })
+        $server = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{21329A2B-09B3-4250-9103-9267877321EB}\InprocServer32')
+        $installedSchema = Join-Path $env:ProgramFiles 'DicomStudyCount\DicomStudyCount.propdesc'
+        $upToDate = $server -and [IO.Path]::GetFileName([string]$server.GetValue('')) -eq "DicomShell-$dllHash.dll" -and
+            (Test-Path -LiteralPath $installedSchema) -and
+            ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'shellext\DicomStudyCount.propdesc')).Hash)
+        if ($upToDate) { Write-Host 'DICOM columns already installed and up to date' }
+        else { Invoke-Elevated (Join-Path $PSScriptRoot 'shellext\Register-DicomProperties.ps1') @('-Dll', $iconDll) }
+    }
+    else { Write-Host 'DICOM file icons and columns not installed: build them first with shellext\Build-DicomIcons.ps1' }
+    Write-Host 'Installed. Right-click a folder: DICOM >'
     $menuEntries | ForEach-Object { Write-Host "  - $($_.Label)" }
     Write-Host '(on Windows 11 it is under "Show more options" when using the new context menu).'
     Write-Host 'Background watcher running and registered to start at logon.'
@@ -122,10 +186,16 @@ if ($Uninstall) {
     Remove-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
     Stop-Watcher
     foreach ($parent in $menuParents) {
-        foreach ($entry in $menuEntries) {
-            $key = "$parent\$($entry.Name)"
-            if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Recurse -Force }
+        foreach ($name in @($menuName) + $oldMenuNames) {
+            if (Test-Path -LiteralPath "$parent\$name") { Remove-Item -LiteralPath "$parent\$name" -Recurse -Force }
         }
+    }
+    $iconSetup = Join-Path $PSScriptRoot 'shellext\Register-DicomIcons.ps1'
+    if (Test-Path -LiteralPath $iconSetup) { & $iconSetup -Uninstall }
+    $propertySetup = Join-Path $PSScriptRoot 'shellext\Register-DicomProperties.ps1'
+    if ((Test-Path -LiteralPath $propertySetup) -and
+        [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\DicomStudyCount\PropertyHandler')) {
+        Invoke-Elevated $propertySetup @('-Uninstall')
     }
     Write-Host 'Uninstalled.'
     return
@@ -169,6 +239,29 @@ function Stop-CountsOn([string]$root) {
                 Write-Host "Stopped the count running on $p"
             }
         }
+}
+
+# Shows or hides the DICOM columns in the Explorer windows open on the folder (menu on the background
+# of a window) or on its parent folder (menu on a folder of the list): hidden if any is visible in the
+# first of those windows, shown otherwise, and the same in all of them
+function Switch-DicomColumns([string]$root) {
+    $parent = Split-Path -Path $root -Parent
+    $targets = @()
+    $windows = (New-Object -ComObject Shell.Application).Windows()
+    for ($i = 0; $i -lt $windows.Count; $i++) {
+        try {
+            $window = $windows.Item($i)
+            $windowPath = $window.Document.Folder.Self.Path
+            if ($windowPath -eq $root -or ($parent -and $windowPath -eq $parent)) { $targets += $window }
+        }
+        catch { }   # windows that are not file system folders (This PC, Home...)
+    }
+    if (-not $targets) { Write-Host "No Explorer window open on $root"; return }
+    $show = -not [DicomStudyCount.ExplorerColumns]::AnyColumnShown($targets[0], [string[]]$dicomColumns)
+    foreach ($w in $targets) {
+        try { [DicomStudyCount.ExplorerColumns]::SetColumnsShown($w, [string[]]$dicomColumns, $show) } catch { }
+    }
+    Write-Host ('DICOM columns {0} in {1} window(s)' -f $(if ($show) { 'shown' } else { 'hidden' }), $targets.Count)
 }
 
 # Adds the Comments column (and fits it to the text) in the Explorer windows open on the
@@ -562,6 +655,79 @@ namespace DicomStudyCount
             };
             cm.SetColumnInfo(ref comment, ref info);
             return !present;
+        }
+
+        [DllImport("propsys.dll", CharSet = CharSet.Unicode)]
+        static extern int PSGetPropertyKeyFromName(string name, out PROPERTYKEY key);
+
+        static IColumnManager ColumnsOf(object explorerWindow)
+        {
+            Guid sid = SID_STopLevelBrowser, iid = typeof(IShellBrowser).GUID;
+            object browser;
+            ((IComServiceProvider)explorerWindow).QueryService(ref sid, ref iid, out browser);
+            object view;
+            ((IShellBrowser)browser).QueryActiveShellView(out view);
+            return (IColumnManager)view;
+        }
+
+        static List<PROPERTYKEY> Visible(IColumnManager cm)
+        {
+            uint count;
+            cm.GetColumnCount(CM_ENUM_VISIBLE, out count);
+            var keys = new PROPERTYKEY[count];
+            cm.GetColumns(CM_ENUM_VISIBLE, keys, count);
+            return new List<PROPERTYKEY>(keys);
+        }
+
+        // The keys of the properties named (those not registered are left out)
+        static List<PROPERTYKEY> KeysOf(string[] names)
+        {
+            var keys = new List<PROPERTYKEY>();
+            foreach (var n in names)
+            {
+                PROPERTYKEY k;
+                if (PSGetPropertyKeyFromName(n, out k) == 0) keys.Add(k);
+            }
+            return keys;
+        }
+
+        static bool Contains(List<PROPERTYKEY> keys, PROPERTYKEY k)
+        {
+            foreach (var x in keys) if (x.fmtid == k.fmtid && x.pid == k.pid) return true;
+            return false;
+        }
+
+        // True if any of the columns named is visible in the window
+        public static bool AnyColumnShown(object explorerWindow, string[] names)
+        {
+            var visible = Visible(ColumnsOf(explorerWindow));
+            foreach (var k in KeysOf(names)) if (Contains(visible, k)) return true;
+            return false;
+        }
+
+        // Shows the columns named (after the visible ones, in that order, fitted to their content) or
+        // hides them; the other columns stay as they are
+        public static void SetColumnsShown(object explorerWindow, string[] names, bool show)
+        {
+            var cm = ColumnsOf(explorerWindow);
+            var wanted = KeysOf(names);
+            var columns = new List<PROPERTYKEY>();
+            foreach (var k in Visible(cm)) if (!Contains(wanted, k)) columns.Add(k);
+            if (show) columns.AddRange(wanted);
+            cm.SetColumns(columns.ToArray(), (uint)columns.Count);
+            if (!show) return;
+            foreach (var k in wanted)
+            {
+                var key = k;
+                var info = new CM_COLUMNINFO
+                {
+                    cbSize = (uint)Marshal.SizeOf(typeof(CM_COLUMNINFO)),
+                    dwMask = CM_MASK_WIDTH,
+                    uWidth = CM_WIDTH_AUTOSIZE,
+                    wszName = ""
+                };
+                cm.SetColumnInfo(ref key, ref info);
+            }
         }
 
         // Removes the Comments column from the view. Returns true if it was visible.
@@ -1039,7 +1205,7 @@ namespace DicomStudyCount
                         }
                         node.BaseComment = FolderComments.Format(node.Uids.Count, tag, studyDate, node.SeriesUids.Count,
                             seriesNumber, seriesDescription, node.DicomFiles, node.TotalFiles);
-                        TrySetComment(node.Path, node.BaseComment, p, TryIcon(node.IconColors, false));
+                        TrySetComment(node.Path, node.BaseComment, p, TryIcon(node.IconColors));
                     }
                 }
                 var parent = node.Parent;
@@ -1157,7 +1323,9 @@ namespace DicomStudyCount
 
             FindIncompleteSeries(instances, studyTags, seriesLabel, nodeByPath, result);
             result.External = new List<ExternalCopySet>();
-            if (indexDir != null) CheckOtherLocations(root, indexDir, indexEntries, nodeByPath, result);
+            // Every file with copies -> its copies, for the "duplicated in" column of the files
+            var fileCopies = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            if (indexDir != null) CheckOtherLocations(root, indexDir, indexEntries, nodeByPath, result, fileCopies);
 
             // Duplicated files: every SOPInstanceUID seen in more than one file
             var copies = new Dictionary<string, List<string>>();
@@ -1185,6 +1353,8 @@ namespace DicomStudyCount
                 var dirs = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var f in files)
                 {
+                    foreach (var other in files)
+                        if (!string.Equals(other, f, StringComparison.OrdinalIgnoreCase)) AddCopy(fileCopies, f, other, same);
                     string dir = Path.GetDirectoryName(f);
                     dirs.Add(dir);
                     duplicatedFiles++;
@@ -1211,6 +1381,8 @@ namespace DicomStudyCount
             result.Duplicates = new List<DuplicateSet>(sets.Values);
             result.Duplicates.Sort((a, b) => b.Files.CompareTo(a.Files));
             result.DuplicatedFiles = duplicatedFiles;
+            if (indexDir != null)
+                GlobalIndex.SaveCopies(Path.Combine(Path.GetDirectoryName(indexDir), "duplicates"), root, fileCopies);
 
             // Split studies: a study whose topmost single-study folders are more than one
             var locations = new Dictionary<string, List<FolderNode>>();
@@ -1233,7 +1405,7 @@ namespace DicomStudyCount
             }
 
             if (!writeComments) return;
-            var rewrites = new List<KeyValuePair<FolderNode, string>>();    // folder -> comment with warnings
+            var rewrites = new List<KeyValuePair<string, string>>();    // folder -> comment with warnings
             foreach (var n in nodes)
             {
                 if (n.BaseComment == null) continue;
@@ -1270,11 +1442,9 @@ namespace DicomStudyCount
                     warn.Append("  " + FolderComments.Warning + " " + n.ExternalFiles + " also in other locations");
                     if (n.ExternalDifferent > 0) warn.Append(" (" + n.ExternalDifferent + " differ)");
                 }
-                if (warn.Length > 0 || changed) rewrites.Add(new KeyValuePair<FolderNode, string>(n, n.BaseComment + warn));
+                if (warn.Length > 0 || changed) rewrites.Add(new KeyValuePair<string, string>(n.Path, n.BaseComment + warn));
             }
-            // With warnings, the icon gets the warning sign
-            Parallel.ForEach(rewrites, kv => TrySetComment(kv.Key.Path, kv.Value, p,
-                kv.Value.Length > kv.Key.BaseComment.Length ? TryIcon(kv.Key.IconColors, true) : null));
+            Parallel.ForEach(rewrites, kv => TrySetComment(kv.Key, kv.Value, p));
         }
 
         // Incomplete series: for every series, the range of InstanceNumbers seen in the whole tree
@@ -1358,7 +1528,8 @@ namespace DicomStudyCount
         // first checked against the disk: a file deleted, or replaced by another one (different size,
         // date or time), leaves the index. Confirmed with the same byte-exact comparison as duplicates.
         static void CheckOtherLocations(string root, string indexDir, List<IndexEntry> entries,
-                                        Dictionary<string, FolderNode> nodeByPath, ScanResult result)
+                                        Dictionary<string, FolderNode> nodeByPath, ScanResult result,
+                                        Dictionary<string, List<string>> fileCopies)
         {
             string rootSlash = root.TrimEnd('\\') + "\\";
             string ownIndex = GlobalIndex.FileFor(indexDir, root);
@@ -1401,6 +1572,7 @@ namespace DicomStudyCount
                             foreach (var m in mine)
                             {
                                 bool same = FileCompare.Identical(m, e.Path);
+                                AddCopy(fileCopies, m, e.Path, same);
                                 string myDir = Path.GetDirectoryName(m), otherDir = Path.GetDirectoryName(e.Path);
                                 ExternalCopySet set;
                                 string key = myDir + "|" + otherDir;
@@ -1437,6 +1609,14 @@ namespace DicomStudyCount
             result.External.Sort((a, b) => b.Files.CompareTo(a.Files));
         }
 
+        // A copy of a file (the same study and image); one whose bytes differ is marked so
+        static void AddCopy(Dictionary<string, List<string>> fileCopies, string file, string copy, bool identical)
+        {
+            List<string> list;
+            if (!fileCopies.TryGetValue(file, out list)) { list = new List<string>(); fileCopies[file] = list; }
+            list.Add(identical ? copy : copy + " (differs)");
+        }
+
         // The folder whose study is most "at home" there: the one whose topmost single-study
         // folder holds the most files
         static string SuggestKeep(List<string> folders, Dictionary<string, FolderNode> nodeByPath)
@@ -1467,10 +1647,10 @@ namespace DicomStudyCount
 
         // Path of the folder icon for those study colors (built if needed); null (icon left as it
         // is) if it cannot be built
-        static string TryIcon(List<int> colors, bool warning)
+        static string TryIcon(List<int> colors)
         {
             if (colors == null || colors.Count == 0) return null;
-            try { return FolderIcons.Ensure(FolderIcons.NameFor(colors, warning)); }
+            try { return FolderIcons.Ensure(FolderIcons.NameFor(colors)); }
             catch (Exception) { return null; }
         }
 
@@ -1589,10 +1769,89 @@ namespace DicomStudyCount
             }
             return forgotten;
         }
+
+        // The same for the copies of the files ("duplicated in"): its files, and its files as copies
+        // of files elsewhere. Returns the number of files whose copies were forgotten.
+        public static int ForgetCopies(string copiesDir, string folder)
+        {
+            if (!Directory.Exists(copiesDir)) return 0;
+            int forgotten = 0;
+            foreach (var file in Directory.GetFiles(copiesDir, "*.tsv"))
+            {
+                string root = GlobalIndex.RootOf(file);
+                if (root == null) continue;
+                if (Paths.IsUnder(root, folder)) { File.Delete(file); continue; }
+                forgotten += GlobalIndex.FilterCopies(file, folder, true);
+            }
+            return forgotten;
+        }
     }
 
     internal static class GlobalIndex
     {
+        // The copies of every file of a count, for the "duplicated in" column of the files (read by
+        // DicomIcons.dll): one file per counted folder, "path<TAB>copy<TAB>copy...". Like the index,
+        // this count replaces what other counts said about its own files.
+        public static void SaveCopies(string dir, string root, Dictionary<string, List<string>> copies)
+        {
+            string own = FileFor(dir, root);
+            if (Directory.Exists(dir))
+                foreach (var file in Directory.GetFiles(dir, "*.tsv"))
+                {
+                    if (string.Equals(file, own, StringComparison.OrdinalIgnoreCase)) continue;
+                    string other = RootOf(file);
+                    if (other == null) continue;
+                    if (Paths.IsUnder(other, root)) File.Delete(file);                       // counted again inside this one
+                    else if (Paths.IsUnder(root, other)) FilterCopies(file, root, false);     // its lines for this folder
+                }
+            if (copies.Count == 0) { if (File.Exists(own)) File.Delete(own); return; }
+            var lines = new List<string>();
+            foreach (var kv in copies) lines.Add(kv.Key + "\t" + string.Join("\t", kv.Value));
+            WriteCopies(dir, own, root, lines);
+        }
+
+        // Drops the lines of the files inside the folder; with references, also its files as copies of others
+        public static int FilterCopies(string file, string folder, bool references)
+        {
+            string root = null;
+            var kept = new List<string>();
+            int dropped = 0;
+            bool changed = false;
+            foreach (var line in File.ReadAllLines(file, Encoding.UTF8))
+            {
+                if (line.StartsWith("#root\t")) { root = line.Substring(6); continue; }
+                var f = line.Split('\t');
+                if (f.Length < 2 || Paths.IsUnder(f[0], folder)) { dropped++; continue; }
+                if (!references) { kept.Add(line); continue; }
+                var others = new List<string>();
+                for (int i = 1; i < f.Length; i++)
+                {
+                    string copy = f[i].EndsWith(" (differs)") ? f[i].Substring(0, f[i].Length - 10) : f[i];
+                    if (!Paths.IsUnder(copy, folder)) others.Add(f[i]);
+                }
+                if (others.Count == 0) { dropped++; continue; }
+                if (others.Count == f.Length - 1) kept.Add(line);
+                else { kept.Add(f[0] + "\t" + string.Join("\t", others)); changed = true; }
+            }
+            if (root == null || (dropped == 0 && !changed)) return 0;
+            if (kept.Count == 0) File.Delete(file);
+            else WriteCopies(Path.GetDirectoryName(file), file, root, kept);
+            return dropped;
+        }
+
+        static void WriteCopies(string dir, string file, string root, List<string> lines)
+        {
+            Directory.CreateDirectory(dir);
+            string temp = file + ".tmp";
+            using (var w = new StreamWriter(temp, false, new UTF8Encoding(false)))
+            {
+                w.WriteLine("#root\t" + root);
+                foreach (var l in lines) w.WriteLine(l);
+            }
+            if (File.Exists(file)) File.Delete(file);
+            File.Move(temp, file);
+        }
+
         public static string RootOf(string file)
         {
             try
@@ -2012,9 +2271,9 @@ namespace DicomStudyCount
 
     // Folder icons in the colors of the studies they hold, for the Name column of Explorer (desktop.ini
     // IconResource): an archive box instead of a folder; one study -> a box of its color; 2 to 5 ->
-    // vertical stripes; more -> horizontal rainbow stripes; a small warning sign in the corner when the
-    // folder has problems. The file name says what the icon is ("c05.ico", "c05-17-w.ico",
-    // "rainbow.ico"), so a lost icon is rebuilt from its name alone.
+    // vertical stripes; more -> horizontal rainbow stripes (the problems are marked in the comment
+    // only). The file name says what the icon is ("c05.ico", "c05-17.ico", "rainbow.ico"), so a lost
+    // icon is rebuilt from its name alone.
     public static class FolderIcons
     {
         // Colors chosen to be told apart at 16 px. No yellow: it would look like a plain folder, and
@@ -2045,18 +2304,13 @@ namespace DicomStudyCount
         }
 
         // Icon file name for the color indexes of the studies of a folder (in display order)
-        public static string NameFor(IList<int> colors, bool warning)
+        public static string NameFor(IList<int> colors)
         {
             if (colors.Count == 0) return null;
-            string name;
-            if (colors.Count > MaxStripes) name = "rainbow";
-            else
-            {
-                var parts = new string[colors.Count];
-                for (int i = 0; i < colors.Count; i++) parts[i] = colors[i].ToString("D2");
-                name = "c" + string.Join("-", parts);
-            }
-            return name + (warning ? "-w" : "") + ".ico";
+            if (colors.Count > MaxStripes) return "rainbow.ico";
+            var parts = new string[colors.Count];
+            for (int i = 0; i < colors.Count; i++) parts[i] = colors[i].ToString("D2");
+            return "c" + string.Join("-", parts) + ".ico";
         }
 
         // Also the icons written by another user or on another PC (other profile folder), so a count
@@ -2072,6 +2326,7 @@ namespace DicomStudyCount
         {
             string path = Path.Combine(VersionDir, name);
             if (File.Exists(path)) return path;
+            // "-w": the warning sign of earlier versions, no longer drawn
             bool warning = name.EndsWith("-w.ico", StringComparison.OrdinalIgnoreCase);
             string body = name.Substring(0, name.Length - (warning ? 6 : 4));
             List<int> colors = null;     // null = rainbow
@@ -2089,7 +2344,7 @@ namespace DicomStudyCount
             Directory.CreateDirectory(VersionDir);
             // Written under a temporary name and renamed: several threads (or counts) may build it at once
             string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            WriteIco(tmp, colors, warning);
+            WriteIco(tmp, colors);
             try { File.Move(tmp, path); }
             catch (IOException) { File.Delete(tmp); }     // built by someone else meanwhile
             return path;
@@ -2179,11 +2434,11 @@ namespace DicomStudyCount
             finally { DestroyIcon(large); }
         }
 
-        static void WriteIco(string path, List<int> colors, bool warning)
+        static void WriteIco(string path, List<int> colors)
         {
             var pngs = new List<byte[]>();
             foreach (int size in Sizes)
-                using (var bmp = Draw(size, colors, warning))
+                using (var bmp = Draw(size, colors))
                 using (var ms = new MemoryStream())
                 {
                     bmp.Save(ms, ImageFormat.Png);
@@ -2208,7 +2463,7 @@ namespace DicomStudyCount
 
         // An archive box (lid, handle and, from 32 px, a label) drawn on a 16x16 grid scaled to the size:
         // its own shape, so a box of studies is never taken for a plain folder whatever its color
-        public static Bitmap Draw(int size, List<int> colors, bool warning)
+        public static Bitmap Draw(int size, List<int> colors)
         {
             var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
             float s = size / 16f;
@@ -2234,7 +2489,6 @@ namespace DicomStudyCount
                         g.DrawPath(p, Rounded(4.2f, 10.6f, 7.6f, 2.4f, 0.3f));
                 }
             }
-            if (warning) DrawWarning(bmp, size);
             return bmp;
         }
 
@@ -2330,31 +2584,6 @@ namespace DicomStudyCount
             if (l < 0.25f) return Color.FromArgb(125, 125, 125);
             return Mix(c, Color.Black, 0.4f);
         }
-
-        // Warning sign at the bottom right: yellow triangle, dark border and "!". About half the icon
-        // at 16-24 px, where it must be seen; proportionally smaller on larger icons.
-        static void DrawWarning(Bitmap bmp, int size)
-        {
-            float s = size * (size <= 24 ? 0.56f : Math.Max(0.36f, 0.56f - (size - 24) * 0.005f));
-            float x0 = size - s, y0 = size - s * 0.92f;
-            var tri = new[] { new PointF(x0 + s / 2, y0), new PointF(size - 0.5f, size - 0.5f), new PointF(x0, size - 0.5f) };
-            using (var g = Graphics.FromImage(bmp))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                float pen = Math.Max(1f, size / 16f);
-                using (var fill = new SolidBrush(Color.FromArgb(255, 200, 0)))
-                    g.FillPolygon(fill, tri);
-                using (var border = new Pen(Color.FromArgb(60, 40, 0), pen) { LineJoin = LineJoin.Round })
-                    g.DrawPolygon(border, tri);
-                using (var mark = new SolidBrush(Color.Black))
-                {
-                    float cx = x0 + s / 2, bar = Math.Max(1f, s * 0.13f);
-                    g.FillRectangle(mark, cx - bar / 2, y0 + s * 0.32f, bar, s * 0.33f);
-                    g.FillRectangle(mark, cx - bar / 2, y0 + s * 0.72f, bar, bar);
-                }
-            }
-        }
     }
 }
 '@
@@ -2389,6 +2618,9 @@ if (-not ('DicomStudyCount.Scanner' -as [type])) {
 $reportDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\reports'
 # Index of counted locations, to find copies across them (one file per counted folder)
 $indexDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\index'
+# Copies of every file found by the counts, for the "DICOM duplicated in" column (written by the
+# counts next to the index, read by the property handler of shellext\DicomIcons.dll)
+$copiesDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\duplicates'
 
 function Get-ReportPath([string]$root) {
     $sha = [Security.Cryptography.SHA1]::Create()
@@ -2571,7 +2803,7 @@ function Show-DicomTree([string]$root) {
         $tree.EndUpdate()
         $tree.Nodes[0].EnsureVisible()
     }
-    foreach ($b in @(@('Count DICOM studies', $countRoot),
+    foreach ($b in @(@('Recount', $countRoot),
                      @('Expand to studies', $expandToStudies),
                      @('Expand all', { $tree.ExpandAll(); if ($tree.Nodes.Count) { $tree.Nodes[0].EnsureVisible() } }),
                      @('Collapse all', { $tree.CollapseAll(); if ($tree.Nodes.Count) { $tree.Nodes[0].Expand() } }),
@@ -2665,7 +2897,7 @@ function Show-DicomTree([string]$root) {
     function Show-Problems {
         $report = Get-ProblemsReport $root
         if (-not $report) {
-            [void][Windows.Forms.MessageBox]::Show($form, 'There is no report for this folder yet: click "Count DICOM studies" first.', 'Problems')
+            [void][Windows.Forms.MessageBox]::Show($form, 'There is no report for this folder yet: click "Recount" first.', 'Problems')
             return
         }
         if ($script:problemsDialog -and -not $script:problemsDialog.IsDisposed) { $script:problemsDialog.Close() }
@@ -2953,7 +3185,7 @@ function Show-DicomTree([string]$root) {
         } elseif ($commented) {
             "$commented folders with comments  -  double-click: open in Explorer  -  F5: refresh"
         } else {
-            'No comments found: click "Count DICOM studies" to count this folder'
+            'No comments found: click "Recount" to count this folder'
         })
     }
 
@@ -3241,6 +3473,11 @@ try {
         return
     }
 
+    if ($ToggleColumns) {
+        Switch-DicomColumns $root
+        return
+    }
+
     if ($Clean -or $ClearComments) {
         Stop-CountsOn $root
         # Comments, icons, folder type and the attributes added to the folders
@@ -3256,6 +3493,7 @@ try {
         # Copies in other locations will no longer point here, and the reports of the counts made
         # inside the folder are deleted
         $forgotten = [DicomStudyCount.CountedData]::ForgetIndex($indexDir, $root)
+        [void][DicomStudyCount.CountedData]::ForgetCopies($copiesDir, $root)
         $reports = 0
         foreach ($file in Get-ChildItem -LiteralPath $reportDir -Filter '*.json' -ErrorAction SilentlyContinue) {
             try { $reportRoot = (Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json).Root } catch { continue }

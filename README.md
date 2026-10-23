@@ -2,11 +2,11 @@
 
 Find duplicated DICOM files and badly organized folders straight from Windows Explorer.
 
-Right-click a folder and choose **Count DICOM studies**: every folder and subfolder gets a summary in
-Explorer's **Comments** column (studies, date, series) together with warnings for the problems found:
-studies split across folders, duplicated images, incomplete series and copies in other locations.
-Folders with DICOM get an archive box icon in the color of their study. **Show DICOM tree** opens the whole folder tree with one
-color per study.
+Right-click a folder and choose **DICOM > Count studies**: every folder and subfolder gets a summary
+in Explorer's **Comments** column (studies, date, series) together with warnings for the problems
+found: studies split across folders, duplicated images, incomplete series and copies in other
+locations. Folders with DICOM get an archive box icon in the color of their study. **DICOM > Show
+tree** opens the whole folder tree with one color per study.
 
 ![Comments column in Explorer](docs/explorer-comments.png)
 
@@ -49,11 +49,45 @@ color per study.
   - one study: a box of the study's color, always the same for the same study (22 colors told
     apart at 16 px, from a hash of the StudyInstanceUID, including black, white and three grays);
   - 2 to 5 studies: vertical stripes of their colors, in date order;
-  - more than 5 studies: horizontal rainbow stripes;
-  - problems: a small `⚠` in the corner.
+  - more than 5 studies: horizontal rainbow stripes.
+
+  The icon does not mark problems, so it never hides the colors: they are marked in the comment.
 
   Folders without DICOM keep the normal folder icon, and a custom icon set by someone else is never
   replaced.
+- **Icons of the DICOM files** (optional): every DICOM file shows its SeriesNumber in the color of its
+  study (the color of its box), on the complementary color (made darker or lighter when the number
+  would not read well on it). DICOMDIR and other files keep their usual icon. It is an icon handler,
+  a small C++ DLL (`shellext\DicomIcons.cpp`) that Explorer asks for the icon of `.dcm` files and of
+  files without extension; it reads only the header, up to SeriesNumber, and never writes to them.
+- **Columns of the DICOM files** (optional): Explorer columns that can be shown, sorted, grouped and
+  filtered like any other (right-click a column header > *More...*, they all start with "DICOM"):
+
+  | Column | Example |
+  |---|---|
+  | DICOM study hash / series hash | `hwmA0`: 5 characters from a hash of the UID; the study one as in the study tag `[MR-hwmA0]` of the folder comments |
+  | DICOM study UID / series UID | `2.25.27005...` |
+  | DICOM series number / instance number | `7` (numbers: 2 sorts before 10) |
+  | DICOM series description / protocol | `cine_retro_4ch` |
+  | DICOM modality / manufacturer | `MR`, `Siemens Healthineers` |
+  | DICOM patient ID | `5805091` |
+  | DICOM acquired | date and time: AcquisitionDateTime, else Acquisition Date + Time, else Content, else Series (local time, as in the header) |
+  | DICOM study date | date |
+  | DICOM object type | the SOP class by name: `MR Image`, `Secondary Capture`, `Enhanced SR`... |
+  | DICOM image type | `ORIGINAL\PRIMARY\M\NORM`, `DERIVED\...` |
+  | DICOM compression | from the transfer syntax: `none`, `JPEG lossless`, `JPEG 2000`... |
+  | DICOM rows / columns / frames | `156`, `192`; frames only in multi-frame files |
+  | DICOM pixel spacing / slice thickness | `1.97917\1.97917`, `8` |
+  | DICOM image orientation | ImageOrientationPatient as in the header |
+  | DICOM Z level | position of the slice along its normal (mm), as `xZ` of DICOMstack: comparable only between slices with the same frame of reference |
+  | DICOM frame of reference | 5-character hash of the FrameOfReferenceUID |
+  | DICOM trigger time | ms after the R wave (cine phase) |
+  | DICOM plane (experimental) | as `slicePlaneName` of DICOMstack: `AX`/`COR`/`SAG` only within 1e-3 rad of a cardinal plane, otherwise the nearest cardiac view `hla`/`vla`/`lvot`/`sa` (`shellext\New-PlaneClouds.ps1` takes its reference orientations from DICOMstack.m) |
+  | DICOM duplicated in | the other copies of the file found by the last count, in the counted folder or in other counted locations (`(differs)` when their bytes differ) |
+
+  They come from the property handler of the same DLL, which reads the header on the fly; *duplicated
+  in* comes from the last count (like the folder comments). Windows registers property handlers and
+  columns for the whole machine only, so installing them asks for administrator rights.
 - **DICOM tree window**: the folder tree with the same icons, the number of files (recursive),
   the comment of every folder, one pastel color per study in the rows, *Expand to studies* (expands until studies separate), live
   updates while counting and when files or folders change, and the *Problems* window.
@@ -82,10 +116,20 @@ color per study.
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Install
    ```
+   For the icons and columns of the DICOM files, build the DLL first (it needs the Visual Studio C++
+   build tools); `-Install` registers it when it finds it built (the icons for the user; the columns
+   for the machine, after a UAC prompt; restart Explorer to see them):
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\shellext\Build-DicomIcons.ps1
+   ```
+   It is registered only for the types no other program owns (`.dcm`, files without extension);
+   `shellext\Test-DicomIcons.ps1` tries the icons outside Explorer, and `shellext\Get-ShellProperties.ps1`
+   prints the columns of files as Explorer sees them.
 4. Recommended: hide protected operating system files (Explorer > *Options* > *View* >
    *Hide protected operating system files*), so the `desktop.ini` files are not shown.
 
-On Windows 11 the menu entries are under **Show more options** (or Shift+F10).
+On Windows 11 the **DICOM** submenu is under **Show more options** (or Shift+F10). Running `-Install`
+again updates the menu of an earlier version.
 
 To remove the context menu and the watcher:
 ```powershell
@@ -94,12 +138,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
 
 ## Usage
 
-**From Explorer** (right-click a folder, or the background of an open folder):
+**From Explorer** (right-click a folder, or the background of an open folder), in the **DICOM**
+submenu. Its entries are always the same: Explorer does not read `desktop.ini` when it builds the
+menu, so the menu cannot tell a counted folder from one that is not.
 
-- **Count DICOM studies**: counts the folder and writes the comments of the whole tree.
-- **Show DICOM tree**: opens the tree window. It reads the comments only; use its
-  *Count DICOM studies* button (or the context menu) to count.
-- **Clean DICOM info**: leaves Explorer, from that folder down, as if it had never been counted (no
+- **Count studies**: counts the folder and writes the comments of the whole tree.
+- **Show tree**: opens the tree window. It reads the comments only; its *Recount* button counts the
+  folder again (the tree updates live), then just close the window.
+- **Show/hide DICOM columns**: shows all the DICOM columns of the files in that Explorer window (after
+  its other columns, fitted to their content), or hides them all if any is visible. On the background
+  of a window it acts on that window; on a folder of the list, on the window showing the list.
+- **Clean**: leaves Explorer, from that folder down, as if it had never been counted (no
   confirmation asked):
   - stops a count running on the folder, inside it or on a folder that contains it;
   - removes the comments, the box icons and the folder attributes the tool added (only what the
@@ -107,8 +156,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
   - removes the Comments column from the open Explorer windows and from the views Explorer saved for
     those folders (and for the parent folder, if no other folder in it has comments), keeping the
     rest of each view (other columns, sorting, icon size);
-  - forgets its files in the index of counted locations, so copies elsewhere no longer point to it,
-    and deletes the problems reports of the counts made inside it.
+  - forgets its files in the index of counted locations and in the copies of the files ("duplicated
+    in"), so copies elsewhere no longer point to it, and deletes the problems reports of the counts
+    made inside it.
 
 **From PowerShell:**
 
@@ -116,9 +166,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
 .\Count-DicomStudies.ps1 D:\Patients                     # summary and problems in the console
 .\Count-DicomStudies.ps1 D:\Patients -Detail             # plus a table of studies
 .\Count-DicomStudies.ps1 D:\Patients -Csv C:\temp\x.csv  # export the studies (';' separated)
-.\Count-DicomStudies.ps1 D:\Patients -WriteComments      # what "Count DICOM studies" does
-.\Count-DicomStudies.ps1 D:\Patients -ShowTree           # what "Show DICOM tree" does
-.\Count-DicomStudies.ps1 D:\Patients -Clean              # what "Clean DICOM info" does (-ClearComments: the same)
+.\Count-DicomStudies.ps1 D:\Patients -WriteComments      # what "DICOM > Count studies" does
+.\Count-DicomStudies.ps1 D:\Patients -ShowTree           # what "DICOM > Show tree" does
+.\Count-DicomStudies.ps1 D:\Patients -Clean              # what "DICOM > Clean" does (-ClearComments: the same)
+.\Count-DicomStudies.ps1 D:\Patients -ToggleColumns      # what "DICOM > Show/hide DICOM columns" does
 ```
 
 ## What it writes, and where
@@ -131,6 +182,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
+| Icons of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (the DLL) and `HKCU\Software\Classes` (its CLSID, the `DicomStudyCount.*` file types, and `.dcm` and `.` when no other program owned them) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID`, the property handlers of `.dcm` and `.` (when they had none) and the registered schema | `-Uninstall` (asks for administrator rights) |
+| Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 
 The tool never modifies, moves or deletes DICOM files. The reports and the index contain file paths
 and DICOM UIDs, but no patient names or IDs read from the files (folder names, of course, may carry

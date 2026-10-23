@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Columns of DICOM files in Explorer, filled by the property handler of DicomIcons.dll. Registered
+     with PSRegisterPropertySchema by Register-DicomProperties.ps1. The labels start with "DICOM" so
+     they are listed together in Explorer's "More..." columns. -->
+<schema xmlns="http://schemas.microsoft.com/windows/2006/propertydescription" schemaVersion="1.0">
+  <propertyDescriptionList publisher="DicomStudyCount" product="DicomStudyCount">
+
+    <!-- 5 case-sensitive characters from a hash of the StudyInstanceUID, as in the study tags of the folder comments -->
+    <propertyDescription name="DicomStudyCount.StudyHash" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="2">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM study hash" />
+      <displayInfo displayType="String" defaultColumnWidth="10" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.StudyInstanceUID" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="3">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM study UID" />
+      <displayInfo displayType="String" defaultColumnWidth="30" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.SeriesInstanceUID" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="4">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM series UID" />
+      <displayInfo displayType="String" defaultColumnWidth="30" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.SeriesNumber" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="5">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="Int32" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM series number" />
+      <displayInfo displayType="Number" defaultColumnWidth="8" alignment="Right" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.SeriesDescription" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="6">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM series description" />
+      <displayInfo displayType="String" defaultColumnWidth="24" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.Modality" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="7">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM modality" />
+      <displayInfo displayType="String" defaultColumnWidth="6" />
+    </propertyDescription>
+
+    <!-- Other copies of the same image (same StudyInstanceUID and SOPInstanceUID) found by the last
+         count: in the counted folder and in other counted locations -->
+    <propertyDescription name="DicomStudyCount.DuplicatedIn" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="8">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="false" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM duplicated in" />
+      <displayInfo displayType="String" defaultColumnWidth="40" />
+    </propertyDescription>
+
+    <!-- 5 case-sensitive characters from a hash of the SeriesInstanceUID (the same hash as the study's) -->
+    <propertyDescription name="DicomStudyCount.SeriesHash" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="9">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM series hash" />
+      <displayInfo displayType="String" defaultColumnWidth="10" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.Rows" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="10">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="UInt32" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM rows" />
+      <displayInfo displayType="Number" defaultColumnWidth="6" alignment="Right" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.Columns" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="11">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="UInt32" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM columns" />
+      <displayInfo displayType="Number" defaultColumnWidth="6" alignment="Right" />
+    </propertyDescription>
+
+    <!-- ImageOrientationPatient as in the header: the 6 direction cosines, separated by \ -->
+    <propertyDescription name="DicomStudyCount.ImageOrientation" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="12">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM image orientation" />
+      <displayInfo displayType="String" defaultColumnWidth="30" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.InstanceNumber" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="13">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="Int32" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM instance number" />
+      <displayInfo displayType="Number" defaultColumnWidth="8" alignment="Right" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.PatientID" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="14">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM patient ID" />
+      <displayInfo displayType="String" defaultColumnWidth="14" />
+    </propertyDescription>
+
+    <!-- Position of the slice along its normal, in mm: xZ of DICOMstack.m (third row of the inverse of
+         the rotation from ImageOrientationPatient, times ImagePositionPatient) -->
+    <propertyDescription name="DicomStudyCount.ZLevel" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="15">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="Double" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM Z level" />
+      <displayInfo displayType="Number" defaultColumnWidth="10" alignment="Right" />
+    </propertyDescription>
+
+    <!-- When the image was acquired: AcquisitionDateTime, else AcquisitionDate + Time, else ContentDate
+         + Time, else SeriesDate + Time; local time, as in the header -->
+    <propertyDescription name="DicomStudyCount.Acquired" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="16">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="DateTime" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM acquired" />
+      <displayInfo displayType="DateTime" defaultColumnWidth="18">
+        <dateTimeFormat formatTime="LongTime" />
+      </displayInfo>
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.StudyDate" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="17">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="DateTime" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM study date" />
+      <displayInfo displayType="DateTime" defaultColumnWidth="10">
+        <dateTimeFormat formatTime="HideTime" />
+      </displayInfo>
+    </propertyDescription>
+
+    <!-- 5 characters from a hash of the FrameOfReferenceUID: only slices with the same one have
+         comparable positions (Z level) -->
+    <propertyDescription name="DicomStudyCount.FrameOfReference" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="18">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM frame of reference" />
+      <displayInfo displayType="String" defaultColumnWidth="10" />
+    </propertyDescription>
+
+    <!-- The SOP class by name ("MR Image", "Secondary Capture", "Comprehensive SR"...), or its UID -->
+    <propertyDescription name="DicomStudyCount.ObjectType" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="19">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM object type" />
+      <displayInfo displayType="String" defaultColumnWidth="18" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.ImageType" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="20">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM image type" />
+      <displayInfo displayType="String" defaultColumnWidth="24" />
+    </propertyDescription>
+
+    <!-- NumberOfFrames: only in multi-frame files -->
+    <propertyDescription name="DicomStudyCount.Frames" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="21">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="Int32" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM frames" />
+      <displayInfo displayType="Number" defaultColumnWidth="6" alignment="Right" />
+    </propertyDescription>
+
+    <!-- TriggerTime, in ms after the R wave: the cardiac phase of a cine -->
+    <propertyDescription name="DicomStudyCount.TriggerTime" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="22">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="Double" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM trigger time" />
+      <displayInfo displayType="Number" defaultColumnWidth="8" alignment="Right" />
+    </propertyDescription>
+
+    <!-- PixelSpacing as in the header: row spacing \ column spacing, in mm -->
+    <propertyDescription name="DicomStudyCount.PixelSpacing" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="23">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM pixel spacing" />
+      <displayInfo displayType="String" defaultColumnWidth="16" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.SliceThickness" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="24">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="Double" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM slice thickness" />
+      <displayInfo displayType="Number" defaultColumnWidth="8" alignment="Right" />
+    </propertyDescription>
+
+    <!-- From the transfer syntax: "none", "JPEG lossless", "JPEG 2000"... -->
+    <propertyDescription name="DicomStudyCount.Compression" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="25">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM compression" />
+      <displayInfo displayType="String" defaultColumnWidth="14" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.Protocol" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="26">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM protocol" />
+      <displayInfo displayType="String" defaultColumnWidth="24" />
+    </propertyDescription>
+
+    <propertyDescription name="DicomStudyCount.Manufacturer" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="27">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM manufacturer" />
+      <displayInfo displayType="String" defaultColumnWidth="14" />
+    </propertyDescription>
+
+    <!-- slicePlaneName of DICOMstack.m: AX / COR / SAG only when cardinal within 1e-3 rad, otherwise
+         the nearest cardiac view (hla, vla, lvot, sa), with no distance limit -->
+    <propertyDescription name="DicomStudyCount.Plane" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="28">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM plane (experimental)" />
+      <displayInfo displayType="String" defaultColumnWidth="8" />
+    </propertyDescription>
+
+  </propertyDescriptionList>
+</schema>
