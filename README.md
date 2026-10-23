@@ -99,6 +99,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
 - **Count DICOM studies**: counts the folder and writes the comments of the whole tree.
 - **Show DICOM tree**: opens the tree window. It reads the comments only; use its
   *Count DICOM studies* button (or the context menu) to count.
+- **Clean DICOM info**: leaves Explorer, from that folder down, as if it had never been counted (no
+  confirmation asked):
+  - stops a count running on the folder, inside it or on a folder that contains it;
+  - removes the comments, the box icons and the folder attributes the tool added (only what the
+    tool wrote: other `desktop.ini` settings, such as a custom icon, are kept);
+  - removes the Comments column from the open Explorer windows and from the views Explorer saved for
+    those folders (and for the parent folder, if no other folder in it has comments), keeping the
+    rest of each view (other columns, sorting, icon size);
+  - forgets its files in the index of counted locations, so copies elsewhere no longer point to it,
+    and deletes the problems reports of the counts made inside it.
 
 **From PowerShell:**
 
@@ -108,17 +118,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
 .\Count-DicomStudies.ps1 D:\Patients -Csv C:\temp\x.csv  # export the studies (';' separated)
 .\Count-DicomStudies.ps1 D:\Patients -WriteComments      # what "Count DICOM studies" does
 .\Count-DicomStudies.ps1 D:\Patients -ShowTree           # what "Show DICOM tree" does
-.\Count-DicomStudies.ps1 D:\Patients -ClearComments      # remove the comments written by the tool
+.\Count-DicomStudies.ps1 D:\Patients -Clean              # what "Clean DICOM info" does (-ClearComments: the same)
 ```
 
 ## What it writes, and where
 
 | What | Where | Undo |
 |---|---|---|
-| Folder comments and icons | a hidden `desktop.ini` in each folder with DICOM, and the folder's Read-only attribute (needed by Explorer to read it) | `-ClearComments` removes only what the tool wrote and restores the attribute |
+| Folder comments and icons | a hidden `desktop.ini` in each folder with DICOM, and the folder's Read-only attribute (needed by Explorer to read it) | `-Clean` removes only what the tool wrote and restores the attribute |
+| Comments column | open Explorer windows, and the views Explorer saves (`HKCU\...\Shell\Bags`) | `-Clean` removes it from the views of the cleaned folders |
 | Folder icon files | `%LOCALAPPDATA%\DicomStudyCount\icons\` (built when first needed; a lost one is built again from its name) | delete the folder |
-| Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | delete the folder |
-| Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | delete the folder |
+| Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
+| Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
 
 The tool never modifies, moves or deletes DICOM files. The reports and the index contain file paths
@@ -127,7 +138,12 @@ patient information), and they stay on the local machine.
 
 ## Notes and limitations
 
-- Comments are a snapshot of the last count: count again after moving or copying data.
+- Comments are a snapshot of the last count: count again after moving or copying data. Likewise,
+  after cleaning a subfolder, the comments of the folders above it (e.g. `also in: ...`) still refer
+  to it until they are counted again.
+- The saved views of Explorer are in an undocumented format (the same since Windows 7): `-Clean`
+  only removes the Comments column from them when it finds that format, and leaves any other view
+  untouched. It also removes the column from folders where you had added it by hand.
 - Explorer only refreshes after ~0.6 s without change notifications; the tool pauses 1 s after
   marking folders as *Counting* so that state is visible.
 - Explorer cannot color text, cells or rows (color emoji are drawn in gray), hence the study tags and
