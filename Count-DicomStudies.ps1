@@ -263,8 +263,13 @@ namespace DicomStudyCount
     public static class FolderComments
     {
         public const string CountingText = "Counting StudyUIDs...";
-        public const string NoDicomText = "No DICOMs.";
         public const string EmptyText = "---";
+
+        // Files but no DICOM in the whole subtree: "(0 DICOMs of 12 files)"
+        public static string NoDicomText(int totalFiles)
+        {
+            return "(0 DICOMs of " + totalFiles + (totalFiles == 1 ? " file)" : " files)");
+        }
         const string Marker = "DicomStudyCount";
 
         // One lock per folder (striped by path), not one for all: different folders are written in
@@ -760,7 +765,7 @@ namespace DicomStudyCount
                 {
                     // Without DICOM: "---" when the whole subtree has no files at all
                     if (node.Uids.Count == 0)
-                        TrySetComment(node.Path, node.TotalFiles == 0 ? FolderComments.EmptyText : FolderComments.NoDicomText, p);
+                        TrySetComment(node.Path, node.TotalFiles == 0 ? FolderComments.EmptyText : FolderComments.NoDicomText(node.TotalFiles), p);
                     else
                     {
                         string seriesNumber = null, seriesDescription = null;
@@ -1409,7 +1414,10 @@ namespace DicomStudyCount
 
     internal static class DicomParser
     {
+        const uint TagMediaStorageSOPClass = 0x00020002;
         const uint TagTransferSyntax = 0x00020010;
+        const uint TagDirectoryRecordSequence = 0x00041220;
+        const uint TagSOPClassUID = 0x00080016;
         const uint TagSOPInstanceUID = 0x00080018;
         const uint TagStudyDate = 0x00080020;
         const uint TagModality = 0x00080060;
@@ -1421,9 +1429,13 @@ namespace DicomStudyCount
         const uint TagSeriesNumber = 0x00200011;
         const uint TagInstanceNumber = 0x00200013;
 
+        // SOP Class of a DICOMDIR (Media Storage Directory Storage)
+        const string DirectorySopClass = "1.2.840.10008.1.3.10";
+
         static readonly Encoding Latin1 = Encoding.GetEncoding(28591);
 
-        // null = not DICOM. Throws if it is DICOM but cannot be read.
+        // null = not DICOM. Throws if it is DICOM but cannot be read. A DICOMDIR (the index of a
+        // DICOM media, recognized by its contents, not by its name) is not counted either: null too.
         public static DicomTags ReadFile(string path)
         {
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 4096))
@@ -1442,7 +1454,7 @@ namespace DicomStudyCount
                 try
                 {
                     var t = ReadAfterPreamble(fs);
-                    return string.IsNullOrEmpty(t.Uid) ? null : t;
+                    return t == null || string.IsNullOrEmpty(t.Uid) ? null : t;
                 }
                 catch (Exception) { return null; }
             }
@@ -1452,7 +1464,7 @@ namespace DicomStudyCount
         {
             // File meta information (group 0002): always Explicit VR Little Endian
             var r = new DicomReader(fs) { Explicit = true };
-            string ts = null;
+            string ts = null, mediaClass = null;
             while (fs.Position + 8 <= fs.Length)
             {
                 long pos = fs.Position;
@@ -1461,8 +1473,10 @@ namespace DicomStudyCount
                 string vr;
                 uint len = r.ReadLength(tag, out vr);
                 if (tag == TagTransferSyntax) ts = Str(r.Bytes(len));
+                else if (tag == TagMediaStorageSOPClass) mediaClass = Str(r.Bytes(len));
                 else r.Skip(len);
             }
+            if (mediaClass == DirectorySopClass) return null;   // DICOMDIR: its records are not read
 
             switch (ts)
             {
@@ -1491,9 +1505,14 @@ namespace DicomStudyCount
                 if (tag > TagInstanceNumber) break;   // tags are sorted: they will not appear anymore
                 string vr;
                 uint len = r.ReadLength(tag, out vr);
+                // DICOMDIR without (or with a wrong) meta information: it has directory records
+                if (tag == TagDirectoryRecordSequence) return null;
                 if (len == 0xFFFFFFFF) { r.SkipSequence(vr); continue; }
                 switch (tag)
                 {
+                    case TagSOPClassUID:
+                        if (Str(r.Bytes(len)) == DirectorySopClass) return null;
+                        break;
                     case TagSOPInstanceUID: t.SopUid = Str(r.Bytes(len)); break;
                     case TagStudyDate: t.Date = Str(r.Bytes(len)); break;
                     case TagModality: t.Modality = Str(r.Bytes(len)); break;
@@ -2317,7 +2336,7 @@ function Show-DicomTree([string]$root) {
             }
             $rect = New-Object Drawing.Rectangle($x, $e.Bounds.Y, [Math]::Max(0, $tree.ClientSize.Width - $x), $e.Bounds.Height)
             $color = if ($studyBrush) { [Drawing.Color]::Black }
-                     elseif ($comment -like 'Counting*' -or $comment -like 'No DICOM*') { [Drawing.Color]::Gray }
+                     elseif ($comment -like 'Counting*' -or $comment -like '(0 DICOMs*') { [Drawing.Color]::Gray }
                      else { [Drawing.Color]::FromArgb(0, 95, 170) }
             [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $main, $tree.Font, $rect, $color, $flags -bor [Windows.Forms.TextFormatFlags]::EndEllipsis)
             if ($warnAt -gt 0) {

@@ -27,7 +27,7 @@ studies split across folders, duplicated images, incomplete series and copies in
   | several studies | `4 DICOM studies` |
   | one study | `[MR-hwmA0] 02/Jun/2025 - 4 series` |
   | one study, one series | `[MR-hwmA0] 02/Jun/2025 - 007.cine_retro_4ch (25 of 25)` *(DICOM files of all files)* |
-  | files, but no DICOM | `No DICOMs.` |
+  | files, but no DICOM | `(0 DICOMs of 12 files)` *(files of the whole subtree)* |
   | no files at all (subfolders included) | `---` |
 
   `[MR-hwmA0]` is the study tag: the study's main image modality plus 5 case-sensitive characters from
