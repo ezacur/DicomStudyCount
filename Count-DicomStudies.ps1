@@ -336,24 +336,36 @@ namespace DicomStudyCount
 
         const FileAttributes FolderCustomAttrs = FileAttributes.ReadOnly | FileAttributes.System;
 
-        public static void Set(string dir, string text)
+        // A custom icon set by someone else (IconResource, or the older IconFile) is never replaced
+        static bool HasForeignIcon(string ini)
+        {
+            if (!File.Exists(ini)) return false;
+            string icon = Native.ReadIni(ini, ".ShellClassInfo", "IconResource");
+            if (icon != "" && !FolderIcons.IsOurs(FolderIcons.PathOf(icon))) return true;
+            return Native.ReadIni(ini, ".ShellClassInfo", "IconFile") != "";
+        }
+
+        // icon: full path of the folder icon, "" to remove the icon of this script, null to leave it as it is
+        public static void Set(string dir, string text, string icon = null)
         {
             string ini = Path.Combine(dir, "desktop.ini");
             lock (LockFor(dir))
             {
                 var before = File.GetAttributes(dir);
                 bool hadMarker = File.Exists(ini) && Native.ReadIni(ini, Marker, "Generated") != "";
+                if (icon != null && HasForeignIcon(ini)) icon = null;
                 if (File.Exists(ini))
                 {
                     // Drop the Unicode copy of the previous text: the API only rewrites it for non-ASCII text
                     File.SetAttributes(ini, FileAttributes.Normal);
                     Native.DeleteIniKey(ini, ".ShellClassInfo.W", "InfoTip");
                     Native.DeleteIniKey(ini, ".ShellClassInfo.A", "InfoTip");
+                    if (icon == "") Native.DeleteIniKey(ini, ".ShellClassInfo", "IconResource");
                 }
 
                 // Using the official API (rather than writing the .ini by hand) is what makes
                 // Explorer invalidate its desktop.ini cache and refresh the column right away
-                Native.SetFolderInfoTip(dir, text);
+                Native.SetFolderInfoTip(dir, text, icon == "" ? null : icon);
 
                 File.SetAttributes(ini, FileAttributes.Normal);
                 Native.WritePrivateProfileString(Marker, "Generated", "1", ini);
@@ -389,6 +401,9 @@ namespace DicomStudyCount
             lock (LockFor(dir))
             {
                 if (!File.Exists(ini) || Native.ReadIni(ini, Marker, "Generated") == "") return false;
+                File.SetAttributes(ini, FileAttributes.Normal);
+                if (FolderIcons.IsOurs(FolderIcons.PathOf(Native.ReadIni(ini, ".ShellClassInfo", "IconResource"))))
+                    Native.DeleteIniKey(ini, ".ShellClassInfo", "IconResource");
                 Native.SetFolderInfoTip(dir, "");       // clears the column in Explorer
                 File.SetAttributes(ini, FileAttributes.Normal);
                 Native.DeleteIniKey(ini, ".ShellClassInfo", "InfoTip");
@@ -566,7 +581,8 @@ namespace DicomStudyCount
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern int SHGetSetFolderCustomSettings(ref SHFOLDERCUSTOMSETTINGS pfcs, string pszPath, uint dwReadWrite);
 
-        public static void SetFolderInfoTip(string dir, string text)
+        // iconFile: null leaves the folder icon as it is
+        public static void SetFolderInfoTip(string dir, string text, string iconFile = null)
         {
             var s = new SHFOLDERCUSTOMSETTINGS
             {
@@ -574,6 +590,12 @@ namespace DicomStudyCount
                 dwMask = 0x4,           // FCSM_INFOTIP
                 pszInfoTip = text
             };
+            if (iconFile != null)
+            {
+                s.dwMask |= 0x10;       // FCSM_ICONFILE
+                s.pszIconFile = iconFile;
+                s.iIconIndex = 0;
+            }
             int hr = SHGetSetFolderCustomSettings(ref s, dir, 0x2 /* FCS_FORCEWRITE */);
             if (hr < 0) Marshal.ThrowExceptionForHR(hr);
         }
@@ -765,9 +787,13 @@ namespace DicomStudyCount
                 {
                     // Without DICOM: "---" when the whole subtree has no files at all
                     if (node.Uids.Count == 0)
-                        TrySetComment(node.Path, node.TotalFiles == 0 ? FolderComments.EmptyText : FolderComments.NoDicomText(node.TotalFiles), p);
+                        TrySetComment(node.Path, node.TotalFiles == 0 ? FolderComments.EmptyText : FolderComments.NoDicomText(node.TotalFiles), p, "");
                     else
                     {
+                        // Icon colors: one per study, in date order
+                        var byDate = new List<string>(node.Uids);
+                        byDate.Sort((a, b) => string.CompareOrdinal(studies[a].StudyDate + a, studies[b].StudyDate + b));
+                        node.IconColors = byDate.ConvertAll<int>(FolderIcons.ColorIndex);
                         string seriesNumber = null, seriesDescription = null;
                         if (node.SeriesUids.Count == 1)
                             foreach (var s in node.SeriesUids)
@@ -784,7 +810,7 @@ namespace DicomStudyCount
                         }
                         node.BaseComment = FolderComments.Format(node.Uids.Count, tag, studyDate, node.SeriesUids.Count,
                             seriesNumber, seriesDescription, node.DicomFiles, node.TotalFiles);
-                        TrySetComment(node.Path, node.BaseComment, p);
+                        TrySetComment(node.Path, node.BaseComment, p, TryIcon(node.IconColors, false));
                     }
                 }
                 var parent = node.Parent;
@@ -978,7 +1004,7 @@ namespace DicomStudyCount
             }
 
             if (!writeComments) return;
-            var rewrites = new List<KeyValuePair<string, string>>();    // folder -> comment with warnings
+            var rewrites = new List<KeyValuePair<FolderNode, string>>();    // folder -> comment with warnings
             foreach (var n in nodes)
             {
                 if (n.BaseComment == null) continue;
@@ -1015,9 +1041,11 @@ namespace DicomStudyCount
                     warn.Append("  " + FolderComments.Warning + " " + n.ExternalFiles + " also in other locations");
                     if (n.ExternalDifferent > 0) warn.Append(" (" + n.ExternalDifferent + " differ)");
                 }
-                if (warn.Length > 0 || changed) rewrites.Add(new KeyValuePair<string, string>(n.Path, n.BaseComment + warn));
+                if (warn.Length > 0 || changed) rewrites.Add(new KeyValuePair<FolderNode, string>(n, n.BaseComment + warn));
             }
-            Parallel.ForEach(rewrites, kv => TrySetComment(kv.Key, kv.Value, p));
+            // With warnings, the icon gets the warning sign
+            Parallel.ForEach(rewrites, kv => TrySetComment(kv.Key.Path, kv.Value, p,
+                kv.Value.Length > kv.Key.BaseComment.Length ? TryIcon(kv.Key.IconColors, true) : null));
         }
 
         // Incomplete series: for every series, the range of InstanceNumbers seen in the whole tree
@@ -1202,10 +1230,19 @@ namespace DicomStudyCount
             return path.Substring(root.Length).TrimStart('\\');
         }
 
-        static void TrySetComment(string dir, string text, ScanProgress p)
+        static void TrySetComment(string dir, string text, ScanProgress p, string icon = null)
         {
-            try { FolderComments.Set(dir, text); }
+            try { FolderComments.Set(dir, text, icon); }
             catch (Exception) { Interlocked.Increment(ref p.CommentErrors); }
+        }
+
+        // Path of the folder icon for those study colors (built if needed); null (icon left as it
+        // is) if it cannot be built
+        static string TryIcon(List<int> colors, bool warning)
+        {
+            if (colors == null || colors.Count == 0) return null;
+            try { return FolderIcons.Ensure(FolderIcons.NameFor(colors, warning)); }
+            catch (Exception) { return null; }
         }
 
         static List<FolderNode> BuildTree(string root, List<string> inaccessible)
@@ -1262,6 +1299,7 @@ namespace DicomStudyCount
         public int FinalStudies;    // distinct studies in the subtree, once finished
         public string FinalUid;     // the StudyInstanceUID when FinalStudies == 1
         public string BaseComment;  // comment without warnings
+        public List<int> IconColors;    // palette index of every study of the subtree, in date order
         public int DuplicatedFiles; // files in the subtree whose SOPInstanceUID also appears in another file
         public int DifferentFiles;  // ...of which the copies do not have identical contents
         public int FinalSeries;     // distinct series in the subtree, once finished
@@ -1687,6 +1725,364 @@ namespace DicomStudyCount
         }
     }
 }
+
+namespace DicomStudyCount
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Drawing;
+    using System.Drawing.Drawing2D;
+    using System.Drawing.Imaging;
+    using System.IO;
+    using System.Runtime.InteropServices;
+
+    // Folder icons in the colors of the studies they hold, for the Name column of Explorer (desktop.ini
+    // IconResource): an archive box instead of a folder; one study -> a box of its color; 2 to 5 ->
+    // vertical stripes; more -> horizontal rainbow stripes; a small warning sign in the corner when the
+    // folder has problems. The file name says what the icon is ("c05.ico", "c05-17-w.ico",
+    // "rainbow.ico"), so a lost icon is rebuilt from its name alone.
+    public static class FolderIcons
+    {
+        // Colors chosen to be told apart at 16 px. No yellow: it would look like a plain folder, and
+        // it is one of the rainbow stripes.
+        public static readonly int[] Palette =
+        {
+            0x000000, 0x404040, 0x808080, 0xBFBFBF, 0xFFFFFF,   // black, gray 25/50/75 %, white
+            0xE6194B, 0x800000, 0xF58231, 0xFFD8B1, 0x9A6324,   // red, maroon, orange, apricot, brown
+            0x808000, 0xBFEF45, 0x3CB44B, 0xAAFFC3, 0x469990,   // olive, lime, green, mint, teal
+            0x42D4F4, 0x4363D8, 0x000075, 0xDCBEFF, 0x911EB4,   // cyan, blue, navy, lavender, purple
+            0xF032E6, 0xFABED4                                  // magenta, pink
+        };
+
+        public const int MaxStripes = 5;
+        static readonly int[] Sizes = { 16, 20, 24, 32, 40, 48, 64, 256 };
+
+        // Versioned, so a change in the drawing never mixes with icons already cached by Explorer
+        public static readonly string Dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"DicomStudyCount\icons");
+        static readonly string VersionDir = Path.Combine(Dir, "v2");
+
+        // Always the same color for the same study (64-bit FNV-1a of the StudyInstanceUID)
+        public static int ColorIndex(string uid)
+        {
+            ulong h = 14695981039346656037;
+            foreach (char c in uid) { h ^= c; h *= 1099511628211; }
+            return (int)((h >> 32) % (ulong)Palette.Length);
+        }
+
+        // Icon file name for the color indexes of the studies of a folder (in display order)
+        public static string NameFor(IList<int> colors, bool warning)
+        {
+            if (colors.Count == 0) return null;
+            string name;
+            if (colors.Count > MaxStripes) name = "rainbow";
+            else
+            {
+                var parts = new string[colors.Count];
+                for (int i = 0; i < colors.Count; i++) parts[i] = colors[i].ToString("D2");
+                name = "c" + string.Join("-", parts);
+            }
+            return name + (warning ? "-w" : "") + ".ico";
+        }
+
+        // Also the icons written by another user or on another PC (other profile folder), so a count
+        // there replaces them instead of keeping them as someone else's custom icon
+        public static bool IsOurs(string iconPath)
+        {
+            return !string.IsNullOrEmpty(iconPath) &&
+                   iconPath.IndexOf(@"\DicomStudyCount\icons\", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Full path of the icon, created if it does not exist yet (or was lost)
+        public static string Ensure(string name)
+        {
+            string path = Path.Combine(VersionDir, name);
+            if (File.Exists(path)) return path;
+            bool warning = name.EndsWith("-w.ico", StringComparison.OrdinalIgnoreCase);
+            string body = name.Substring(0, name.Length - (warning ? 6 : 4));
+            List<int> colors = null;     // null = rainbow
+            if (body != "rainbow")
+            {
+                if (!body.StartsWith("c")) throw new ArgumentException("Not an icon name: " + name);
+                colors = new List<int>();
+                foreach (var part in body.Substring(1).Split('-'))
+                {
+                    int i = int.Parse(part);
+                    if (i < 0 || i >= Palette.Length) throw new ArgumentException("Not an icon name: " + name);
+                    colors.Add(i);
+                }
+            }
+            Directory.CreateDirectory(VersionDir);
+            // Written under a temporary name and renamed: several threads (or counts) may build it at once
+            string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            WriteIco(tmp, colors, warning);
+            try { File.Move(tmp, path); }
+            catch (IOException) { File.Delete(tmp); }     // built by someone else meanwhile
+            return path;
+        }
+
+        // Icon file of a desktop.ini IconResource value ("path,index")
+        public static string PathOf(string iconResource)
+        {
+            if (string.IsNullOrEmpty(iconResource)) return "";
+            int comma = iconResource.LastIndexOf(',');
+            return comma > 0 ? iconResource.Substring(0, comma) : iconResource;
+        }
+
+        // Icon file of a folder written by this script, rebuilt first if it was lost; null if the
+        // folder has no icon of ours
+        public static string OfFolder(string dir)
+        {
+            string ini = Path.Combine(dir, "desktop.ini");
+            if (!File.Exists(ini)) return null;
+            string path = PathOf(Native.ReadIni(ini, ".ShellClassInfo", "IconResource"));
+            if (!IsOurs(path)) return null;
+            if (!File.Exists(path) &&
+                string.Equals(Path.GetDirectoryName(path), VersionDir, StringComparison.OrdinalIgnoreCase))
+            {
+                try { Ensure(Path.GetFileName(path)); }
+                catch (Exception) { return null; }
+                Native.NotifyUpdated(dir);
+            }
+            return File.Exists(path) ? path : null;
+        }
+
+        // The image of one of our .ico files at that size (the nearest larger one, scaled down)
+        public static Bitmap Load(string path, int size)
+        {
+            byte[] ico = File.ReadAllBytes(path);
+            int count = BitConverter.ToInt16(ico, 4), best = -1, bestSide = int.MaxValue, largest = -1, largestSide = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int side = ico[6 + 16 * i] == 0 ? 256 : ico[6 + 16 * i];
+                if (side >= size && side < bestSide) { best = i; bestSide = side; }
+                if (side > largestSide) { largest = i; largestSide = side; }
+            }
+            if (best < 0) best = largest;
+            int length = BitConverter.ToInt32(ico, 6 + 16 * best + 8), offset = BitConverter.ToInt32(ico, 6 + 16 * best + 12);
+            using (var png = new Bitmap(new MemoryStream(ico, offset, length)))
+            {
+                var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(png, 0, 0, size, size);
+                }
+                return bmp;
+            }
+        }
+
+        // Rebuilds the lost icons of the subfolders of a folder (what Explorer shows when browsing it)
+        public static void RepairChildren(string dir)
+        {
+            int n = 0;
+            foreach (var sub in Directory.EnumerateDirectories(dir))
+            {
+                if (n++ >= 2000) break;
+                OfFolder(sub);
+            }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHDefExtractIcon(string file, int index, uint flags, out IntPtr large, out IntPtr small, uint size);
+
+        [DllImport("user32.dll")]
+        static extern bool DestroyIcon(IntPtr h);
+
+        // The standard folder icon of Windows at that size (imageres.dll, resource 3)
+        public static Bitmap SystemFolder(int size)
+        {
+            IntPtr large, small;
+            string imageres = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "imageres.dll");
+            if (SHDefExtractIcon(imageres, -3, 0, out large, out small, (uint)size) != 0 || large == IntPtr.Zero)
+                throw new InvalidOperationException("Folder icon not found");
+            try
+            {
+                using (var icon = Icon.FromHandle(large))
+                using (var bmp = icon.ToBitmap())
+                    return new Bitmap(bmp);
+            }
+            finally { DestroyIcon(large); }
+        }
+
+        static void WriteIco(string path, List<int> colors, bool warning)
+        {
+            var pngs = new List<byte[]>();
+            foreach (int size in Sizes)
+                using (var bmp = Draw(size, colors, warning))
+                using (var ms = new MemoryStream())
+                {
+                    bmp.Save(ms, ImageFormat.Png);
+                    pngs.Add(ms.ToArray());
+                }
+            // .ico with PNG entries (supported since Windows Vista)
+            using (var w = new BinaryWriter(new FileStream(path, FileMode.CreateNew)))
+            {
+                w.Write((short)0); w.Write((short)1); w.Write((short)Sizes.Length);
+                int offset = 6 + 16 * Sizes.Length;
+                for (int i = 0; i < Sizes.Length; i++)
+                {
+                    byte side = (byte)(Sizes[i] >= 256 ? 0 : Sizes[i]);
+                    w.Write(side); w.Write(side); w.Write((byte)0); w.Write((byte)0);
+                    w.Write((short)1); w.Write((short)32);
+                    w.Write(pngs[i].Length); w.Write(offset);
+                    offset += pngs[i].Length;
+                }
+                foreach (var p in pngs) w.Write(p);
+            }
+        }
+
+        // An archive box (lid, handle and, from 32 px, a label) drawn on a 16x16 grid scaled to the size:
+        // its own shape, so a box of studies is never taken for a plain folder whatever its color
+        public static Bitmap Draw(int size, List<int> colors, bool warning)
+        {
+            var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            float s = size / 16f;
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.ScaleTransform(s, s);
+                var bands = Bands(colors, s);
+                Paint(g, s, Rounded(1.5f, 5.5f, 13, 9, 0.7f), bands, 0f);
+                Paint(g, s, Rounded(0.6f, 2.8f, 14.8f, 3.6f, 0.6f), bands, colors == null ? -0.08f : -0.18f);
+
+                // Handle: a slot darker than the box (lighter on dark colors)
+                float at = colors == null ? 8.55f : 8f;
+                Color mid = bands.Find(x => x.From <= at && at < x.To).Color;
+                using (var b = new SolidBrush(Lum(mid) < 0.25f ? Color.FromArgb(150, 150, 150) : Mix(mid, Color.Black, 0.6f)))
+                    g.FillPath(b, Rounded(5.8f, 7.8f, 4.4f, 1.5f, 0.75f));
+                if (size >= 32)
+                {
+                    using (var b = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
+                        g.FillPath(b, Rounded(4.2f, 10.6f, 7.6f, 2.4f, 0.3f));
+                    using (var p = new Pen(Color.FromArgb(150, 120, 120, 120), 1f / s))
+                        g.DrawPath(p, Rounded(4.2f, 10.6f, 7.6f, 2.4f, 0.3f));
+                }
+            }
+            if (warning) DrawWarning(bmp, size);
+            return bmp;
+        }
+
+        // A band of color: the area [From, To) of the grid, vertical (x) or horizontal (y)
+        class Band { public float From, To; public Color Color; public bool Horizontal; }
+
+        // The studies as vertical stripes, left to right; more than MaxStripes as horizontal rainbow
+        // stripes, so "many" is told from "a few" by the direction and not only by the colors.
+        // The edges fall on whole pixels, so the stripes stay sharp at 16 px.
+        static List<Band> Bands(List<int> colors, float s)
+        {
+            var bands = new List<Band>();
+            bool rainbow = colors == null;
+            int n = rainbow ? Rainbow.Length : colors.Count;
+            float from = rainbow ? 2.8f : 1.5f, to = rainbow ? 14.5f : 14.5f;
+            for (int i = 0; i < n; i++)
+            {
+                float a = (float)Math.Round((from + (to - from) * i / n) * s) / s;
+                float z = (float)Math.Round((from + (to - from) * (i + 1) / n) * s) / s;
+                bands.Add(new Band
+                {
+                    From = i == 0 ? -1 : a, To = i == n - 1 ? 17 : z, Horizontal = rainbow,
+                    Color = rainbow ? Rainbow[i] : FromRgb(Palette[colors[i]])
+                });
+            }
+            return bands;
+        }
+
+        static readonly Color[] Rainbow =
+        {
+            Color.FromArgb(230, 25, 40), Color.FromArgb(250, 135, 20), Color.FromArgb(250, 215, 0),
+            Color.FromArgb(40, 170, 60), Color.FromArgb(30, 110, 230), Color.FromArgb(140, 50, 190)
+        };
+
+        // Fills a part of the box band by band, shaded (shade < 0: darker), with a 1 px edge in a
+        // darker tone of each band (gray for white and for dark colors, visible on any background)
+        static void Paint(Graphics g, float s, GraphicsPath path, List<Band> bands, float shade)
+        {
+            var edge = Inset(path, 0.5f / s);
+            foreach (var band in bands)
+            {
+                g.SetClip(band.Horizontal ? new RectangleF(-1, band.From, 18, band.To - band.From)
+                                          : new RectangleF(band.From, -1, band.To - band.From, 18));
+                using (var b = new SolidBrush(Tone(band.Color, shade))) g.FillPath(b, path);
+                using (var p = new Pen(Edge(band.Color), 1f / s)) g.DrawPath(p, edge);
+                g.ResetClip();
+            }
+        }
+
+        static GraphicsPath Rounded(float x, float y, float w, float h, float r)
+        {
+            var p = new GraphicsPath();
+            float d = 2 * r;
+            p.AddArc(x, y, d, d, 180, 90);
+            p.AddArc(x + w - d, y, d, d, 270, 90);
+            p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+            p.AddArc(x, y + h - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        // The same outline k units inside, so a 1 px edge falls on whole pixels
+        static GraphicsPath Inset(GraphicsPath path, float k)
+        {
+            var b = path.GetBounds();
+            var m = new Matrix(b, new[] { new PointF(b.X + k, b.Y + k), new PointF(b.Right - k, b.Y + k), new PointF(b.X + k, b.Bottom - k) });
+            var copy = (GraphicsPath)path.Clone();
+            copy.Transform(m);
+            return copy;
+        }
+
+        static Color FromRgb(int rgb) { return Color.FromArgb((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255); }
+
+        static float Lum(Color c) { return (0.299f * c.R + 0.587f * c.G + 0.114f * c.B) / 255f; }
+
+        static Color Mix(Color a, Color b, float t)
+        {
+            return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
+        }
+
+        // shade < 0: darker; very dark colors get lighter instead, where darker would not show
+        static Color Tone(Color c, float shade)
+        {
+            if (shade == 0) return c;
+            if (Lum(c) < 0.25f) return Mix(c, Color.White, -shade * 0.9f);
+            return Mix(c, Color.Black, -shade);
+        }
+
+        static Color Edge(Color c)
+        {
+            float l = Lum(c);
+            if (l > 0.8f) return Color.FromArgb(140, 140, 140);
+            if (l < 0.25f) return Color.FromArgb(125, 125, 125);
+            return Mix(c, Color.Black, 0.4f);
+        }
+
+        // Warning sign at the bottom right: yellow triangle, dark border and "!". About half the icon
+        // at 16-24 px, where it must be seen; proportionally smaller on larger icons.
+        static void DrawWarning(Bitmap bmp, int size)
+        {
+            float s = size * (size <= 24 ? 0.56f : Math.Max(0.36f, 0.56f - (size - 24) * 0.005f));
+            float x0 = size - s, y0 = size - s * 0.92f;
+            var tri = new[] { new PointF(x0 + s / 2, y0), new PointF(size - 0.5f, size - 0.5f), new PointF(x0, size - 0.5f) };
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                float pen = Math.Max(1f, size / 16f);
+                using (var fill = new SolidBrush(Color.FromArgb(255, 200, 0)))
+                    g.FillPolygon(fill, tri);
+                using (var border = new Pen(Color.FromArgb(60, 40, 0), pen) { LineJoin = LineJoin.Round })
+                    g.DrawPolygon(border, tri);
+                using (var mark = new SolidBrush(Color.Black))
+                {
+                    float cx = x0 + s / 2, bar = Math.Max(1f, s * 0.13f);
+                    g.FillRectangle(mark, cx - bar / 2, y0 + s * 0.32f, bar, s * 0.33f);
+                    g.FillRectangle(mark, cx - bar / 2, y0 + s * 0.72f, bar, bar);
+                }
+            }
+        }
+    }
+}
 '@
 
 if (-not ('DicomStudyCount.Scanner' -as [type])) {
@@ -1700,7 +2096,7 @@ if (-not ('DicomStudyCount.Scanner' -as [type])) {
             New-Item -ItemType Directory -Path $binDir -Force | Out-Null
             # Compiled under a temporary name and renamed, in case two counts start at the same time
             $tmp = Join-Path $binDir ([Guid]::NewGuid().ToString('N') + '.dll')
-            Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $tmp -OutputType Library
+            Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies System.Drawing -OutputAssembly $tmp -OutputType Library
             try { Move-Item -LiteralPath $tmp -Destination $dll -ErrorAction Stop }
             catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
             # DLLs of older versions of the script (the ones still loaded are left for the next time)
@@ -1710,7 +2106,7 @@ if (-not ('DicomStudyCount.Scanner' -as [type])) {
         Add-Type -LiteralPath $dll
     }
     catch {
-        if (-not ('DicomStudyCount.Scanner' -as [type])) { Add-Type -TypeDefinition $source -Language CSharp }
+        if (-not ('DicomStudyCount.Scanner' -as [type])) { Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies System.Drawing }
     }
 }
 
@@ -1875,6 +2271,18 @@ function Show-DicomTree([string]$root) {
     $tree.HideSelection = $false
     $tree.ShowNodeToolTips = $true
     $tree.ItemHeight = [int]($form.Font.Height * 1.6)
+
+    # Folder icons: the same ones Explorer shows (study colors), at the size of the screen's DPI
+    $dpiGraphics = $tree.CreateGraphics()
+    $script:iconSize = [int][Math]::Round(16 * $dpiGraphics.DpiX / 96)
+    $dpiGraphics.Dispose()
+    $images = New-Object Windows.Forms.ImageList
+    $images.ColorDepth = 'Depth32Bit'
+    $images.ImageSize = New-Object Drawing.Size($script:iconSize, $script:iconSize)
+    try { $images.Images.Add('folder', [DicomStudyCount.FolderIcons]::SystemFolder($script:iconSize)) } catch { }
+    $tree.ImageList = $images
+    $tree.ImageKey = 'folder'
+    $tree.SelectedImageKey = 'folder'
 
     $toolbar = New-Object Windows.Forms.FlowLayoutPanel
     $toolbar.Dock = 'Top'
@@ -2112,6 +2520,23 @@ function Show-DicomTree([string]$root) {
         $text
     }
 
+    # Shows the folder icon written by the count (rebuilt if it was lost), or the plain folder
+    function Set-NodeIcon($node) {
+        $key = 'folder'
+        try {
+            $icon = [DicomStudyCount.FolderIcons]::OfFolder($node.Tag.Path)
+            if ($icon) {
+                if (-not $images.Images.ContainsKey($icon)) { $images.Images.Add($icon, [DicomStudyCount.FolderIcons]::Load($icon, $script:iconSize)) }
+                $key = $icon
+            }
+        }
+        catch { }
+        if ($node.ImageKey -ne $key) {
+            $node.ImageKey = $key
+            $node.SelectedImageKey = $key
+        }
+    }
+
     # Files directly in the folder (the desktop.ini written by this script does not count)
     function Get-DirectFileCount([string]$dir) {
         try { $n = [IO.Directory]::GetFiles($dir).Length } catch { return 0 }
@@ -2128,8 +2553,9 @@ function Show-DicomTree([string]$root) {
         if ($index -ge 0) { $nodes.Insert($index, $node) } else { [void]$nodes.Add($node) }
         $node.Tag = [pscustomobject]@{ Path = $dir; Comment = $comment; StudyUid = (Get-StudyUid $comment); DirectFiles = $direct; TotalFiles = $direct }
         $node.ToolTipText = $comment
+        Set-NodeIcon $node
         $script:nodeByPath[$dir] = $node
-        $width = ($level + 1) * $tree.Indent + [Windows.Forms.TextRenderer]::MeasureText($name, $tree.Font).Width
+        $width = ($level + 1) * $tree.Indent + $script:iconSize + 4 + [Windows.Forms.TextRenderer]::MeasureText($name, $tree.Font).Width
         if ($width -gt $script:nameWidth) { $script:nameWidth = $width }
         $subs = @()
         try { $subs = [IO.Directory]::GetDirectories($dir) | Sort-Object $naturalKey } catch { }
@@ -2464,6 +2890,7 @@ function Show-DicomTree([string]$root) {
                 $node.ToolTipText = $comment
                 Repaint-Row $node
             }
+            Set-NodeIcon $node
         }
         Update-StudyColors
         Update-Status
@@ -2512,6 +2939,8 @@ if ($Watch) {
                     if ($handled.ContainsKey($key)) { continue }
                     if ([IO.Path]::IsPathRooted($path) -and (Test-HasDicomComments $path)) {
                         [void][DicomStudyCount.ExplorerColumns]::ShowCommentColumn($window)
+                        # Folder icons lost (deleted cache, another PC): rebuilt from their names
+                        try { [DicomStudyCount.FolderIcons]::RepairChildren($path) } catch { }
                     }
                     $handled[$key] = $true
                 }
@@ -2544,7 +2973,6 @@ try {
         Write-Host "Comments removed from $cleared folders in $root"
         return
     }
-
     if ($WriteComments) { Show-CommentColumn $root }
 
     $progress = New-Object DicomStudyCount.ScanProgress

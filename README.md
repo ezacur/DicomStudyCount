@@ -5,7 +5,8 @@ Find duplicated DICOM files and badly organized folders straight from Windows Ex
 Right-click a folder and choose **Count DICOM studies**: every folder and subfolder gets a summary in
 Explorer's **Comments** column (studies, date, series) together with warnings for the problems found:
 studies split across folders, duplicated images, incomplete series and copies in other locations.
-**Show DICOM tree** opens the whole folder tree with one color per study.
+Folders with DICOM get an archive box icon in the color of their study. **Show DICOM tree** opens the whole folder tree with one
+color per study.
 
 ![Comments column in Explorer](docs/explorer-comments.png)
 
@@ -43,13 +44,23 @@ studies split across folders, duplicated images, incomplete series and copies in
   - **Copies in other counted locations**: every count keeps an index of its files (path, size, date
     and time, study and image UIDs); copies found in other counted folders or disks are confirmed with
     the same byte-by-byte comparison. Entries of deleted or replaced files are dropped from the index.
-- **DICOM tree window**: the folder tree with the number of files (recursive), the comment of every
-  folder, one pastel color per study, *Expand to studies* (expands until studies separate), live
+- **Folder icons in the colors of the studies** (Name column, and every other view of Explorer): an
+  archive box instead of a folder, so folders with DICOM stand out whatever their color:
+  - one study: a box of the study's color, always the same for the same study (22 colors told
+    apart at 16 px, from a hash of the StudyInstanceUID, including black, white and three grays);
+  - 2 to 5 studies: vertical stripes of their colors, in date order;
+  - more than 5 studies: horizontal rainbow stripes;
+  - problems: a small `⚠` in the corner.
+
+  Folders without DICOM keep the normal folder icon, and a custom icon set by someone else is never
+  replaced.
+- **DICOM tree window**: the folder tree with the same icons, the number of files (recursive),
+  the comment of every folder, one pastel color per study in the rows, *Expand to studies* (expands until studies separate), live
   updates while counting and when files or folders change, and the *Problems* window.
 - **No window while counting**: folders show `Counting StudyUIDs...` and are updated one by one as
   they are finished; the Comments column is added to open Explorer windows and fitted to the text.
 - **Background watcher**: adds the Comments column (last, fitted to the text) whenever you browse a
-  folder that has comments written by this tool.
+  folder that has comments written by this tool, and rebuilds its folder icons if they were lost.
 
 ## Requirements
 
@@ -104,7 +115,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Un
 
 | What | Where | Undo |
 |---|---|---|
-| Folder comments | a hidden `desktop.ini` in each folder with DICOM, and the folder's Read-only attribute (needed by Explorer to read it) | `-ClearComments` removes only what the tool wrote and restores the attribute |
+| Folder comments and icons | a hidden `desktop.ini` in each folder with DICOM, and the folder's Read-only attribute (needed by Explorer to read it) | `-ClearComments` removes only what the tool wrote and restores the attribute |
+| Folder icon files | `%LOCALAPPDATA%\DicomStudyCount\icons\` (built when first needed; a lost one is built again from its name) | delete the folder |
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
@@ -118,9 +130,14 @@ patient information), and they stay on the local machine.
 - Comments are a snapshot of the last count: count again after moving or copying data.
 - Explorer only refreshes after ~0.6 s without change notifications; the tool pauses 1 s after
   marking folders as *Counting* so that state is visible.
-- Explorer cannot color cells or rows (color emoji are drawn in gray), hence the study tags; colors
-  are only available in the tree window, where they are assigned in tree order so consecutive studies
-  get clearly different hues.
+- Explorer cannot color text, cells or rows (color emoji are drawn in gray), hence the study tags and
+  the folder icons. With 22 colors, different studies can share a color: the tag tells them apart.
+  The pastel colors of the tree rows are assigned in tree order instead, so consecutive studies get
+  clearly different hues (saturated colors would make the text unreadable).
+- The icons live in `%LOCALAPPDATA%` of the user who counted, and `desktop.ini` points there: on
+  another PC or user account the folders show the plain folder icon (never a broken one) until they
+  are counted there. Large icon views can take a few seconds to show them the first time. On the same account, a deleted icon is rebuilt by the background watcher, the
+  tree window or the next count.
 - Explorer's sorting and search are case-insensitive, while study tags are case-sensitive.
 - Incomplete series are judged on the range of InstanceNumbers seen (min..max): gaps before the lowest
   number seen cannot be detected. Non-image series such as Siemens *PhoenixZIPReport* often have gaps.
