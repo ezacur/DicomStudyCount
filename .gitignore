@@ -1,2 +1,2 @@
-# Build output of the icon handler (shellext\Build-DicomIcons.ps1)
-shellext/bin/
+# The DLLs of bin\ are in the repository on purpose (no build needed to use the tool);
+# tools\Build.ps1 builds in %TEMP%, so there is no build output to ignore here.

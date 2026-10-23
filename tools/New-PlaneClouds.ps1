@@ -2,7 +2,8 @@
 .SYNOPSIS
     Generates PlaneClouds.h from slicePlaneName of DICOMstack.m: the clouds of reference orientations
     (elevation, azimuth) of the cardiac views hla, vla, lvot and sa, used by the "DICOM plane
-    (experimental)" column of DicomIcons.dll. Run it again when the clouds change there.
+    (experimental)" column of bin\DicomShell.dll. Run it again when the clouds change there, then
+    tools\Build.ps1 -Cpp.
 #>
 param([string]$Source = 'C:\Dropbox\mTools\libraries\scratch\DICOM\DICOMstack.m')
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,6 @@ foreach ($name in 'HLA', 'VLA', 'LVOT', 'SA') {
     [void]$out.AppendLine('};')
     Write-Host "$name : $($pairs.Count) orientations"
 }
-$target = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'PlaneClouds.h'
+$target = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'src\PlaneClouds.h'
 [IO.File]::WriteAllText($target, ($out.ToString() -replace "`r?`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
 Write-Host "Written $target"

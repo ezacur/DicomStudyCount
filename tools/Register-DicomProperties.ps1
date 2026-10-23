@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Registers the DICOM property handler of DicomIcons.dll for the whole machine (it needs administrator
+    Registers the DICOM property handler of bin\DicomShell.dll for the whole machine (it needs administrator
     rights: Windows reads property handlers only from HKLM). -Uninstall removes it.
 .NOTES
     The DLL is copied to %ProgramFiles%\DicomStudyCount, which only administrators can change: Explorer
@@ -17,7 +17,8 @@ if (-not (New-Object Security.Principal.WindowsPrincipal ([Security.Principal.Wi
     throw 'Administrator rights are needed (run it elevated)'
 }
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
-if (-not $Dll) { $Dll = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'bin\DicomIcons.dll' }
+$bin = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'bin'
+if (-not $Dll) { $Dll = Join-Path $bin 'DicomShell.dll' }
 
 $clsid = '{21329A2B-09B3-4250-9103-9267877321EB}'
 $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
@@ -26,7 +27,7 @@ $extensions = '.', '.dcm'                                   # '.': files without
 $hklm = [Microsoft.Win32.Registry]::LocalMachine
 $dir = Join-Path $env:ProgramFiles 'DicomStudyCount'
 # The columns (names, types) of the properties: a schema registered from its installed copy
-$schemaSource = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'DicomStudyCount.propdesc'
+$schemaSource = Join-Path $bin 'DicomStudyCount.propdesc'
 $schema = Join-Path $dir 'DicomStudyCount.propdesc'
 Add-Type -Namespace DicomPropsSetup -Name PropSys -MemberDefinition '
     [DllImport("propsys.dll", CharSet = CharSet.Unicode)] public static extern int PSRegisterPropertySchema(string path);
@@ -50,7 +51,7 @@ if ($Uninstall) {
     return
 }
 
-if (-not (Test-Path -LiteralPath $Dll)) { throw "Not found: $Dll (build it with Build-DicomIcons.ps1)" }
+if (-not (Test-Path -LiteralPath $Dll)) { throw "Not found: $Dll (build it with tools\Build.ps1)" }
 $sha = [Security.Cryptography.SHA256]::Create()
 $hash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($Dll))[0..7] | ForEach-Object { $_.ToString('x2') })
 New-Item -ItemType Directory -Force $dir | Out-Null

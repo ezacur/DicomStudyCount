@@ -1,4 +1,4 @@
-// DicomIcons: Explorer icon handler for DICOM files. Every DICOM file gets an icon with its
+// DicomShell (bin\DicomShell.dll, built by tools\Build.ps1): Explorer icon handler for DICOM files. Every DICOM file gets an icon with its
 // SeriesNumber written in the color of its study (the same palette and hash as the folder boxes of
 // Count-DicomStudies.ps1), on the complementary color. Files that are not DICOM (or are a DICOMDIR)
 // keep the generic file icon.
@@ -12,7 +12,7 @@
 // last count ("duplicated in").
 //
 // Registered by Count-DicomStudies.ps1 -Install for .dcm and files without extension: the icons per
-// user (Register-DicomIcons.ps1), the properties for the machine (Register-DicomProperties.ps1).
+// user (tools\Register-DicomIcons.ps1), the properties for the machine (tools\Register-DicomProperties.ps1).
 // It runs inside Explorer: every error ends in the generic icon or no properties, never in an exception.
 
 #include <windows.h>
@@ -115,6 +115,7 @@ struct Header
     std::string acquisitionDateTime, acquisitionDate, acquisitionTime, contentDate, contentTime;
     std::string seriesDate, seriesTime, studyDate;
     std::string numberOfFrames, triggerTime, sliceThickness, pixelSpacing;
+
 };
 
 // Where the reading stops: the icons need the header up to SeriesNumber only, the columns up to
@@ -291,47 +292,6 @@ static Kind ReadDataset(Parser& p, File& f, Header& h, unsigned last)
         case 0x00280030:                                           // PixelSpacing
             if (!p.String(len, h.pixelSpacing)) return Kind::Dicom;
             break;
-        case 0x00080005:                                           // SpecificCharacterSet
-            if (!p.String(len, h.charset)) return Kind::Dicom;
-            break;
-        case 0x00080018:                                           // SOPInstanceUID
-            if (!p.String(len, h.sopUid)) return Kind::Dicom;
-            break;
-        case 0x00080060:                                           // Modality
-            if (!p.String(len, h.modality)) return Kind::Dicom;
-            break;
-        case 0x0008103E:                                           // SeriesDescription
-            if (!p.String(len, h.seriesDescription)) return Kind::Dicom;
-            break;
-        case 0x0020000D:                                           // StudyInstanceUID
-            if (!p.String(len, h.studyUid)) return Kind::Dicom;
-            break;
-        case 0x0020000E:                                           // SeriesInstanceUID
-            if (!p.String(len, h.seriesUid)) return Kind::Dicom;
-            break;
-        case 0x00100020:                                           // PatientID
-            if (!p.String(len, h.patientId)) return Kind::Dicom;
-            break;
-        case 0x00200011:                                           // SeriesNumber
-            if (!p.String(len, h.seriesNumber)) return Kind::Dicom;
-            break;
-        case 0x00200013:                                           // InstanceNumber
-            if (!p.String(len, h.instanceNumber)) return Kind::Dicom;
-            break;
-        case 0x00200032:                                           // ImagePositionPatient
-            if (!p.String(len, h.imagePosition)) return Kind::Dicom;
-            break;
-        case 0x00200037:                                           // ImageOrientationPatient
-            if (!p.String(len, h.imageOrientation)) return Kind::Dicom;
-            break;
-        case 0x00280010:                                           // Rows (US, binary)
-        case 0x00280011:                                           // Columns
-        {
-            unsigned value = 0;
-            if (len < 2 || !p.U16(value) || !f.Skip(len - 2)) return Kind::Dicom;
-            (tag == 0x00280010 ? h.rows : h.columns) = value;
-            break;
-        }
         default:
             if (!f.Skip(len)) return Kind::Dicom;
         }

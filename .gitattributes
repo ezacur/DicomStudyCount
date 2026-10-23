@@ -3,5 +3,7 @@
 *.md  text eol=crlf
 *.cpp text eol=crlf
 *.h   text eol=crlf
+*.cs  text eol=crlf
+*.dll binary
 *.propdesc text eol=crlf
 *.png binary

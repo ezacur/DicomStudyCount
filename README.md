@@ -55,12 +55,12 @@ tree** opens the whole folder tree with one color per study.
 
   Folders without DICOM keep the normal folder icon, and a custom icon set by someone else is never
   replaced.
-- **Icons of the DICOM files** (optional): every DICOM file shows its SeriesNumber in the color of its
+- **Icons of the DICOM files**: every DICOM file shows its SeriesNumber in the color of its
   study (the color of its box), on the complementary color (made darker or lighter when the number
   would not read well on it). DICOMDIR and other files keep their usual icon. It is an icon handler,
-  a small C++ DLL (`shellext\DicomIcons.cpp`) that Explorer asks for the icon of `.dcm` files and of
+  a small C++ DLL (`bin\DicomShell.dll`) that Explorer asks for the icon of `.dcm` files and of
   files without extension; it reads only the header, up to SeriesNumber, and never writes to them.
-- **Columns of the DICOM files** (optional): Explorer columns that can be shown, sorted, grouped and
+- **Columns of the DICOM files**: Explorer columns that can be shown, sorted, grouped and
   filtered like any other (right-click a column header > *More...*, they all start with "DICOM"):
 
   | Column | Example |
@@ -82,7 +82,7 @@ tree** opens the whole folder tree with one color per study.
   | DICOM Z level | position of the slice along its normal (mm), as `xZ` of DICOMstack: comparable only between slices with the same frame of reference |
   | DICOM frame of reference | 5-character hash of the FrameOfReferenceUID |
   | DICOM trigger time | ms after the R wave (cine phase) |
-  | DICOM plane (experimental) | as `slicePlaneName` of DICOMstack: `AX`/`COR`/`SAG` only within 1e-3 rad of a cardinal plane, otherwise the nearest cardiac view `hla`/`vla`/`lvot`/`sa` (`shellext\New-PlaneClouds.ps1` takes its reference orientations from DICOMstack.m) |
+  | DICOM plane (experimental) | as `slicePlaneName` of DICOMstack: `AX`/`COR`/`SAG` only within 1e-3 rad of a cardinal plane, otherwise the nearest cardiac view `hla`/`vla`/`lvot`/`sa` (`tools\New-PlaneClouds.ps1` takes its reference orientations from DICOMstack.m) |
   | DICOM duplicated in | the other copies of the file found by the last count, in the counted folder or in other counted locations (`(differs)` when their bytes differ) |
 
   They come from the property handler of the same DLL, which reads the header on the fly; *duplicated
@@ -98,38 +98,50 @@ tree** opens the whole folder tree with one color per study.
 
 ## Requirements
 
-- Windows 10 or 11.
-- Windows PowerShell 5.1 (included in Windows). No other dependencies: the DICOM reader is C# code
-  embedded in the script and compiled on the fly.
-- No administrator rights: everything is installed for the current user (`HKCU`).
+- Windows 10 or 11, 64-bit.
+- Windows PowerShell 5.1 (included in Windows). Nothing to build or install besides: the DLLs are in
+  `bin\`.
+- Administrator rights only for the columns of the DICOM files (Windows registers them for the whole
+  machine); everything else is installed for the current user (`HKCU`).
+
+## The folder
+
+Everything the tool needs is in its folder; what it writes while working (caches, reports, icons)
+goes to `%LOCALAPPDATA%\DicomStudyCount\` (see [What it writes, and where](#what-it-writes-and-where)).
+
+| Path | What |
+|---|---|
+| `Count-DicomStudies.ps1` | the tool: context menu, count, tree window, install |
+| `bin\DicomStudyCount.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
+| `bin\DicomShell.dll` | the icons and columns of the DICOM files (C++, loaded by Explorer) |
+| `bin\DicomStudyCount.propdesc` | the definition of those columns |
+| `src\` | the sources of the DLLs |
+| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Get-ShellProperties.ps1`) |
 
 ## Installation
 
-1. Copy `Count-DicomStudies.ps1` to a permanent folder, for example
+1. Copy (or clone) the whole folder to a permanent place, for example
    `C:\Users\<you>\Tools\DicomStudyCount\`. The context menu points to that path, so run `-Install`
    again if you move it.
-2. If the file was downloaded, unblock it:
+2. If it was downloaded as a zip, unblock its files:
    ```powershell
-   Unblock-File .\Count-DicomStudies.ps1
+   Get-ChildItem -Recurse | Unblock-File
    ```
-3. Install the context menu and the background watcher:
+3. Install the context menu, the background watcher, and the icons and columns of the DICOM files
+   (a UAC prompt for the columns; restart Explorer to see them):
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Install
    ```
-   For the icons and columns of the DICOM files, build the DLL first (it needs the Visual Studio C++
-   build tools); `-Install` registers it when it finds it built (the icons for the user; the columns
-   for the machine, after a UAC prompt; restart Explorer to see them):
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\shellext\Build-DicomIcons.ps1
-   ```
-   It is registered only for the types no other program owns (`.dcm`, files without extension);
-   `shellext\Test-DicomIcons.ps1` tries the icons outside Explorer, and `shellext\Get-ShellProperties.ps1`
-   prints the columns of files as Explorer sees them.
+   The icons and columns are registered only for the types no other program owns (`.dcm`, files
+   without extension). Explorer loads copies of `bin\DicomShell.dll` (in `%LOCALAPPDATA%` for the
+   icons, in `%ProgramFiles%\DicomStudyCount` for the columns, which the search indexer also loads,
+   so only administrators can change it), so the folder can be updated at any time.
 4. Recommended: hide protected operating system files (Explorer > *Options* > *View* >
    *Hide protected operating system files*), so the `desktop.ini` files are not shown.
 
-On Windows 11 the **DICOM** submenu is under **Show more options** (or Shift+F10). Running `-Install`
-again updates the menu of an earlier version.
+On Windows 11 the **DICOM** submenu is under **Show more options** (or Shift+F10). After updating the
+folder (a new version, a `git pull`), run `-Install` again: it registers the new DLLs, and asks for
+administrator rights only if the columns changed.
 
 To remove the context menu and the watcher:
 ```powershell
@@ -182,7 +194,7 @@ menu, so the menu cannot tell a counted folder from one that is not.
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
-| Icons of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (the DLL) and `HKCU\Software\Classes` (its CLSID, the `DicomStudyCount.*` file types, and `.dcm` and `.` when no other program owned them) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| Icons of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`) and `HKCU\Software\Classes` (its CLSID, the `DicomStudyCount.*` file types, and `.dcm` and `.` when no other program owned them) | `-Uninstall` (Explorer frees the DLL when it restarts) |
 | Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID`, the property handlers of `.dcm` and `.` (when they had none) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 

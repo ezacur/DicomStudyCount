@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Registers DicomIcons.dll for the current user (HKCU, no administrator rights): DICOM files without
-    extension and .dcm files get the icon drawn by it. -Uninstall removes it. Called by
-    Count-DicomStudies.ps1 -Install / -Uninstall.
+    Registers the icon handler of bin\DicomShell.dll for the current user (HKCU, no administrator
+    rights): DICOM files without extension and .dcm files get the icon drawn by it. -Uninstall removes
+    it. Called by Count-DicomStudies.ps1 -Install / -Uninstall.
 .NOTES
     The DLL is copied to %LOCALAPPDATA%\DicomStudyCount\shellext under a name with its hash: Explorer
-    keeps the registered one loaded, so a new build can never overwrite it.
+    keeps the registered one loaded, so the one in bin\ can always be replaced.
     An extension that already belongs to another program is left alone (its icon is not changed).
 #>
 param(
@@ -14,7 +14,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
-if (-not $Dll) { $Dll = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'bin\DicomIcons.dll' }
+if (-not $Dll) { $Dll = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'bin\DicomShell.dll' }
 $clsid = '{F4798986-2EEA-49F6-8082-2FC552CE691B}'
 $classes = 'Software\Classes'
 $state = 'Software\DicomStudyCount\IconHandler'      # what was registered, to undo only that
@@ -48,12 +48,12 @@ if ($Uninstall) {
     return
 }
 
-if (-not (Test-Path -LiteralPath $Dll)) { throw "Not found: $Dll (build it with Build-DicomIcons.ps1)" }
+if (-not (Test-Path -LiteralPath $Dll)) { throw "Not found: $Dll (build it with tools\Build.ps1)" }
 $sha = [Security.Cryptography.SHA256]::Create()
 $hash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($Dll))[0..7] | ForEach-Object { $_.ToString('x2') })
 $dir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\shellext'
 New-Item -ItemType Directory -Force $dir | Out-Null
-$target = Join-Path $dir "DicomIcons-$hash.dll"
+$target = Join-Path $dir "DicomShell-$hash.dll"
 if (-not (Test-Path -LiteralPath $target)) { Copy-Item -LiteralPath $Dll -Destination $target }
 
 $k = $hkcu.CreateSubKey("$classes\CLSID\$clsid")
@@ -80,7 +80,7 @@ foreach ($t in $types) {
 }
 [DicomIconsSetup.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)   # SHCNE_ASSOCCHANGED
 
-# Copies of earlier builds that Explorer no longer has loaded
-Get-ChildItem -LiteralPath $dir -Filter 'DicomIcons-*.dll' | Where-Object { $_.FullName -ne $target } |
+# Copies of earlier builds that Explorer no longer has loaded (DicomIcons-*: their older name)
+Get-ChildItem -LiteralPath $dir -Filter 'Dicom*-*.dll' | Where-Object { $_.FullName -ne $target } |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 Write-Host "DICOM file icons registered: $target"

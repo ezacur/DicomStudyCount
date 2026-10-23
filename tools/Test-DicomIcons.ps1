@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Tests DicomIcons.dll outside Explorer: loads it in this process (no registration), asks it for the
+    Tests the icon handler of bin\DicomShell.dll outside Explorer: loads it in this process (no registration), asks it for the
     icon of every file given and saves the icons drawn as PNG, plus a sheet with all the colors.
 .EXAMPLE
     .\Test-DicomIcons.ps1 -Files (Get-ChildItem D:\DICOM_DEMO -Recurse -File) -Out C:\temp\icons
@@ -12,7 +12,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
-if (-not $Dll) { $Dll = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'bin\DicomIcons.dll' }
+if (-not $Dll) { $Dll = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'bin\DicomShell.dll' }
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System; using System.Drawing; using System.Runtime.InteropServices; using System.Text;
 public static class IconTest {

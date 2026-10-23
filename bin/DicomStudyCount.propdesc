@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Columns of DICOM files in Explorer, filled by the property handler of DicomIcons.dll. Registered
-     with PSRegisterPropertySchema by Register-DicomProperties.ps1. The labels start with "DICOM" so
+<!-- Columns of DICOM files in Explorer, filled by the property handler of bin\DicomShell.dll. Registered
+     with PSRegisterPropertySchema by tools\Register-DicomProperties.ps1. The labels start with "DICOM" so
      they are listed together in Explorer's "More..." columns. -->
 <schema xmlns="http://schemas.microsoft.com/windows/2006/propertydescription" schemaVersion="1.0">
   <propertyDescriptionList publisher="DicomStudyCount" product="DicomStudyCount">
