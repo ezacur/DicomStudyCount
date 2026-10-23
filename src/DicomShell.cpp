@@ -115,13 +115,16 @@ struct Header
     std::string acquisitionDateTime, acquisitionDate, acquisitionTime, contentDate, contentTime;
     std::string seriesDate, seriesTime, studyDate;
     std::string numberOfFrames, triggerTime, sliceThickness, pixelSpacing;
-
+    // Identifying data, for the "sensitive data" column (its values are never shown)
+    std::string patientName, birthDate, address, phone, otherNames, otherIds, motherName;
+    std::string institution, institutionAddress, referring, performing, operators;
+    std::string identityRemoved, burnedIn;
 };
 
 // Where the reading stops: the icons need the header up to SeriesNumber only, the columns up to
-// PixelSpacing (the last attribute they show)
+// BurnedInAnnotation (the last attribute they look at)
 static const unsigned UpToSeriesNumber = 0x00200011;
-static const unsigned UpToPixelSpacing = 0x00280030;
+static const unsigned UpToBurnedIn = 0x00280301;
 
 class Parser
 {
@@ -292,6 +295,62 @@ static Kind ReadDataset(Parser& p, File& f, Header& h, unsigned last)
         case 0x00280030:                                           // PixelSpacing
             if (!p.String(len, h.pixelSpacing)) return Kind::Dicom;
             break;
+        // Identifying data
+        case 0x00080080: if (!p.String(len, h.institution)) return Kind::Dicom; break;          // InstitutionName
+        case 0x00080081: if (!p.String(len, h.institutionAddress)) return Kind::Dicom; break;   // InstitutionAddress
+        case 0x00080090: if (!p.String(len, h.referring)) return Kind::Dicom; break;            // ReferringPhysicianName
+        case 0x00081050: if (!p.String(len, h.performing)) return Kind::Dicom; break;           // PerformingPhysicianName
+        case 0x00081070: if (!p.String(len, h.operators)) return Kind::Dicom; break;            // OperatorsName
+        case 0x00100010: if (!p.String(len, h.patientName)) return Kind::Dicom; break;          // PatientName
+        case 0x00100030: if (!p.String(len, h.birthDate)) return Kind::Dicom; break;            // PatientBirthDate
+        case 0x00101000: if (!p.String(len, h.otherIds)) return Kind::Dicom; break;             // OtherPatientIDs
+        case 0x00101001: if (!p.String(len, h.otherNames)) return Kind::Dicom; break;           // OtherPatientNames
+        case 0x00101040: if (!p.String(len, h.address)) return Kind::Dicom; break;              // PatientAddress
+        case 0x00101060: if (!p.String(len, h.motherName)) return Kind::Dicom; break;           // PatientMotherBirthName
+        case 0x00102154: if (!p.String(len, h.phone)) return Kind::Dicom; break;                // PatientTelephoneNumbers
+        case 0x00120062: if (!p.String(len, h.identityRemoved)) return Kind::Dicom; break;      // PatientIdentityRemoved
+        case 0x00280301: if (!p.String(len, h.burnedIn)) return Kind::Dicom; break;             // BurnedInAnnotation
+        case 0x00080005:                                           // SpecificCharacterSet
+            if (!p.String(len, h.charset)) return Kind::Dicom;
+            break;
+        case 0x00080018:                                           // SOPInstanceUID
+            if (!p.String(len, h.sopUid)) return Kind::Dicom;
+            break;
+        case 0x00080060:                                           // Modality
+            if (!p.String(len, h.modality)) return Kind::Dicom;
+            break;
+        case 0x0008103E:                                           // SeriesDescription
+            if (!p.String(len, h.seriesDescription)) return Kind::Dicom;
+            break;
+        case 0x0020000D:                                           // StudyInstanceUID
+            if (!p.String(len, h.studyUid)) return Kind::Dicom;
+            break;
+        case 0x0020000E:                                           // SeriesInstanceUID
+            if (!p.String(len, h.seriesUid)) return Kind::Dicom;
+            break;
+        case 0x00100020:                                           // PatientID
+            if (!p.String(len, h.patientId)) return Kind::Dicom;
+            break;
+        case 0x00200011:                                           // SeriesNumber
+            if (!p.String(len, h.seriesNumber)) return Kind::Dicom;
+            break;
+        case 0x00200013:                                           // InstanceNumber
+            if (!p.String(len, h.instanceNumber)) return Kind::Dicom;
+            break;
+        case 0x00200032:                                           // ImagePositionPatient
+            if (!p.String(len, h.imagePosition)) return Kind::Dicom;
+            break;
+        case 0x00200037:                                           // ImageOrientationPatient
+            if (!p.String(len, h.imageOrientation)) return Kind::Dicom;
+            break;
+        case 0x00280010:                                           // Rows (US, binary)
+        case 0x00280011:                                           // Columns
+        {
+            unsigned value = 0;
+            if (len < 2 || !p.U16(value) || !f.Skip(len - 2)) return Kind::Dicom;
+            (tag == 0x00280010 ? h.rows : h.columns) = value;
+            break;
+        }
         default:
             if (!f.Skip(len)) return Kind::Dicom;
         }
@@ -1090,6 +1149,51 @@ static double NearestInCloud(const double n[3], const double (&cloud)[N][2])
     return best;
 }
 
+static const PROPERTYKEY PKEY_SensitiveData = { FMTID_Dicom, 29 };
+
+// A value that identifies someone: not empty and not a placeholder left by anonymizers
+// ("ANONYMOUS", "^", "removed"...)
+static bool Identifies(std::string v)
+{
+    std::string t;
+    for (char c : v) if (c != '^' && c != ' ' && c != '*' && c != '=' && c != '-' && c != '\\') t += static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (t.empty()) return false;
+    static const char* placeholders[] = { "anonymous", "anonymized", "anonymised", "anon", "unknown", "removed", "deidentified",
+                                          "none", "na", "x", "xx", "xxx", "patient", "noname", "redacted" };
+    for (auto p : placeholders) if (t == p) return false;
+    return t.compare(0, 6, "anonym") != 0;
+}
+
+// Which kinds of identifying data the header still holds (never the values themselves): "YES: name,
+// birth date, institution"; "no"; "de-identified" (PatientIdentityRemoved) with what remains anyway.
+// Experimental: it cannot see text burned into the pixels that the header does not declare, nor
+// identifying data hidden in private tags.
+static std::wstring SensitiveData(const Header& h)
+{
+    std::wstring found;
+    auto add = [&](const std::string& value, const wchar_t* what) {
+        if (!Identifies(value)) return;
+        if (!found.empty()) found += L", ";
+        found += what;
+    };
+    add(h.patientName, L"name");
+    add(h.otherNames, L"other names");
+    add(h.motherName, L"mother's name");
+    add(h.birthDate, L"birth date");
+    add(h.address, L"address");
+    add(h.phone, L"phone");
+    add(h.otherIds, L"other IDs");
+    add(h.referring, L"referring physician");
+    add(h.performing, L"performing physician");
+    add(h.operators, L"operators");
+    add(h.institution, L"institution");
+    add(h.institutionAddress, L"institution address");
+    if (h.burnedIn == "YES") { if (!found.empty()) found += L", "; found += L"burned-in text"; }
+    bool removed = h.identityRemoved == "YES";
+    if (found.empty()) return removed ? L"de-identified" : L"no";
+    return (removed ? L"de-identified, but: " : L"YES: ") + found;
+}
+
 static std::wstring PlaneName(const Header& h)
 {
     double o[6];
@@ -1150,7 +1254,7 @@ public:
         try
         {
             Header h;
-            if (ReadHeader(path, h, UpToPixelSpacing) != Kind::Dicom) return S_OK;   // not DICOM: no properties
+            if (ReadHeader(path, h, UpToBurnedIn) != Kind::Dicom) return S_OK;   // not DICOM: no properties
             if (!h.studyUid.empty()) Set(PKEY_StudyHash, Hash5(h.studyUid));
             if (!h.seriesUid.empty()) Set(PKEY_SeriesHash, Hash5(h.seriesUid));
             Set(PKEY_PatientID, Widen(h.patientId, h.charset));
@@ -1175,6 +1279,7 @@ public:
             Set(PKEY_Protocol, Widen(h.protocolName, h.charset));
             Set(PKEY_Manufacturer, Widen(h.manufacturer, h.charset));
             Set(PKEY_Plane, PlaneName(h));
+            Set(PKEY_SensitiveData, SensitiveData(h));
             Set(PKEY_StudyUid, Widen(h.studyUid));
             Set(PKEY_SeriesUid, Widen(h.seriesUid));
             Set(PKEY_SeriesDescription, Widen(h.seriesDescription, h.charset));

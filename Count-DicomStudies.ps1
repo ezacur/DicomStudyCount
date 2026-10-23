@@ -94,7 +94,7 @@ $menuEntries = @(
 $dicomColumns = 'StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber', 'SeriesDescription',
     'Plane', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness', 'Frames',
     'ImageType', 'ObjectType', 'Compression', 'Protocol', 'Manufacturer', 'FrameOfReference', 'StudyDate',
-    'PatientID', 'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' |
+    'PatientID', 'SensitiveData', 'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' |
     ForEach-Object { "DicomStudyCount.$_" }
 $menuParents = @(
     'HKCU:\Software\Classes\Directory\shell',

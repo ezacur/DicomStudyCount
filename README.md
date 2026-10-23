@@ -71,6 +71,7 @@ tree** opens the whole folder tree with one color per study.
   | DICOM series description / protocol | `cine_retro_4ch` |
   | DICOM modality / manufacturer | `MR`, `Siemens Healthineers` |
   | DICOM patient ID | `5805091` |
+  | DICOM sensitive data (experimental) | which kinds of identifying data the header holds, never their values: `YES: name, birth date, institution`, `no`, `de-identified` (PatientIdentityRemoved), `de-identified, but: birth date`. Placeholders such as `ANONYMOUS` do not count. It cannot see text burned into the pixels that the header does not declare (BurnedInAnnotation), nor data in private tags |
   | DICOM acquired | date and time: AcquisitionDateTime, else Acquisition Date + Time, else Content, else Series (local time, as in the header) |
   | DICOM study date | date |
   | DICOM object type | the SOP class by name: `MR Image`, `Secondary Capture`, `Enhanced SR`... |
