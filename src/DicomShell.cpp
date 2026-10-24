@@ -46,9 +46,11 @@
 #include <propvarutil.h>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <new>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "PlaneClouds.h"
 
@@ -696,11 +698,89 @@ static HICON DrawIcon(int size, int color, const std::wstring& label)
 // ---------------------------------------------------------------------------------------------
 // COM object: IPersistFile receives the file, IExtractIconW gives its icon
 
+// ---------------------------------------------------------------------------------------------
+// Chaining: the handlers another program had for an extension (files without one included) before the
+// install put these in front of them (tools\Register-DicomIcons.ps1 in HKCU\Software\DicomStudyCount\
+// Chain\<ext>, Register-DicomProperties.ps1 in HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain\<ext>).
+// Files that are not DICOM go to them, as if this DLL were not there.
+
+static const wchar_t ChainKey[] = L"Software\\DicomStudyCount\\Chain";
+static const wchar_t PropertyChainKey[] = L"SOFTWARE\\DicomStudyCount\\PropertyHandler\\Chain";
+
+// ".ima" (lowercase), or "(none)"
+static std::wstring ChainName(const std::wstring& path)
+{
+    const size_t slash = path.find_last_of(L"\\/:"), dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash) || dot + 1 == path.size()) return L"(none)";
+    std::wstring ext = path.substr(dot);
+    CharLowerBuffW(&ext[0], static_cast<DWORD>(ext.size()));
+    return ext;
+}
+
+// What was there before for the extension of `path`: a CLSID, or the location of an icon
+static std::wstring Previous(HKEY root, const wchar_t* base, const std::wstring& path, const wchar_t* name)
+{
+    const std::wstring key = std::wstring(base) + L"\\" + ChainName(path);
+    wchar_t value[1024];
+    DWORD size = sizeof(value);
+    if (RegGetValueW(root, key.c_str(), name, RRF_RT_REG_SZ, nullptr, value, &size) != ERROR_SUCCESS) return std::wstring();
+    return value;
+}
+
+// The previous handler, created in this process; null if there is none, or if it cannot be (a 32-bit one)
+template <class I>
+static I* CreatePrevious(const std::wstring& clsidText)
+{
+    CLSID clsid;
+    if (clsidText.empty() || FAILED(CLSIDFromString(clsidText.c_str(), &clsid))) return nullptr;
+    for (const CLSID* mine : { &CLSID_DicomIcons, &CLSID_DicomProperties, &CLSID_DicomPreview, &CLSID_DicomThumbnails })
+        if (clsid == *mine) return nullptr;
+    I* p = nullptr;
+    if (FAILED(CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER, __uuidof(I), reinterpret_cast<void**>(&p)))) return nullptr;
+    return p;
+}
+
+// The first bytes of a file: "DICM" after the preamble, or a "raw" DICOM (group 0002 or 0008 first),
+// as ReadHeader tries them
+static bool LooksDicom(const unsigned char* b, size_t n)
+{
+    if (n >= 132 && b[128] == 'D' && b[129] == 'I' && b[130] == 'C' && b[131] == 'M') return true;
+    return n >= 8 && b[1] == 0 && (b[0] == 0x02 || b[0] == 0x08);
+}
+
+static bool StreamLooksDicom(IStream* stream)
+{
+    unsigned char head[132] = {};
+    LARGE_INTEGER zero = {};
+    ULONG got = 0, n = 0;
+    if (FAILED(stream->Seek(zero, STREAM_SEEK_SET, nullptr))) return false;
+    while (got < sizeof(head) && SUCCEEDED(stream->Read(head + got, sizeof(head) - got, &n)) && n > 0) got += n;
+    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    return LooksDicom(head, got);
+}
+
+// The name of the file of a stream (for its extension), empty if it has none
+static std::wstring StreamName(IStream* stream)
+{
+    STATSTG stat = {};
+    std::wstring name;
+    if (SUCCEEDED(stream->Stat(&stat, STATFLAG_DEFAULT)) && stat.pwcsName)
+    {
+        name = stat.pwcsName;
+        CoTaskMemFree(stat.pwcsName);
+    }
+    return name;
+}
+
 class IconHandler : public IPersistFile, public IExtractIconW
 {
 public:
     IconHandler() { InterlockedIncrement(&g_locks); }
-    virtual ~IconHandler() { InterlockedDecrement(&g_locks); }
+    virtual ~IconHandler()
+    {
+        if (previous) previous->Release();
+        InterlockedDecrement(&g_locks);
+    }
 
     // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override
@@ -746,7 +826,24 @@ public:
             Header h;
             if (path.empty() || ReadHeader(path.c_str(), h, UpToSeriesNumber) != Kind::Dicom)
             {
-                // Not DICOM: the generic file icon
+                // Not DICOM: the icon it had before the install (its handler, or its fixed icon)
+                if (!path.empty())
+                {
+                    if (!previous && (previous = CreatePrevious<IExtractIconW>(Previous(HKEY_CURRENT_USER, ChainKey, path, L"IconHandler"))))
+                    {
+                        IPersistFile* load = nullptr;
+                        HRESULT hr = previous->QueryInterface(IID_PPV_ARGS(&load));
+                        if (SUCCEEDED(hr)) { hr = load->Load(path.c_str(), STGM_READ); load->Release(); }
+                        if (FAILED(hr)) { previous->Release(); previous = nullptr; }
+                    }
+                    if (previous) return previous->GetIconLocation(flags, file, cch, index, outFlags);
+                    if (FixedIcon(Previous(HKEY_CURRENT_USER, ChainKey, path, L"Icon"), file, cch, index))
+                    {
+                        *outFlags = 0;
+                        return S_OK;
+                    }
+                }
+                // Nothing before: the generic file icon
                 wchar_t sys[MAX_PATH];
                 UINT n = GetSystemDirectoryW(sys, MAX_PATH);
                 if (n == 0 || n >= MAX_PATH) return S_FALSE;
@@ -771,14 +868,19 @@ public:
         catch (...) { return S_FALSE; }
     }
 
-    IFACEMETHODIMP Extract(LPCWSTR file, UINT, HICON* largeIcon, HICON* smallIcon, UINT sizes) override
+    IFACEMETHODIMP Extract(LPCWSTR file, UINT index, HICON* largeIcon, HICON* smallIcon, UINT sizes) override
     {
         if (!file) return E_INVALIDARG;
         try
         {
             std::wstring key = file;
             size_t prefix = wcslen(KeyPrefix);
-            if (key.compare(0, prefix, KeyPrefix) != 0) return S_FALSE;    // the generic icon: Explorer extracts it
+            if (key.compare(0, prefix, KeyPrefix) != 0)
+            {
+                // The icon of the handler from before; another one (generic, fixed): Explorer extracts it
+                if (previous) return previous->Extract(file, index, largeIcon, smallIcon, sizes);
+                return S_FALSE;
+            }
             size_t bar = key.find(L'|', prefix);
             if (bar == std::wstring::npos) return S_FALSE;
             int color = _wtoi(key.substr(prefix, bar - prefix).c_str());
@@ -794,6 +896,28 @@ public:
 private:
     LONG refs = 1;
     std::wstring path;
+    IExtractIconW* previous = nullptr;              // the icon handler from before, for a file that is not DICOM
+
+    // A fixed icon from before ("C:\...\imageres.dll,-5205"), not "%1" (each file its own icon)
+    static bool FixedIcon(const std::wstring& location, LPWSTR file, UINT cch, int* index)
+    {
+        if (location.empty() || location.find(L"%1") != std::wstring::npos) return false;
+        std::wstring where = location;
+        int number = 0;
+        const size_t comma = where.find_last_of(L',');
+        if (comma != std::wstring::npos)
+        {
+            number = _wtoi(where.c_str() + comma + 1);
+            where.resize(comma);
+        }
+        if (where.size() >= 2 && where.front() == L'"' && where.back() == L'"') where = where.substr(1, where.size() - 2);
+        wchar_t expanded[MAX_PATH];
+        const DWORD n = ExpandEnvironmentStringsW(where.c_str(), expanded, MAX_PATH);
+        if (n == 0 || n > MAX_PATH || wcslen(expanded) + 1 > cch) return false;
+        wcscpy_s(file, cch, expanded);
+        *index = number;
+        return true;
+    }
 };
 
 // DICOM text: UTF-8 when the SpecificCharacterSet says ISO_IR 192, otherwise read as Latin-1 (as the
@@ -1266,6 +1390,7 @@ public:
     virtual ~PropertyHandler()
     {
         if (cache) cache->Release();
+        if (previous) previous->Release();
         InterlockedDecrement(&g_locks);
     }
 
@@ -1290,16 +1415,21 @@ public:
     }
 
     // IInitializeWithFile: the path is needed (not just a stream) for the duplicates of the file
-    IFACEMETHODIMP Initialize(LPCWSTR path, DWORD) override
+    IFACEMETHODIMP Initialize(LPCWSTR path, DWORD mode) override
     {
         if (!path) return E_INVALIDARG;
-        if (cache) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        if (cache || previous) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
         HRESULT hr = PSCreateMemoryPropertyStore(IID_PPV_ARGS(&cache));
         if (FAILED(hr)) return hr;
         try
         {
             Header h;
-            if (ReadHeader(path, h, UpToBurnedIn) != Kind::Dicom) return S_OK;   // not DICOM: no properties
+            if (ReadHeader(path, h, UpToBurnedIn) != Kind::Dicom)
+            {
+                // Not DICOM: the properties of the handler from before, if there was one
+                InitializePrevious(path, mode);
+                return S_OK;
+            }
             if (!h.studyUid.empty()) Set(PKEY_StudyHash, Hash6(h.studyUid));
             if (!h.seriesUid.empty()) Set(PKEY_SeriesHash, Hash6(h.seriesUid));
             Set(PKEY_PatientID, Widen(h.patientId, h.charset));
@@ -1336,24 +1466,71 @@ public:
         return S_OK;
     }
 
-    // IPropertyStore: read only
-    IFACEMETHODIMP GetCount(DWORD* count) override { if (!cache) { if (count) *count = 0; return S_OK; } return cache->GetCount(count); }
-    IFACEMETHODIMP GetAt(DWORD i, PROPERTYKEY* key) override { return cache ? cache->GetAt(i, key) : E_UNEXPECTED; }
+    // IPropertyStore: read only (those of the handler from before, as it does them)
+    IFACEMETHODIMP GetCount(DWORD* count) override
+    {
+        if (previous) return previous->GetCount(count);
+        if (!cache) { if (count) *count = 0; return S_OK; }
+        return cache->GetCount(count);
+    }
+    IFACEMETHODIMP GetAt(DWORD i, PROPERTYKEY* key) override
+    {
+        if (previous) return previous->GetAt(i, key);
+        return cache ? cache->GetAt(i, key) : E_UNEXPECTED;
+    }
     IFACEMETHODIMP GetValue(REFPROPERTYKEY key, PROPVARIANT* value) override
     {
+        if (previous) return previous->GetValue(key, value);
         if (!value) return E_POINTER;
         if (!cache) { PropVariantInit(value); return S_OK; }
         return cache->GetValue(key, value);
     }
-    IFACEMETHODIMP SetValue(REFPROPERTYKEY, REFPROPVARIANT) override { return STG_E_ACCESSDENIED; }
-    IFACEMETHODIMP Commit() override { return STG_E_ACCESSDENIED; }
+    IFACEMETHODIMP SetValue(REFPROPERTYKEY key, REFPROPVARIANT value) override
+    {
+        return previous ? previous->SetValue(key, value) : STG_E_ACCESSDENIED;
+    }
+    IFACEMETHODIMP Commit() override { return previous ? previous->Commit() : STG_E_ACCESSDENIED; }
 
-    // IPropertyStoreCapabilities: nothing can be edited
-    IFACEMETHODIMP IsPropertyWritable(REFPROPERTYKEY) override { return S_FALSE; }
+    // IPropertyStoreCapabilities: nothing can be edited (in a DICOM file)
+    IFACEMETHODIMP IsPropertyWritable(REFPROPERTYKEY key) override
+    {
+        if (!previous) return S_FALSE;
+        IPropertyStoreCapabilities* c = nullptr;
+        if (FAILED(previous->QueryInterface(IID_PPV_ARGS(&c)))) return S_OK;     // without it: all of them
+        const HRESULT hr = c->IsPropertyWritable(key);
+        c->Release();
+        return hr;
+    }
 
 private:
     LONG refs = 1;
     IPropertyStoreCache* cache = nullptr;
+    IPropertyStore* previous = nullptr;             // the handler from before, for a file that is not DICOM
+
+    // It may take the path, or a stream
+    void InitializePrevious(LPCWSTR path, DWORD mode)
+    {
+        IUnknown* p = CreatePrevious<IUnknown>(Previous(HKEY_LOCAL_MACHINE, PropertyChainKey, path, L"Properties"));
+        if (!p) return;
+        HRESULT hr = E_NOINTERFACE;
+        IInitializeWithFile* withFile = nullptr;
+        IInitializeWithStream* withStream = nullptr;
+        if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&withFile))))
+        {
+            hr = withFile->Initialize(path, mode);
+            withFile->Release();
+        }
+        else if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&withStream))))
+        {
+            IStream* s = nullptr;
+            const DWORD access = (mode & (STGM_WRITE | STGM_READWRITE)) ? STGM_READWRITE | STGM_SHARE_DENY_WRITE : STGM_READ | STGM_SHARE_DENY_NONE;
+            hr = SHCreateStreamOnFileEx(path, access, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &s);
+            if (SUCCEEDED(hr)) { hr = withStream->Initialize(s, mode); s->Release(); }
+            withStream->Release();
+        }
+        if (SUCCEEDED(hr)) p->QueryInterface(IID_PPV_ARGS(&previous));
+        p->Release();
+    }
 
     // IS (integer string) as a number, so that 2 sorts before 10
     void SetInt(REFPROPERTYKEY key, const std::string& text)
@@ -1439,6 +1616,16 @@ struct Imaging
     double center = 127.5, width = 255, center0 = 127.5, width0 = 255, low = 0, high = 255;
 };
 
+// A record of a DICOMDIR (patient, study, series, image...): its line in the tree, the file it refers
+// to (relative to the DICOMDIR) and the records under it
+struct DirNode
+{
+    std::string type;
+    std::wstring text, file;
+    long number = 0;                               // a series: its number; a file: its instance number
+    std::vector<DirNode> children;
+};
+
 // What the preview shows: one frame as 32-bit BGR rows (top-down), a summary line, the header twice
 // (one line per element: with the tags "(gggg,eeee)" and with their dictionary names) and the text of
 // the overlay. The thumbnail: the first frame, and the study and series for its badge.
@@ -1452,6 +1639,7 @@ struct Rendered
     double frameTime = 0;                          // ms from frame to frame (the cine), 0 if not known
     std::wstring corners[3];                       // the overlay: top left, top right, bottom left (lines)
     std::wstring sides[4];                         // the patient directions at the left, top, right, bottom
+    std::vector<DirNode> directory;                // a DICOMDIR: its patients
     std::shared_ptr<Imaging> imaging;              // only in the preview (the file, even without image)
 };
 
@@ -1797,6 +1985,101 @@ static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
     return out;
 }
 
+// The records of a DICOMDIR, as a tree: each one points to the next one of its level and to the first
+// one under it by their offsets in the file, which DCMTK keeps for each record it reads. (Not by
+// DcmDicomDir, which writes the file back when it finds something to correct in it.) Never who the
+// patient is: the patient ID, not the name.
+static void ReadRecords(const std::unordered_map<Uint32, DcmItem*>& records, Uint32 offset, const std::string& charset,
+                        std::vector<DirNode>& out, int depth, std::unordered_set<Uint32>& seen)
+{
+    for (; offset != 0 && depth < 8; )
+    {
+        auto it = records.find(offset);
+        if (it == records.end() || !seen.insert(offset).second) return;
+        DcmItem* rec = it->second;
+        Uint32 next = 0, lower = 0;
+        Uint16 inUse = 0xFFFF;
+        rec->findAndGetUint32(DCM_OffsetOfTheNextDirectoryRecord, next);
+        rec->findAndGetUint32(DCM_OffsetOfReferencedLowerLevelDirectoryEntity, lower);
+        rec->findAndGetUint16(DCM_RecordInUseFlag, inUse);
+        offset = next;
+        if (inUse == 0) continue;                   // deleted
+        auto get = [&](const DcmTagKey& key) {
+            OFString v;
+            rec->findAndGetOFStringArray(key, v);
+            return std::string(v.c_str(), v.length());
+        };
+        DirNode n;
+        n.type = get(DCM_DirectoryRecordType);
+        n.file = Widen(get(DCM_ReferencedFileID));
+        n.number = atol(get(n.type == "SERIES" ? DCM_SeriesNumber : DCM_InstanceNumber).c_str());
+        std::wstring text;
+        auto add = [&](const std::wstring& s) { if (!s.empty()) text += (text.empty() ? L"" : L"   ") + s; };
+        if (n.type == "PATIENT")
+        {
+            const std::string id = get(DCM_PatientID);
+            add(id.empty() ? L"Patient" : L"Patient " + Widen(id, charset));
+        }
+        else if (n.type == "STUDY")
+        {
+            add(DateTimeText(get(DCM_StudyDate), get(DCM_StudyTime)));
+            add(Widen(get(DCM_StudyDescription), charset));
+            const std::string uid = get(DCM_StudyInstanceUID);
+            if (!uid.empty()) add(L"[" + Hash6(uid) + L"]");
+            if (text.empty()) text = L"Study";
+        }
+        else if (n.type == "SERIES")
+        {
+            add(Widen(get(DCM_Modality)));
+            const std::string number = get(DCM_SeriesNumber);
+            add(number.empty() ? L"Series" : L"Series " + Widen(number));
+            add(Widen(get(DCM_SeriesDescription), charset));
+        }
+        else
+        {
+            // IMAGE, SR DOCUMENT, PRESENTATION... by their number
+            std::string type = n.type.empty() ? "Record" : n.type;
+            for (size_t i = 1; i < type.size(); i++) if (type[i - 1] != ' ') type[i] = static_cast<char>(tolower(static_cast<unsigned char>(type[i])));
+            const std::string number = get(DCM_InstanceNumber);
+            add(Widen(type) + (number.empty() ? L"" : L" " + Widen(number)));
+        }
+        n.text = text;
+        ReadRecords(records, lower, charset, n.children, depth + 1, seen);
+        // How many there are under it; the images by their number
+        if (!n.children.empty())
+        {
+            const size_t k = n.children.size();
+            const wchar_t* what = n.type == "PATIENT" ? (k == 1 ? L"study" : L"studies") :
+                                  n.type == "STUDY" ? L"series" : (k == 1 ? L"file" : L"files");
+            n.text += L"   (" + std::to_wstring(k) + L" " + what + L")";
+            // The series of a study by their number, the files of a series by theirs
+            if (n.type == "STUDY" || std::all_of(n.children.begin(), n.children.end(), [](const DirNode& c) { return c.children.empty(); }))
+                std::stable_sort(n.children.begin(), n.children.end(), [](const DirNode& a, const DirNode& b) { return a.number < b.number; });
+        }
+        out.push_back(std::move(n));
+    }
+}
+
+static std::vector<DirNode> ReadDirectory(DcmDataset* ds)
+{
+    std::vector<DirNode> roots;
+    DcmSequenceOfItems* seq = nullptr;
+    if (ds->findAndGetSequence(DCM_DirectoryRecordSequence, seq).bad() || !seq) return roots;
+    std::unordered_map<Uint32, DcmItem*> records;
+    for (unsigned long i = 0; i < seq->card(); i++)
+    {
+        DcmItem* item = seq->getItem(i);
+        if (item && item->ident() == EVR_dirRecord) records[static_cast<DcmDirectoryRecord*>(item)->getFileOffset()] = item;
+    }
+    Uint32 first = 0;
+    ds->findAndGetUint32(DCM_OffsetOfTheFirstDirectoryRecordOfTheRootDirectoryEntity, first);
+    OFString charset;
+    ds->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    std::unordered_set<Uint32> seen;
+    ReadRecords(records, first, charset.c_str(), roots, 0, seen);
+    return roots;
+}
+
 // One frame of the file into the pixels, by a DicomImage of its own (a JPEG 2000 one decoded first by
 // OpenJPEG). Its window: the one of the header, or the range of the pixels; `keep`: the one in use, as
 // the frames change. An empty string if it is shown; if not, why (and no pixels).
@@ -1924,6 +2207,17 @@ static Rendered RenderDicom(const std::vector<char>& data, Render what = Render:
     if (what == Render::Everything) DumpHeader(ff, r.tags, r.names);
 
     r.summary = sopClass.empty() ? L"DICOM" : ObjectType(sopClass.c_str());
+    if (what != Render::Thumbnail && ds->tagExists(DCM_DirectoryRecordSequence))
+    {
+        r.directory = ReadDirectory(ds);
+        size_t files = 0;
+        std::function<void(const std::vector<DirNode>&)> count = [&](const std::vector<DirNode>& nodes) {
+            for (auto& n : nodes) { if (!n.file.empty()) files++; count(n.children); }
+        };
+        count(r.directory);
+        r.summary = L"DICOMDIR  -  " + std::to_wstring(r.directory.size()) + (r.directory.size() == 1 ? L" patient" : L" patients") +
+                    L", " + std::to_wstring(files) + L" files";
+    }
     r.imaging = im;
     if (ds->tagExists(DCM_PixelData))
     {
@@ -2289,6 +2583,7 @@ public:
         if (!hwnd || !rc) return E_INVALIDARG;
         parent = hwnd;
         bounds = *rc;
+        if (previous) return previous->SetWindow(hwnd, rc);
         if (wnd)
         {
             ::SetParent(wnd, parent);
@@ -2300,18 +2595,31 @@ public:
     {
         if (!rc) return E_INVALIDARG;
         bounds = *rc;
+        if (previous) return previous->SetRect(rc);
         if (wnd) Place();
         return S_OK;
     }
     IFACEMETHODIMP DoPreview() override
     {
-        if (wnd) return S_OK;
+        if (wnd || previous) return S_OK;
         if (!item || !parent) return E_UNEXPECTED;
         try
         {
             IStream* stream = nullptr;
             HRESULT hr = item->BindToHandler(nullptr, BHID_Stream, IID_PPV_ARGS(&stream));
             if (FAILED(hr)) return hr;
+            // Not DICOM: the preview from before, if there was one (not even read here: it can be a
+            // disk image of gigabytes)
+            if (!StreamLooksDicom(stream))
+            {
+                const bool chained = StartPrevious(stream);
+                stream->Release();
+                if (chained) return S_OK;
+                view = Rendered();
+                view.summary = L"Not a DICOM file";
+                plain = true;
+                return CreateWindows();
+            }
             std::vector<char> data;
             hr = ReadAll(stream, data);
             stream->Release();
@@ -2323,12 +2631,23 @@ public:
     }
     IFACEMETHODIMP Unload() override
     {
+        if (previous)
+        {
+            previous->Unload();
+            IObjectWithSite* s = nullptr;
+            if (SUCCEEDED(previous->QueryInterface(IID_PPV_ARGS(&s)))) { s->SetSite(nullptr); s->Release(); }
+            previous->Release();
+            previous = nullptr;
+        }
         if (scan) { InterlockedExchange(&scan->cancel, 1); scan.reset(); }
-        if (wnd) { DestroyWindow(wnd); wnd = nullptr; edit = nullptr; list = nullptr; }
+        if (wnd) { DestroyWindow(wnd); wnd = nullptr; edit = nullptr; list = nullptr; tree = nullptr; }
+        directory.clear();
+        groups.clear();
+        group = -1;
         series.clear();
         slice = -1;
         current.clear();
-        playing = stale = windowSet = false;
+        playing = stale = windowSet = plain = false;
         for (HFONT* f : { &font, &uiFont, &boldFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
         if (background) { DeleteObject(background); background = nullptr; }
         if (item) { item->Release(); item = nullptr; }
@@ -2340,6 +2659,7 @@ public:
     }
     IFACEMETHODIMP SetFocus() override
     {
+        if (previous) return previous->SetFocus();
         HWND content = Content();
         if (!content) return S_FALSE;
         ::SetFocus(content);
@@ -2348,12 +2668,14 @@ public:
     IFACEMETHODIMP QueryFocus(HWND* focus) override
     {
         if (!focus) return E_INVALIDARG;
+        if (previous) return previous->QueryFocus(focus);
         *focus = GetFocus();
         return *focus ? S_OK : HRESULT_FROM_WIN32(GetLastError());
     }
     IFACEMETHODIMP TranslateAccelerator(MSG* msg) override
     {
         if (!msg) return E_INVALIDARG;
+        if (previous) return previous->TranslateAccelerator(msg);
         // In the header: Ctrl+A selects it all, Ctrl+C (or Ctrl+Insert) copies the selection; in the
         // columns the same with rows. Ctrl+T: between the two headers. Explorer would take Ctrl+C to
         // copy the file.
@@ -2393,13 +2715,20 @@ public:
         backColor = color;
         if (background) { DeleteObject(background); background = nullptr; }
         Recolor();
+        if (IPreviewHandlerVisuals* v = PreviousVisuals()) { v->SetBackgroundColor(color); v->Release(); }
         return S_OK;
     }
-    IFACEMETHODIMP SetFont(const LOGFONTW*) override { return S_OK; }
+    IFACEMETHODIMP SetFont(const LOGFONTW* f) override
+    {
+        if (f) { hostFont = *f; hasFont = true; }
+        if (IPreviewHandlerVisuals* v = PreviousVisuals()) { v->SetFont(f); v->Release(); }
+        return S_OK;
+    }
     IFACEMETHODIMP SetTextColor(COLORREF color) override
     {
         textColor = color;
         Recolor();
+        if (IPreviewHandlerVisuals* v = PreviousVisuals()) { v->SetTextColor(color); v->Release(); }
         return S_OK;
     }
 
@@ -2418,6 +2747,8 @@ public:
         if (site) site->Release();
         site = s;
         if (site) site->AddRef();
+        IObjectWithSite* p = nullptr;
+        if (previous && SUCCEEDED(previous->QueryInterface(IID_PPV_ARGS(&p)))) { p->SetSite(s); p->Release(); }
         return S_OK;
     }
     IFACEMETHODIMP GetSite(REFIID riid, void** ppv) override
@@ -2428,7 +2759,7 @@ public:
     }
 
 private:
-    enum { TabColumns, TabHeader, TabTags, TabCount };
+    enum { TabColumns, TabHeader, TabTags, TabDirectory, TabCount };
     enum class Drag { None, Split, Window, Pan, Zoom, Track };
     static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2;
     static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2;
@@ -2437,15 +2768,71 @@ private:
     LONG refs = 1;
     IShellItem* item = nullptr;
     IUnknown* site = nullptr;
+    IPreviewHandler* previous = nullptr;            // the preview from before, for a file that is not DICOM
+    LOGFONTW hostFont = {};
+    bool hasFont = false;
+
+    IPreviewHandlerVisuals* PreviousVisuals() const
+    {
+        IPreviewHandlerVisuals* v = nullptr;
+        if (previous) previous->QueryInterface(IID_PPV_ARGS(&v));
+        return v;
+    }
+
+    // The preview from before for this extension, in this window: initialized as it can be (the item,
+    // the path or the stream), with the site and colors of this one
+    bool StartPrevious(IStream* stream)
+    {
+        IPreviewHandler* p = CreatePrevious<IPreviewHandler>(Previous(HKEY_CURRENT_USER, ChainKey, path, L"Preview"));
+        if (!p) return false;
+        HRESULT hr = E_NOINTERFACE;
+        IInitializeWithItem* withItem = nullptr;
+        IInitializeWithFile* withFile = nullptr;
+        IInitializeWithStream* withStream = nullptr;
+        if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&withItem)))) { hr = withItem->Initialize(item, STGM_READ); withItem->Release(); }
+        else if (!path.empty() && SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&withFile)))) { hr = withFile->Initialize(path.c_str(), STGM_READ); withFile->Release(); }
+        else if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&withStream)))) { hr = withStream->Initialize(stream, STGM_READ); withStream->Release(); }
+        if (SUCCEEDED(hr))
+        {
+            IObjectWithSite* s = nullptr;
+            if (site && SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&s)))) { s->SetSite(site); s->Release(); }
+            IPreviewHandlerVisuals* v = nullptr;
+            if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&v))))
+            {
+                v->SetBackgroundColor(backColor);
+                v->SetTextColor(textColor);
+                if (hasFont) v->SetFont(&hostFont);
+                v->Release();
+            }
+            hr = p->SetWindow(parent, &bounds);
+            if (SUCCEEDED(hr)) hr = p->DoPreview();
+        }
+        if (FAILED(hr))
+        {
+            p->Unload();
+            p->Release();
+            return false;
+        }
+        previous = p;
+        return true;
+    }
     std::wstring path, folder, note;
     std::wstring current;                           // the file shown: the path, or another one of its series
     std::shared_ptr<SeriesScan> scan;
     std::vector<std::wstring> series;               // the files of its series, in order (empty until read)
     int slice = -1;                                 // the one shown, in `series`
     bool overlay = true, playing = false;
+    bool plain = false;                             // not DICOM, and nothing before: only a line saying so
     bool stale = false;                             // its header and values are those of a slice shown before
     bool windowSet = false;                         // the window dragged: it stays from slice to slice
-    HWND parent = nullptr, wnd = nullptr, edit = nullptr, list = nullptr;
+    HWND parent = nullptr, wnd = nullptr, edit = nullptr, list = nullptr, tree = nullptr;
+    // A DICOMDIR: its records, and the files under each record that has them (a series, mostly): the
+    // slider steps through those of the one chosen
+    struct DirGroup { std::vector<std::wstring> files, labels; std::vector<HTREEITEM> items; };
+    std::vector<DirNode> directory;
+    std::vector<DirGroup> groups;
+    int group = -1;
+    bool selecting = false;                         // the tree selection changes from the code
     RECT bounds = {};
     RECT tabArea = {}, tabRects[TabCount] = {}, contentArea = {}, splitArea = {}, imageArea = {}, statusArea = {};
     RECT barArea = {}, playRect = {}, trackRect = {}, overlayRect = {};
@@ -2482,7 +2869,7 @@ private:
         return MulDiv(n, dpi ? dpi : 96, 96);
     }
 
-    HWND Content() const { return tab == TabColumns ? list : edit; }
+    HWND Content() const { return tab == TabColumns ? list : tab == TabDirectory ? tree : edit; }
 
     static DWORD ReadDword(const wchar_t* key, const wchar_t* name, DWORD fallback)
     {
@@ -2507,7 +2894,10 @@ private:
         // The tab of this folder (the columns at first), and the split of every preview
         if (!folder.empty())
             tab = static_cast<int>(ReadDword(L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), TabColumns));
-        if (tab < 0 || tab >= TabCount) tab = TabColumns;
+        if (tab < 0 || tab >= TabCount || tab == TabDirectory) tab = TabColumns;
+        // A DICOMDIR opens on its tree
+        directory = std::move(view.directory);
+        if (!directory.empty()) tab = TabDirectory;
         split = static_cast<int>(ReadDword(Settings, L"Split", 450));
         overlay = ReadDword(Settings, L"Overlay", 1) != 0;
         current = path;
@@ -2523,12 +2913,20 @@ private:
                              OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         boldFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        if (plain)
+        {
+            Place();
+            return S_OK;
+        }
         // The controls of the common controls 6 (themed), not the old ones prevhost.exe would give
         ULONG_PTR cookie = 0;
         HANDLE context = ThemedControls();
         bool active = context != INVALID_HANDLE_VALUE && ActivateActCtx(context, &cookie);
-        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
+        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES };
         InitCommonControlsEx(&icc);
+        if (!directory.empty())
+            tree = CreateWindowExW(0, WC_TREEVIEWW, L"", WS_CHILD | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS |
+                                   TVS_FULLROWSELECT, 0, 0, 10, 10, wnd, nullptr, g_module, nullptr);
         edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
                                0, 0, 10, 10, wnd, nullptr, g_module, nullptr);
@@ -2542,6 +2940,8 @@ private:
             SetWindowTextW(edit, (tab == TabTags ? view.tags : view.names).c_str());
         }
         if (list) FillColumns();
+        if (tree) FillTree();
+        else if (tab == TabDirectory) tab = TabColumns;
         KeepView();
         Recolor();
         Place();
@@ -2551,6 +2951,101 @@ private:
         // The other files of its series, to step through them
         if (!view.pixels.empty() && !path.empty()) scan = StartSeriesScan(path, folder, wnd, WM_SERIES);
         return S_OK;
+    }
+
+    // The tree of a DICOMDIR: patients and studies open; the files of a series when it is opened
+    void FillTree()
+    {
+        SendMessageW(tree, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), FALSE);
+        TreeView_SetExtendedStyle(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        for (const DirNode& n : directory) AddNode(TVI_ROOT, n);
+        if (HTREEITEM first = TreeView_GetRoot(tree)) TreeView_EnsureVisible(tree, first);
+    }
+
+    static LPARAM Code(int g, int i) { return static_cast<LPARAM>((static_cast<long long>(g) << 32) | static_cast<unsigned>(i)); }
+    static int GroupOf(LPARAM p) { return static_cast<int>(static_cast<long long>(p) >> 32); }
+    static int FileOf(LPARAM p) { return static_cast<int>(static_cast<unsigned>(p & 0xFFFFFFFF)); }
+
+    // A record: those whose records are all files become a group (their tree items come when it is
+    // opened: a series can have thousands); a file alone is a group of its own
+    void AddNode(HTREEITEM under, const DirNode& n)
+    {
+        const std::wstring base = folder + (!folder.empty() && folder.back() == L'\\' ? L"" : L"\\");
+        TVINSERTSTRUCTW is = {};
+        is.hParent = under;
+        is.hInsertAfter = TVI_LAST;
+        is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+        is.item.pszText = const_cast<wchar_t*>(n.text.c_str());
+        is.item.lParam = -1;
+        const bool files = !n.children.empty() &&
+                           std::all_of(n.children.begin(), n.children.end(), [](const DirNode& c) { return c.children.empty() && !c.file.empty(); });
+        if (files || (n.children.empty() && !n.file.empty()))
+        {
+            DirGroup g;
+            if (files)
+                for (const DirNode& c : n.children) { g.files.push_back(base + c.file); g.labels.push_back(c.text + L"   " + c.file); }
+            else g.files.push_back(base + n.file);
+            groups.push_back(std::move(g));
+            is.item.lParam = Code(static_cast<int>(groups.size()) - 1, files ? -1 : 0);
+            is.item.cChildren = files ? 1 : 0;
+            std::wstring text = n.text + (files ? L"" : L"   " + n.file);
+            is.item.pszText = const_cast<wchar_t*>(text.c_str());
+            TreeView_InsertItem(tree, &is);
+            return;
+        }
+        is.item.cChildren = n.children.empty() ? 0 : 1;
+        HTREEITEM node = TreeView_InsertItem(tree, &is);
+        for (const DirNode& c : n.children) AddNode(node, c);
+        if (node && !n.children.empty()) TreeView_Expand(tree, node, TVE_EXPAND);
+    }
+
+    // A group opened: its files
+    void ExpandGroup(int g, HTREEITEM node)
+    {
+        if (g < 0 || g >= static_cast<int>(groups.size()) || !groups[g].items.empty()) return;
+        DirGroup& d = groups[g];
+        SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
+        for (size_t i = 0; i < d.labels.size(); i++)
+        {
+            TVINSERTSTRUCTW is = {};
+            is.hParent = node;
+            is.hInsertAfter = TVI_LAST;
+            is.item.mask = TVIF_TEXT | TVIF_PARAM;
+            is.item.pszText = const_cast<wchar_t*>(d.labels[i].c_str());
+            is.item.lParam = Code(g, static_cast<int>(i));
+            d.items.push_back(TreeView_InsertItem(tree, &is));
+        }
+        SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
+    }
+
+    // An item chosen: the file it refers to (a group: its first one), with the slider over its group
+    void Choose(LPARAM p)
+    {
+        if (p == -1) return;
+        const int g = GroupOf(p), i = FileOf(p) == -1 ? 0 : FileOf(p);
+        if (g < 0 || g >= static_cast<int>(groups.size()) || i >= static_cast<int>(groups[g].files.size())) return;
+        if (g != group)
+        {
+            Play(false);
+            group = g;
+            series = groups[g].files;
+            slice = -1;
+        }
+        GoSlice(i);
+    }
+
+    // Enter or a double click on a file of the tree: its folder in Explorer, with it selected
+    void Reveal(LPARAM p)
+    {
+        if (p == -1) return;
+        const int g = GroupOf(p), i = FileOf(p) == -1 ? 0 : FileOf(p);
+        if (g < 0 || g >= static_cast<int>(groups.size()) || i >= static_cast<int>(groups[g].files.size())) return;
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(groups[g].files[i].c_str(), nullptr, &pidl, 0, nullptr)))
+        {
+            SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+            CoTaskMemFree(pidl);
+        }
     }
 
     // One row per DICOM column: its name and its value for this file, checked if the Explorer window
@@ -2707,17 +3202,17 @@ private:
     // The tab chosen, remembered for this folder (HKCU\Software\DicomStudyCount\Preview\Tabs)
     void SelectTab(int t)
     {
-        if (t == tab || t < 0 || t >= TabCount) return;
+        if (plain || t == tab || t < 0 || t >= TabCount || (t == TabDirectory && !tree)) return;
         Settle();
         const bool headers = (t == TabHeader || t == TabTags) && (tab == TabHeader || tab == TabTags);
         LRESULT first = headers ? SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
         tab = t;
-        if (edit && t != TabColumns)
+        if (edit && (t == TabHeader || t == TabTags))
         {
             SetWindowTextW(edit, (t == TabTags ? view.tags : view.names).c_str());
             if (headers) SendMessageW(edit, EM_LINESCROLL, 0, first);   // both have the same lines
         }
-        if (!folder.empty())
+        if (!folder.empty() && t != TabDirectory)       // (the tree: only in a DICOMDIR, always first)
         {
             DWORD value = static_cast<DWORD>(t);
             RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), REG_DWORD,
@@ -2732,7 +3227,8 @@ private:
     void ShowContent()
     {
         if (list) ShowWindow(list, tab == TabColumns ? SW_SHOWNA : SW_HIDE);
-        if (edit) ShowWindow(edit, tab == TabColumns ? SW_HIDE : SW_SHOWNA);
+        if (edit) ShowWindow(edit, tab == TabHeader || tab == TabTags ? SW_SHOWNA : SW_HIDE);
+        if (tree) ShowWindow(tree, tab == TabDirectory ? SW_SHOWNA : SW_HIDE);
     }
 
     void Recolor()
@@ -2751,6 +3247,13 @@ private:
         {
             SetWindowTheme(edit, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
             InvalidateRect(edit, nullptr, TRUE);
+        }
+        if (tree)
+        {
+            TreeView_SetBkColor(tree, backColor);
+            TreeView_SetTextColor(tree, textColor);
+            SetWindowTheme(tree, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            InvalidateRect(tree, nullptr, TRUE);
         }
         if (wnd) InvalidateRect(wnd, nullptr, TRUE);
     }
@@ -2792,6 +3295,7 @@ private:
         const int ch = contentArea.bottom - contentArea.top > 0 ? contentArea.bottom - contentArea.top : 0;
         if (edit) MoveWindow(edit, 0, contentArea.top, w, ch, TRUE);
         if (list) MoveWindow(list, 0, contentArea.top, w, ch, TRUE);
+        if (tree) MoveWindow(tree, 0, contentArea.top, w, ch, TRUE);
         InvalidateRect(wnd, nullptr, TRUE);
     }
 
@@ -2802,12 +3306,22 @@ private:
         FillRect(dc, &c, Background());
         SetBkMode(dc, TRANSPARENT);
         HGDIOBJ old = SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
-
-        // The tabs: the chosen one in bold and underlined, the others dimmed
-        static const wchar_t* const labels[TabCount] = { L"Columns", L"Header", L"Tags" };
-        int x = Px(6);
-        for (int t = 0; t < TabCount; t++)
+        if (plain)
         {
+            ::SetTextColor(dc, Dim(70));
+            DrawTextW(dc, view.summary.c_str(), -1, &c, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, old);
+            return;
+        }
+
+        // The tabs: the chosen one in bold and underlined, the others dimmed. The tree of a DICOMDIR first.
+        static const wchar_t* const labels[TabCount] = { L"Columns", L"Header", L"Tags", L"Directory" };
+        static const int order[TabCount] = { TabDirectory, TabColumns, TabHeader, TabTags };
+        int x = Px(6);
+        for (int t : order)
+        {
+            tabRects[t] = {};
+            if (t == TabDirectory && !tree) continue;
             SelectObject(dc, t == tab && boldFont ? boldFont : uiFont);
             SIZE ext = {};
             GetTextExtentPoint32W(dc, labels[t], static_cast<int>(wcslen(labels[t])), &ext);
@@ -2868,7 +3382,9 @@ private:
             // The overlay, on the part of the image in sight
             RECT shown = { static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top)),
                            static_cast<LONG>(std::lround(left + view.width * scale)), static_cast<LONG>(std::lround(top + view.height * scale)) };
-            if (overlay && IntersectRect(&shown, &shown, &imageArea)) PaintOverlay(dc, shown);
+            if (overlay && IntersectRect(&shown, &shown, &imageArea) && shown.right - shown.left >= Px(200) &&
+                shown.bottom - shown.top >= Px(150))        // (not on a small image: it would hide it)
+                PaintOverlay(dc, shown);
         }
         PaintBar(dc);
 
@@ -3101,6 +3617,14 @@ private:
         stale = true;
         SetTimer(wnd, TimerSettle, 300, nullptr);
         SetWindowTextW(wnd, view.summary.c_str());
+        // In a DICOMDIR: the file in the tree too, when its series is open there
+        if (tree && group >= 0 && group < static_cast<int>(groups.size()) && i < static_cast<int>(groups[group].items.size()) &&
+            !selecting)
+        {
+            selecting = true;
+            TreeView_SelectItem(tree, groups[group].items[i]);
+            selecting = false;
+        }
         Shown(had);
     }
 
@@ -3462,6 +3986,29 @@ private:
                     (change->uOldState & LVIS_STATEIMAGEMASK))     // not the first check box of a new row
                     self->Toggle(change->iItem);
             }
+            if (self && self->tree && reinterpret_cast<NMHDR*>(lp)->hwndFrom == self->tree)
+            {
+                // The tree of a DICOMDIR: a series opened, an item chosen, Enter or a double click
+                const UINT code = reinterpret_cast<NMHDR*>(lp)->code;
+                if (code == TVN_ITEMEXPANDINGW)
+                {
+                    auto tv = reinterpret_cast<NMTREEVIEWW*>(lp);
+                    if (tv->action & TVE_EXPAND && tv->itemNew.lParam != -1 && FileOf(tv->itemNew.lParam) == -1)
+                        self->ExpandGroup(GroupOf(tv->itemNew.lParam), tv->itemNew.hItem);
+                }
+                else if (code == TVN_SELCHANGEDW && !self->selecting)
+                    self->Choose(reinterpret_cast<NMTREEVIEWW*>(lp)->itemNew.lParam);
+                else if (code == NM_DBLCLK || code == NM_RETURN)
+                {
+                    TVITEMW item = { TVIF_PARAM };
+                    item.hItem = TreeView_GetSelection(self->tree);
+                    if (item.hItem && TreeView_GetItem(self->tree, &item) && item.lParam != -1 && FileOf(item.lParam) != -1)
+                    {
+                        self->Reveal(item.lParam);
+                        return TRUE;
+                    }
+                }
+            }
             break;
         case WM_PAINT:
         {
@@ -3548,6 +4095,8 @@ public:
         if (!stream || cx == 0) return E_UNEXPECTED;
         try
         {
+            // Not DICOM: the thumbnail of the provider from before (none: the icon)
+            if (!StreamLooksDicom(stream)) return PreviousThumbnail(cx, bitmap, alpha);
             std::vector<char> data;
             HRESULT hr = ReadAll(stream, data);
             if (FAILED(hr)) return hr;
@@ -3607,6 +4156,25 @@ public:
 private:
     LONG refs = 1;
     IStream* stream = nullptr;
+
+    // The provider from before for the extension of the file of the stream, given the same stream
+    HRESULT PreviousThumbnail(UINT cx, HBITMAP* bitmap, WTS_ALPHATYPE* alpha)
+    {
+        const std::wstring name = StreamName(stream);
+        if (name.empty()) return E_FAIL;
+        IThumbnailProvider* p = CreatePrevious<IThumbnailProvider>(Previous(HKEY_CURRENT_USER, ChainKey, name, L"Thumbnail"));
+        if (!p) return E_FAIL;
+        HRESULT hr = E_NOINTERFACE;
+        IInitializeWithStream* init = nullptr;
+        if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&init))))
+        {
+            hr = init->Initialize(stream, STGM_READ);
+            init->Release();
+        }
+        if (SUCCEEDED(hr)) hr = p->GetThumbnail(cx, bitmap, alpha);
+        p->Release();
+        return hr;
+    }
 };
 
 // One factory per class: the icons, the properties, the preview and the thumbnails

@@ -8,13 +8,18 @@
 .NOTES
     The DLL is copied to %LOCALAPPDATA%\DicomStudyCount\shellext under a name with its hash: Explorer
     keeps the registered one loaded, so the one in bin\ can always be replaced.
-    An extension that already belongs to another program keeps its icon (the icon belongs to the
-    program that opens it); the rest goes into SystemFileAssociations, which Windows reads for every
-    file of that extension whoever owns it.
+    An extension that already belongs to another program (a viewer, Windows) stays its own: opening the
+    files, their type and their verbs do not change. The icon, thumbnail and preview of that program
+    are chained: these handlers are put in front of them (in HKCU, over its class), and give every file
+    that is not DICOM back to them, as recorded in HKCU\Software\DicomStudyCount\Chain\<ext>. The rest
+    goes into SystemFileAssociations, which Windows reads for every file of that extension. -Uninstall
+    puts everything back as it was.
+    -Img adds .img (disc images for Windows, Analyze images...), remembered for the next installs.
 #>
 param(
     [string]$Dll,
     [string]$Script,        # Count-DicomStudies.ps1, for the "Show DICOM duplicates" verb
+    [switch]$Img,
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -37,8 +42,11 @@ $types = @(
     @{ Ext = '.'; ProgId = 'DicomStudyCount.NoExtension'; Name = 'File' },
     @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' },
     @{ Ext = '.ima'; ProgId = 'DicomStudyCount.Ima'; Name = 'DICOM File (IMA)' },
-    @{ Ext = '.dicom'; ProgId = 'DicomStudyCount.Dicom'; Name = 'DICOM File' }
+    @{ Ext = '.dicom'; ProgId = 'DicomStudyCount.Dicom'; Name = 'DICOM File' },
+    @{ Ext = '.img'; ProgId = 'DicomStudyCount.Img'; Name = 'Image File' }
 )
+$chain = 'Software\DicomStudyCount\Chain'           # what other programs had (read by the DLL)
+$iconHandlerKey = 'ShellEx\IconHandler'
 $verbKey = 'shell\DicomStudyCountDuplicates'
 
 # DICOM values shown when hovering a file, in the Details pane and in Properties > Details
@@ -56,6 +64,13 @@ $fullDetails = 'prop:System.PropGroup.Description;' + (('StudyHash', 'SeriesHash
     'System.DateCreated;System.DateModified;System.FileAttributes'
 
 $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+$hkcr = [Microsoft.Win32.Registry]::ClassesRoot
+$hklm = [Microsoft.Win32.Registry]::LocalMachine
+$ours = $clsid, $previewClsid, $thumbClsid
+# .img only when asked for, now or by an earlier install
+$st = $hkcu.OpenSubKey($state)
+$withImg = $Img -or $Uninstall -or ($st -and $st.GetValue('Img') -eq 1)
+if (-not $withImg) { $types = @($types | Where-Object { $_.Ext -ne '.img' }) }
 Add-Type -Namespace DicomIconsSetup -Name Shell -MemberDefinition '
     [DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);'
 
@@ -76,6 +91,8 @@ function Set-FileType([string]$key, [bool]$icon, [bool]$rest) {
     $hkcu.CreateSubKey("$key\$previewShellEx").SetValue('', $previewClsid)
     $hkcu.CreateSubKey("$key\$thumbShellEx").SetValue('', $thumbClsid)
     $k = $hkcu.CreateSubKey($key)
+    # Thumbnails from 48 x 48 on (medium icons); smaller (details, list, small icons): the series icon
+    $k.SetValue('ThumbnailCutoff', 2, 'DWord')
     $k.SetValue('InfoTip', $infoTip)
     $k.SetValue('PreviewDetails', $previewDetails)
     $k.SetValue('FullDetails', $fullDetails)
@@ -92,6 +109,7 @@ function Clear-Sfa([string]$key) {
     $k = $hkcu.OpenSubKey($key, $true)
     if (-not $k) { return }
     foreach ($n in 'InfoTip', 'PreviewDetails', 'FullDetails') { if ($k.GetValue($n) -like '*DicomStudyCount.*') { $k.DeleteValue($n, $false) } }
+    if ($k.GetValue('ThumbnailCutoff') -eq 2 -and $hkcu.OpenSubKey("$key\$thumbShellEx")) { $k.DeleteValue('ThumbnailCutoff', $false) }
     foreach ($sub in $previewShellEx, $thumbShellEx) {
         $s = $hkcu.OpenSubKey("$key\$sub")
         if ($s -and ($s.GetValue('') -eq $previewClsid -or $s.GetValue('') -eq $thumbClsid)) { $s.Close(); $hkcu.DeleteSubKeyTree("$key\$sub") }
@@ -102,9 +120,99 @@ function Clear-Sfa([string]$key) {
     if ($k -and $k.SubKeyCount -eq 0 -and $k.ValueCount -eq 0) { $k.Close(); $hkcu.DeleteSubKey($key) }
 }
 
+# ---- Chaining
+
+function Get-Value([Microsoft.Win32.RegistryKey]$root, [string]$path, [string]$name = '') {
+    $k = $root.OpenSubKey($path)
+    if (-not $k) { return '' }
+    $v = [string]$k.GetValue($name)
+    $k.Close()
+    $v
+}
+function Get-ChainName([string]$ext) { if ($ext -eq '.') { '(none)' } else { $ext } }
+
+# The program an extension belongs to, other than us: the one chosen in "Open with" (UserChoice), or
+# the class of the extension for the machine, or for the user. Empty: nobody else.
+function Get-Owner($t) {
+    $choice = Get-Value $hkcu "Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$($t.Ext)\UserChoice" 'ProgId'
+    if ($choice -and $choice -ne $t.ProgId) { return $choice }
+    $machine = Get-Value $hklm "Software\Classes\$($t.Ext)"
+    if ($machine -and $machine -ne $t.ProgId) { return $machine }
+    $user = Get-Value $hkcu "$classes\$($t.Ext)"
+    if ($user -and $user -ne $t.ProgId) { return $user }
+    ''
+}
+
+# The handler of a kind the file type had (its class, the extension, SystemFileAssociations), not ours
+function Get-Handler([string]$owner, [string]$ext, [string]$sub) {
+    foreach ($path in "$owner\$sub", "$ext\$sub", "SystemFileAssociations\$ext\$sub") {
+        $v = Get-Value $hkcr $path
+        if ($v -and $ours -notcontains $v) { return $v }
+    }
+    ''
+}
+
+# In front of the icon, thumbnail and preview of the program that owns the extension: what it had is
+# recorded first (once for that program: afterwards these are in front), and what the user had in
+# HKCU, overwritten here, is kept to put it back
+function Set-Chain($t, [string]$owner) {
+    $c = $hkcu.CreateSubKey("$chain\$(Get-ChainName $t.Ext)")
+    if ($c.GetValue('ProgId') -ne $owner) {
+        foreach ($n in $c.GetValueNames()) { $c.DeleteValue($n) }
+        $c.SetValue('ProgId', $owner)
+        $icon = Get-Value $hkcr "$owner\DefaultIcon"
+        if ($icon -and $icon -notlike '*%1*') { $c.SetValue('Icon', $icon) }
+        elseif ($icon) { $h = Get-Handler $owner $t.Ext $iconHandlerKey; if ($h) { $c.SetValue('IconHandler', $h) } }
+        $h = Get-Handler $owner $t.Ext $thumbShellEx; if ($h) { $c.SetValue('Thumbnail', $h) }
+        $h = Get-Handler $owner $t.Ext $previewShellEx; if ($h) { $c.SetValue('Preview', $h) }
+        foreach ($sub in 'DefaultIcon', $iconHandlerKey, $thumbShellEx, $previewShellEx) {
+            $k = $hkcu.OpenSubKey("$classes\$owner\$sub")
+            if ($k -and $null -ne $k.GetValue('')) { $c.SetValue("User:$sub", [string]$k.GetValue('')) }
+            if ($k) { $k.Close() }
+        }
+    }
+    $hkcu.CreateSubKey("$classes\$owner\DefaultIcon").SetValue('', '%1')
+    $hkcu.CreateSubKey("$classes\$owner\$iconHandlerKey").SetValue('', $clsid)
+    $hkcu.CreateSubKey("$classes\$owner\$thumbShellEx").SetValue('', $thumbClsid)
+    $hkcu.CreateSubKey("$classes\$owner\$previewShellEx").SetValue('', $previewClsid)
+    Write-Host "$($t.Ext) belongs to $owner`: chained (its files that are not DICOM keep what they had)"
+}
+
+# Undo Set-Chain: what the user had in HKCU again, or nothing (then the machine's shows again)
+function Clear-Chain([string]$name) {
+    $c = $hkcu.OpenSubKey("$chain\$name")
+    if (-not $c) { return }
+    $owner = [string]$c.GetValue('ProgId')
+    if ($owner) {
+        foreach ($sub in 'DefaultIcon', $iconHandlerKey, $thumbShellEx, $previewShellEx) {
+            $k = $hkcu.OpenSubKey("$classes\$owner\$sub", $true)
+            if (-not $k) { continue }
+            $mine = [string]$k.GetValue('')
+            if ($mine -eq '%1' -or $ours -contains $mine) {
+                $saved = $c.GetValue("User:$sub")
+                if ($null -ne $saved) { $k.SetValue('', [string]$saved) } else { $k.DeleteValue('', $false) }
+            }
+            $k.Close()
+            # The keys made only for this, empty again, go
+            $path = "$classes\$owner\$sub"
+            while ($path -ne "$classes\$owner") {
+                $e = $hkcu.OpenSubKey($path)
+                if (-not $e -or $e.SubKeyCount -gt 0 -or $e.ValueCount -gt 0) { if ($e) { $e.Close() }; break }
+                $e.Close(); $hkcu.DeleteSubKey($path)
+                $path = Split-Path $path -Parent
+            }
+        }
+        $e = $hkcu.OpenSubKey("$classes\$owner")
+        if ($e -and $e.SubKeyCount -eq 0 -and $e.ValueCount -eq 0) { $e.Close(); $hkcu.DeleteSubKey("$classes\$owner") }
+    }
+    $c.Close()
+    Remove-Key "$chain\$name"
+}
+
 if ($Uninstall) {
     $s = $hkcu.OpenSubKey($state)
     foreach ($t in $types) {
+        Clear-Chain (Get-ChainName $t.Ext)
         # The extension is given back only if it still points to our type
         if ($s -and $s.GetValue("Owns$($t.Ext)") -eq 1) {
             $k = $hkcu.OpenSubKey("$classes\$($t.Ext)", $true)
@@ -120,6 +228,7 @@ if ($Uninstall) {
     $list = $hkcu.OpenSubKey($previewList, $true)
     if ($list) { $list.DeleteValue($previewClsid, $false) }
     Remove-Key $state
+    Remove-Key $chain
     Remove-Key $previewSettings
     [DicomIconsSetup.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)   # SHCNE_ASSOCCHANGED
     Write-Host 'DICOM file icons, preview and thumbnails unregistered (Explorer frees the DLL when it restarts).'
@@ -150,13 +259,24 @@ $p = $hkcu.OpenSubKey($previewSettings, $true)
 if ($p) { $p.DeleteValue('HeaderNames', $false) }
 
 $s = $hkcu.CreateSubKey($state)
+if ($withImg) { $s.SetValue('Img', 1, 'DWord') }
 foreach ($t in $types) {
-    $ext = $hkcu.CreateSubKey("$classes\$($t.Ext)")
-    $current = [string]$ext.GetValue('')
-    if ($current -and $current -ne $t.ProgId) {
-        Write-Host "$($t.Ext) belongs to $current already: it keeps its icon"
+    $owner = Get-Owner $t
+    if ($owner) {
+        # Someone else's: an earlier install that took it over (from the user's classes, over the
+        # machine's) gives it back
+        $ext = $hkcu.OpenSubKey("$classes\$($t.Ext)", $true)
+        if ($ext -and $ext.GetValue('') -eq $t.ProgId) {
+            $ext.DeleteValue('', $false)
+            if ($ext.ValueCount -eq 0 -and $ext.SubKeyCount -eq 0) { $ext.Close(); $hkcu.DeleteSubKey("$classes\$($t.Ext)") }
+        }
+        $s.DeleteValue("Owns$($t.Ext)", $false)
+        Remove-Key "$classes\$($t.ProgId)"
+        Set-Chain $t $owner
     }
     else {
+        Clear-Chain (Get-ChainName $t.Ext)
+        $ext = $hkcu.CreateSubKey("$classes\$($t.Ext)")
         $hkcu.CreateSubKey("$classes\$($t.ProgId)").SetValue('', $t.Name)
         Set-FileType "$classes\$($t.ProgId)" $true ($t.Ext -eq '.')
         $ext.SetValue('', $t.ProgId)

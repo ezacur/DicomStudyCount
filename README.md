@@ -67,7 +67,8 @@ tree** opens the whole folder tree with one color per study.
   file (the `DICM` at byte 128, or a raw dataset) and leaves the files that are not DICOM as they were.
 - **Thumbnails** (medium icons and larger, unless *Always show icons, never thumbnails* is on): the
   first frame, with the series icon as a badge in its lower right corner. DICOM files without an image
-  (reports, DICOMDIR) keep their icon.
+  (reports, DICOMDIR) keep their icon. Smaller (details, list, small icons): the series icon, not
+  the thumbnail.
 - **Preview of the DICOM files** (Explorer's preview pane, Alt+P): three tabs over the image.
   - *Columns*: every DICOM column with its value for this file, and a check box that shows or hides
     that column in the Explorer window of the folder (as *right-click a column header > More...*
@@ -97,6 +98,12 @@ tree** opens the whole folder tree with one color per study.
   corners, never who the patient is: modality, series, description and image number; date and time,
   device and protocol; Z level, slice thickness, pixel spacing and size; the window and zoom; and the
   patient directions at the sides (R/L, A/P, H/F, from ImageOrientationPatient).
+
+  A **DICOMDIR** opens on a *Directory* tab: its patients (by ID, never by name), studies, series (by
+  number, with how many files) and files. Choosing a file shows it under the tree, with the slider
+  over its series; Enter or a double click opens its folder in Explorer with the file selected. The
+  DICOMDIR is only read (DCMTK's DICOMDIR class is not used: it writes the file back when it finds
+  something to correct).
   Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
   JPEG 2000 pixel data (not deflated files). It uses DCMTK and OpenJPEG, inside the same DLL.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
@@ -135,6 +142,21 @@ tree** opens the whole folder tree with one color per study.
   They come from the property handler of the same DLL, which reads the header on the fly; *duplicated
   in* comes from the last count (like the folder comments). Windows registers property handlers and
   columns for the whole machine only, so installing them asks for administrator rights.
+- **Searching by DICOM fields**: Explorer's search box takes the columns as keywords, their name
+  without spaces, in the folder and its subfolders. It also works without the Windows Search index
+  (searching then reads every file, slower):
+
+  | Search | Finds |
+  |---|---|
+  | `dicommodality:CT` | the CT images |
+  | `dicomseriesnumber:1503` · `dicomseriesnumber:>100` | a series by number, or a range |
+  | `dicomseriesdescription:cine` | "cine" in the description |
+  | `dicomstudydate:2011` · `dicomacquired:>2023-01-01` | by date |
+  | `dicomzlevel:<-100 dicomseriesnumber:7` | both conditions (`OR` too) |
+  | `dicompatientid:5805091` · `dicomstudyhash:FhwmA0` | a patient, a study |
+
+  Each column of the table above works the same way: `dicomframes:>1`, `dicomcompression:"JPEG 2000"`,
+  `dicomobjecttype:"Enhanced SR"`, `dicomsensitivedata(experimental):YES`...
 - **DICOM tree window**: the folder tree with the same icons, the number of files (recursive),
   the comment of every folder, one pastel color per study in the rows, *Expand to studies* (expands until studies separate), live
   updates while counting and when files or folders change, and the *Problems* window.
@@ -180,9 +202,13 @@ goes to `%LOCALAPPDATA%\DicomStudyCount\` (see [What it writes, and where](#what
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Install
    ```
-   The icons are registered only for the types no other program owns (`.dcm`, `.ima`, `.dicom`,
-   files without extension); the preview, thumbnails, columns and *Show DICOM duplicates* for those
-   types whoever owns them. Explorer loads copies of `bin\DicomShell.dll` (in `%LOCALAPPDATA%` for the
+   It covers `.dcm`, `.ima`, `.dicom` and files without extension; add `-Img` for DICOM files named
+   `.img` (remembered by later installs). A type that another program already owns (a viewer that
+   took `.ima`, Windows with `.img` for disc images) stays its own: opening the files, their type
+   name and their verbs do not change. Its icon, thumbnail, preview and columns are **chained**: these
+   go in front of them, look at each file (`DICM` in its first bytes), and give every file that is
+   not DICOM to what that program had, as if they were not there. `-Uninstall` puts back everything
+   as it was. Explorer loads copies of `bin\DicomShell.dll` (in `%LOCALAPPDATA%` for the
    icons, in `%ProgramFiles%\DicomStudyCount` for the columns, which the search indexer also loads,
    so only administrators can change it), so the folder can be updated at any time.
 4. Recommended: hide protected operating system files (Explorer > *Options* > *View* >
@@ -211,7 +237,7 @@ menu, so the menu cannot tell a counted folder from one that is not.
   of a window it acts on that window; on a folder of the list, on the window showing the list.
 - **Unblock (allow preview)**: files downloaded from the Internet carry a "mark of the web" (a
   `Zone.Identifier` stream), and Windows does not show them in the preview pane ("The file you are
-  attempting to preview could harm your computer"). This removes that mark from the DICOM files of
+  attempting to preview could harm your computer"). This removes that mark from the DICOM files (DICOMDIR included) of
   the folder and its subfolders, as `Unblock-File` does, and only from them; their contents are not
   touched.
 - **Clean**: leaves Explorer, from that folder down, as if it had never been counted (no
@@ -249,8 +275,8 @@ menu, so the menu cannot tell a counted folder from one that is not.
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
-| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
-| Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (when they had none) and the registered schema | `-Uninstall` (asks for administrator rights) |
+| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\DicomStudyCount\Chain` (what those programs had), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (and `.img` with `-Img`; the one another program had is kept in `HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain` and gets its files back) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 
 The tool never modifies, moves or deletes DICOM files. The reports and the index contain file paths

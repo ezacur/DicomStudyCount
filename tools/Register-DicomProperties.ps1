@@ -5,10 +5,13 @@
 .NOTES
     The DLL is copied to %ProgramFiles%\DicomStudyCount, which only administrators can change: Explorer
     and the search indexer load it. Its name carries its hash, since a loaded DLL cannot be overwritten.
-    An extension that already has a property handler is left alone.
+    An extension that already has a property handler of another program is chained: this one goes in
+    front of it, and gives every file that is not DICOM to it (recorded in Chain\<ext> of the state key
+    below, read by the DLL); -Uninstall puts it back. -Img adds .img (remembered).
 #>
 param(
     [string]$Dll,
+    [switch]$Img,
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -26,6 +29,9 @@ $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHa
 $state = 'SOFTWARE\DicomStudyCount\PropertyHandler'      # what was registered, to undo only that
 $extensions = '.', '.dcm', '.ima', '.dicom'                 # '.': files without extension
 $hklm = [Microsoft.Win32.Registry]::LocalMachine
+$st = $hklm.OpenSubKey($state)
+if ($Img -or $Uninstall -or ($st -and $st.GetValue('Img') -eq 1)) { $extensions += '.img' }
+function Get-ChainName([string]$ext) { if ($ext -eq '.') { '(none)' } else { $ext } }
 $dir = Join-Path $env:ProgramFiles 'DicomStudyCount'
 # The columns (names, types) of the properties: a schema registered from its installed copy
 $schemaSource = Join-Path $bin 'DicomStudyCount.propdesc'
@@ -44,7 +50,12 @@ if ($Uninstall) {
     $s = $hklm.OpenSubKey($state)
     foreach ($ext in $extensions) {
         $k = $hklm.OpenSubKey("$handlers\$ext")
-        if ($s -and $s.GetValue("Owns$ext") -eq 1 -and $k -and $k.GetValue('') -eq $clsid) { Remove-Key "$handlers\$ext" }
+        if ($s -and $s.GetValue("Owns$ext") -eq 1 -and $k -and $k.GetValue('') -eq $clsid) {
+            # The handler from before, if there was one
+            $before = $hklm.OpenSubKey("$state\Chain\$(Get-ChainName $ext)")
+            $previous = if ($before) { [string]$before.GetValue('Properties') }
+            if ($previous) { $hklm.CreateSubKey("$handlers\$ext").SetValue('', $previous) } else { Remove-Key "$handlers\$ext" }
+        }
     }
     Remove-Key "SOFTWARE\Classes\CLSID\$clsid"
     Remove-Key "SOFTWARE\Classes\CLSID\$previewClsid"
@@ -81,12 +92,13 @@ $k = $hklm.CreateSubKey("SOFTWARE\Classes\CLSID\$previewClsid")
 $k.SetValue('DisableLowILProcessIsolation', 1, 'DWord')
 
 $s = $hklm.CreateSubKey($state)
+if ($extensions -contains '.img') { $s.SetValue('Img', 1, 'DWord') }
 foreach ($ext in $extensions) {
     $h = $hklm.CreateSubKey("$handlers\$ext")
     $current = [string]$h.GetValue('')
     if ($current -and $current -ne $clsid) {
-        Write-Host "$ext has a property handler already ($current): left as it is"
-        continue
+        $s.CreateSubKey("Chain\$(Get-ChainName $ext)").SetValue('Properties', $current)
+        Write-Host "$ext has a property handler already ($current): chained (files that are not DICOM keep it)"
     }
     $h.SetValue('', $clsid)
     $s.SetValue("Owns$ext", 1, 'DWord')

@@ -22,6 +22,7 @@
     .\Count-DicomStudies.ps1 -RestoreQuarantine D:\_DicomQuarantine\Patients\20261022_091500
 .EXAMPLE
     .\Count-DicomStudies.ps1 -Install      # context menu + background watcher (-Watch) at logon
+    .\Count-DicomStudies.ps1 -Install -Img # also DICOM files named .img (remembered)
     .\Count-DicomStudies.ps1 -Uninstall
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scan')]
@@ -83,6 +84,8 @@ param(
 
     [Parameter(ParameterSetName = 'Install', Mandatory = $true)]
     [switch]$Install,
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$Img,
 
     [Parameter(ParameterSetName = 'Uninstall', Mandatory = $true)]
     [switch]$Uninstall
@@ -170,7 +173,7 @@ if ($Install) {
     }
     # Icons of the DICOM files (bin\DicomShell.dll, registered for the user)
     $shellDll = Join-Path $PSScriptRoot 'bin\DicomShell.dll'
-    & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Dll $shellDll -Script $PSCommandPath
+    & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Dll $shellDll -Script $PSCommandPath -Img:$Img
     # The columns of the DICOM files: Windows takes property handlers from HKLM only. No UAC prompt
     # when the DLL and the column schema installed are already these ones.
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -180,13 +183,17 @@ if ($Install) {
     $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
     # (and the preview at medium integrity, also from HKLM)
     $preview = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}')
+    # Every extension ours (or chained to ours: Register-DicomProperties.ps1)
+    $extensions = '.', '.dcm', '.ima', '.dicom'
+    $propState = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\DicomStudyCount\PropertyHandler')
+    if ($Img -or ($propState -and $propState.GetValue('Img') -eq 1)) { $extensions += '.img' }
     $upToDate = $server -and [IO.Path]::GetFileName([string]$server.GetValue('')) -eq "DicomShell-$dllHash.dll" -and
         $preview -and $preview.GetValue('DisableLowILProcessIsolation') -eq 1 -and
-        @('.', '.dcm', '.ima', '.dicom' | Where-Object { -not [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$handlers\$_") }).Count -eq 0 -and
+        @($extensions | Where-Object { [string](Get-ItemProperty -LiteralPath "HKLM:\$handlers\$_" -ErrorAction SilentlyContinue).'(default)' -ne '{21329A2B-09B3-4250-9103-9267877321EB}' }).Count -eq 0 -and
         (Test-Path -LiteralPath $installedSchema) -and
         ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'bin\DicomStudyCount.propdesc')).Hash)
     if ($upToDate) { Write-Host 'DICOM columns already installed and up to date' }
-    else { Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') @('-Dll', $shellDll) }
+    else { Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') (@('-Dll', $shellDll) + @(if ($Img) { '-Img' })) }
     # The C# DLL used to be compiled by the script itself into this cache: no longer used
     $oldCache = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\bin'
     if (Test-Path -LiteralPath $oldCache) { Remove-Item -LiteralPath $oldCache -Recurse -Force -ErrorAction SilentlyContinue }

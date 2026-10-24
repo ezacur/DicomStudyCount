@@ -1508,11 +1508,27 @@ namespace DicomStudyCount
                 if (GetFileAttributesW(mark) == 0xFFFFFFFF) return;     // not marked
                 DicomTags tags = null;
                 try { tags = DicomParser.ReadFile(f); } catch (Exception) { }
-                if (tags == null) { Interlocked.Increment(ref notDicom); return; }
+                // A DICOMDIR is not read as an image, but the preview shows it too: any file with "DICM"
+                if (tags == null && !HasPreamble(f)) { Interlocked.Increment(ref notDicom); return; }
                 if (DeleteFileW(mark)) Interlocked.Increment(ref unblocked);
                 else Interlocked.Increment(ref failed);
             });
             return new[] { unblocked, notDicom, failed };
+        }
+
+        static bool HasPreamble(string path)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 256))
+                {
+                    var head = new byte[132];
+                    int n = 0, got;
+                    while (n < head.Length && (got = fs.Read(head, n, head.Length - n)) > 0) n += got;
+                    return n == 132 && head[128] == 'D' && head[129] == 'I' && head[130] == 'C' && head[131] == 'M';
+                }
+            }
+            catch (Exception) { return false; }
         }
     }
 
