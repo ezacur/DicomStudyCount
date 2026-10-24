@@ -23,7 +23,7 @@ if (-not $Dll) { $Dll = Join-Path $bin 'DicomShell.dll' }
 $clsid = '{21329A2B-09B3-4250-9103-9267877321EB}'
 $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
 $state = 'SOFTWARE\DicomStudyCount\PropertyHandler'      # what was registered, to undo only that
-$extensions = '.', '.dcm'                                   # '.': files without extension
+$extensions = '.', '.dcm', '.ima', '.dicom'                 # '.': files without extension
 $hklm = [Microsoft.Win32.Registry]::LocalMachine
 $dir = Join-Path $env:ProgramFiles 'DicomStudyCount'
 # The columns (names, types) of the properties: a schema registered from its installed copy

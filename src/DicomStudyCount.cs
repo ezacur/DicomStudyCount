@@ -147,15 +147,16 @@ namespace DicomStudyCount
 
         const string Base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-        // Short tag that identifies a study: its main modality and 5 case-sensitive characters from
-        // a 64-bit FNV-1a hash of the StudyInstanceUID, always the same for the same study: "CT-aB3x9"
+        // Short tag that identifies a study: its main modality and 6 case-sensitive characters (62
+        // possible each, 56.8e9 tags) from a 64-bit FNV-1a hash of the StudyInstanceUID, always the
+        // same for the same study: "CT-aB3x9Q"
         public static string StudyTag(string uid, string modality)
         {
             ulong h = 14695981039346656037;
             foreach (char c in uid) { h ^= c; h *= 1099511628211; }
-            ulong v = h % 916132832UL;      // 62^5
-            var chars = new char[5];
-            for (int i = 4; i >= 0; i--) { chars[i] = Base62[(int)(v % 62)]; v /= 62; }
+            ulong v = h % 56800235584UL;    // 62^6
+            var chars = new char[6];
+            for (int i = 5; i >= 0; i--) { chars[i] = Base62[(int)(v % 62)]; v /= 62; }
             return (string.IsNullOrEmpty(modality) ? "OT" : modality) + "-" + new string(chars);
         }
 
@@ -1472,6 +1473,114 @@ namespace DicomStudyCount
 
     // Index of counted locations: one tab-separated file per counted folder
     // ("#root <folder>" line, then path, size, last write time, StudyInstanceUID, SOPInstanceUID)
+    // Files downloaded from the Internet carry a Zone.Identifier stream ("mark of the web"), and Windows
+    // does not show them in the preview pane. Unblock removes that stream from the DICOM files of a
+    // folder tree (as Unblock-File does), and only from them; their contents are not touched.
+    public static class Unblocker
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool DeleteFileW(string path);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFileAttributesW(string path);
+
+        // Returns { DICOM files unblocked, marked files left as they are (not DICOM), failures }
+        public static int[] Run(string root, int threads)
+        {
+            int unblocked = 0, notDicom = 0, failed = 0;
+            var files = new List<string>();
+            var dirs = new Stack<string>();
+            dirs.Push(root);
+            while (dirs.Count > 0)
+            {
+                string d = dirs.Pop();
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(d)) files.Add(f);
+                    foreach (var s in Directory.EnumerateDirectories(d)) dirs.Push(s);
+                }
+                catch (Exception) { }
+            }
+            var opts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads) };
+            Parallel.ForEach(files, opts, f =>
+            {
+                string mark = f + ":Zone.Identifier";
+                if (GetFileAttributesW(mark) == 0xFFFFFFFF) return;     // not marked
+                DicomTags tags = null;
+                try { tags = DicomParser.ReadFile(f); } catch (Exception) { }
+                if (tags == null) { Interlocked.Increment(ref notDicom); return; }
+                if (DeleteFileW(mark)) Interlocked.Increment(ref unblocked);
+                else Interlocked.Increment(ref failed);
+            });
+            return new[] { unblocked, notDicom, failed };
+        }
+    }
+
+    // "Show DICOM duplicates" on a file: its copies found by the counts, shown selected in Explorer
+    public static class Duplicates
+    {
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr ILCreateFromPathW(string path);
+
+        [DllImport("shell32.dll")]
+        static extern void ILFree(IntPtr pidl);
+
+        [DllImport("shell32.dll")]
+        static extern int SHOpenFolderAndSelectItems(IntPtr folder, uint count, IntPtr[] items, uint flags);
+
+        // The copies of a file ("path (differs)" when not byte-identical), or none if no count found any
+        public static string[] Of(string copiesDir, string file)
+        {
+            if (!Directory.Exists(copiesDir)) return new string[0];
+            string prefix = file + "\t";
+            foreach (var tsv in Directory.GetFiles(copiesDir, "*.tsv"))
+            {
+                string root = GlobalIndex.RootOf(tsv);
+                if (root == null || !Paths.IsUnder(file, root)) continue;
+                foreach (var line in File.ReadLines(tsv, Encoding.UTF8))
+                    if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var f = line.Split('\t');
+                        var copies = new string[f.Length - 1];
+                        Array.Copy(f, 1, copies, 0, copies.Length);
+                        return copies;
+                    }
+            }
+            return new string[0];
+        }
+
+        // One Explorer window per folder, with its files selected. Returns the files that exist.
+        public static int Show(string[] files)
+        {
+            int shown = 0;
+            var byFolder = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in files)
+            {
+                if (!File.Exists(f)) continue;
+                string dir = Path.GetDirectoryName(f);
+                List<string> list;
+                if (!byFolder.TryGetValue(dir, out list)) byFolder[dir] = list = new List<string>();
+                list.Add(f);
+                shown++;
+            }
+            foreach (var kv in byFolder)
+            {
+                IntPtr folder = ILCreateFromPathW(kv.Key);
+                if (folder == IntPtr.Zero) continue;
+                var items = new List<IntPtr>();
+                foreach (var f in kv.Value)
+                {
+                    IntPtr p = ILCreateFromPathW(f);
+                    if (p != IntPtr.Zero) items.Add(p);
+                }
+                SHOpenFolderAndSelectItems(folder, (uint)items.Count, items.ToArray(), 0);
+                foreach (var p in items) ILFree(p);
+                ILFree(folder);
+            }
+            return shown;
+        }
+    }
+
     public static class CountedData
     {
         // Forgets the files of a folder tree in the index of counted locations: the index files of the

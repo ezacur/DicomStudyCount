@@ -5,7 +5,7 @@
 <schema xmlns="http://schemas.microsoft.com/windows/2006/propertydescription" schemaVersion="1.0">
   <propertyDescriptionList publisher="DicomStudyCount" product="DicomStudyCount">
 
-    <!-- 5 case-sensitive characters from a hash of the StudyInstanceUID, as in the study tags of the folder comments -->
+    <!-- 6 case-sensitive characters from a hash of the StudyInstanceUID, as in the study tags of the folder comments -->
     <propertyDescription name="DicomStudyCount.StudyHash" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="2">
       <searchInfo inInvertedIndex="false" isColumn="true" />
       <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
@@ -57,7 +57,7 @@
       <displayInfo displayType="String" defaultColumnWidth="40" />
     </propertyDescription>
 
-    <!-- 5 case-sensitive characters from a hash of the SeriesInstanceUID (the same hash as the study's) -->
+    <!-- 6 case-sensitive characters from a hash of the SeriesInstanceUID (the same hash as the study's) -->
     <propertyDescription name="DicomStudyCount.SeriesHash" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="9">
       <searchInfo inInvertedIndex="false" isColumn="true" />
       <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
@@ -130,7 +130,7 @@
       </displayInfo>
     </propertyDescription>
 
-    <!-- 5 characters from a hash of the FrameOfReferenceUID: only slices with the same one have
+    <!-- 6 characters from a hash of the FrameOfReferenceUID: only slices with the same one have
          comparable positions (Z level) -->
     <propertyDescription name="DicomStudyCount.FrameOfReference" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="18">
       <searchInfo inInvertedIndex="false" isColumn="true" />

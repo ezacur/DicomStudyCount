@@ -1,32 +1,103 @@
 <#
 .SYNOPSIS
-    Registers the icon handler of bin\DicomShell.dll for the current user (HKCU, no administrator
-    rights): DICOM files without extension and .dcm files get the icon drawn by it. -Uninstall removes
-    it. Called by Count-DicomStudies.ps1 -Install / -Uninstall.
+    Registers, for the current user (HKCU, no administrator rights), what bin\DicomShell.dll does for
+    DICOM files without extension, .dcm, .ima and .dicom: their icon, their image and header in
+    Explorer's preview pane, their thumbnail, the DICOM values shown when hovering them and in the
+    Details pane, and "Show DICOM duplicates" in their context menu. -Uninstall removes it all.
+    Called by Count-DicomStudies.ps1 -Install / -Uninstall.
 .NOTES
     The DLL is copied to %LOCALAPPDATA%\DicomStudyCount\shellext under a name with its hash: Explorer
     keeps the registered one loaded, so the one in bin\ can always be replaced.
-    An extension that already belongs to another program is left alone (its icon is not changed).
+    An extension that already belongs to another program keeps its icon (the icon belongs to the
+    program that opens it); the rest goes into SystemFileAssociations, which Windows reads for every
+    file of that extension whoever owns it.
 #>
 param(
     [string]$Dll,
+    [string]$Script,        # Count-DicomStudies.ps1, for the "Show DICOM duplicates" verb
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
-if (-not $Dll) { $Dll = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'bin\DicomShell.dll' }
-$clsid = '{F4798986-2EEA-49F6-8082-2FC552CE691B}'
+$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+if (-not $Dll) { $Dll = Join-Path $root 'bin\DicomShell.dll' }
+if (-not $Script) { $Script = Join-Path $root 'Count-DicomStudies.ps1' }
+$clsid = '{F4798986-2EEA-49F6-8082-2FC552CE691B}'           # icons
+$previewClsid = '{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}'    # preview (run by Windows in prevhost.exe)
+$thumbClsid = '{F6D7D002-C00D-4893-AC73-DC78D44316C3}'      # thumbnails
+$previewShellEx = 'ShellEx\{8895b1c6-b41f-4c1c-a562-0d564250836f}'   # IPreviewHandler
+$thumbShellEx = 'ShellEx\{e357fccd-a995-4576-b01f-234630154e96}'     # IThumbnailProvider
+$prevhostAppId = '{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}'
+$previewList = 'Software\Microsoft\Windows\CurrentVersion\PreviewHandlers'
 $classes = 'Software\Classes'
+$sfa = 'Software\Classes\SystemFileAssociations'
 $state = 'Software\DicomStudyCount\IconHandler'      # what was registered, to undo only that
 $types = @(
     @{ Ext = '.'; ProgId = 'DicomStudyCount.NoExtension'; Name = 'File' },
-    @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' }
+    @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' },
+    @{ Ext = '.ima'; ProgId = 'DicomStudyCount.Ima'; Name = 'DICOM File (IMA)' },
+    @{ Ext = '.dicom'; ProgId = 'DicomStudyCount.Dicom'; Name = 'DICOM File' }
 )
+$verbKey = 'shell\DicomStudyCountDuplicates'
+
+# DICOM values shown when hovering a file, in the Details pane and in Properties > Details
+$d = 'DicomStudyCount.'
+$infoTip = 'prop:' + (('Modality', 'SeriesNumber', 'SeriesDescription', 'InstanceNumber', 'Plane', 'ZLevel', 'Acquired',
+    'DuplicatedIn' | ForEach-Object { $d + $_ }) -join ';')
+$previewDetails = 'prop:' + ((('StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'SeriesDescription', 'InstanceNumber', 'Rows',
+    'Columns', 'Plane', 'ZLevel', 'TriggerTime', 'Acquired', 'ObjectType', 'Compression', 'DuplicatedIn' | ForEach-Object { $d + $_ }) +
+    'System.Size', 'System.DateModified') -join ';')
+$fullDetails = 'prop:System.PropGroup.Description;' + (('StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber',
+    'SeriesDescription', 'Protocol', 'Plane', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness',
+    'Frames', 'ImageType', 'ObjectType', 'Compression', 'Manufacturer', 'FrameOfReference', 'StudyDate', 'PatientID', 'SensitiveData',
+    'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' | ForEach-Object { $d + $_ }) -join ';') +
+    ';System.PropGroup.FileSystem;System.ItemNameDisplay;System.ItemTypeText;System.ItemFolderPathDisplay;System.Size;' +
+    'System.DateCreated;System.DateModified;System.FileAttributes'
+
 $hkcu = [Microsoft.Win32.Registry]::CurrentUser
 Add-Type -Namespace DicomIconsSetup -Name Shell -MemberDefinition '
     [DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);'
 
 function Remove-Key([string]$path) { if ($hkcu.OpenSubKey($path)) { $hkcu.DeleteSubKeyTree($path) } }
+
+# What goes into a file type: the icon (only in a ProgID of ours), and the rest (preview, thumbnails,
+# values, verb), each in one place only, or Explorer would list the verb twice: in
+# SystemFileAssociations\<ext> for an extension, in the ProgID for files without extension
+function Set-FileType([string]$key, [bool]$icon, [bool]$rest) {
+    if ($icon) {
+        # "%1": the icon of each file comes from its icon handler
+        $hkcu.CreateSubKey("$key\DefaultIcon").SetValue('', '%1')
+        $hkcu.CreateSubKey("$key\ShellEx\IconHandler").SetValue('', $clsid)
+    }
+    if (-not $rest) { return }
+    $hkcu.CreateSubKey("$key\$previewShellEx").SetValue('', $previewClsid)
+    $hkcu.CreateSubKey("$key\$thumbShellEx").SetValue('', $thumbClsid)
+    $k = $hkcu.CreateSubKey($key)
+    $k.SetValue('InfoTip', $infoTip)
+    $k.SetValue('PreviewDetails', $previewDetails)
+    $k.SetValue('FullDetails', $fullDetails)
+    $v = $hkcu.CreateSubKey("$key\$verbKey")
+    $v.SetValue('MUIVerb', 'Show DICOM duplicates')
+    $v.SetValue('Icon', 'imageres.dll,-68')
+    # conhost --headless runs PowerShell without opening a console window
+    $hkcu.CreateSubKey("$key\$verbKey\command").SetValue('',
+        ('conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Path "%1" -ShowDuplicates' -f $Script))
+}
+
+# Undo Set-FileType in SystemFileAssociations\<ext>, leaving whatever others put there
+function Clear-Sfa([string]$key) {
+    $k = $hkcu.OpenSubKey($key, $true)
+    if (-not $k) { return }
+    foreach ($n in 'InfoTip', 'PreviewDetails', 'FullDetails') { if ($k.GetValue($n) -like '*DicomStudyCount.*') { $k.DeleteValue($n, $false) } }
+    foreach ($sub in $previewShellEx, $thumbShellEx) {
+        $s = $hkcu.OpenSubKey("$key\$sub")
+        if ($s -and ($s.GetValue('') -eq $previewClsid -or $s.GetValue('') -eq $thumbClsid)) { $s.Close(); $hkcu.DeleteSubKeyTree("$key\$sub") }
+    }
+    Remove-Key "$key\$verbKey"
+    foreach ($parent in 'ShellEx', 'shell') { $p = $hkcu.OpenSubKey("$key\$parent"); if ($p -and $p.SubKeyCount -eq 0 -and $p.ValueCount -eq 0) { $p.Close(); $hkcu.DeleteSubKey("$key\$parent") } }
+    $k = $hkcu.OpenSubKey($key)
+    if ($k -and $k.SubKeyCount -eq 0 -and $k.ValueCount -eq 0) { $k.Close(); $hkcu.DeleteSubKey($key) }
+}
 
 if ($Uninstall) {
     $s = $hkcu.OpenSubKey($state)
@@ -40,11 +111,14 @@ if ($Uninstall) {
             }
         }
         Remove-Key "$classes\$($t.ProgId)"
+        if ($t.Ext -ne '.') { Clear-Sfa "$sfa\$($t.Ext)" }
     }
-    Remove-Key "$classes\CLSID\$clsid"
-    Remove-Key 'Software\DicomStudyCount\IconHandler'
+    foreach ($c in $clsid, $previewClsid, $thumbClsid) { Remove-Key "$classes\CLSID\$c" }
+    $list = $hkcu.OpenSubKey($previewList, $true)
+    if ($list) { $list.DeleteValue($previewClsid, $false) }
+    Remove-Key $state
     [DicomIconsSetup.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)   # SHCNE_ASSOCCHANGED
-    Write-Host 'DICOM file icons unregistered (Explorer frees the DLL when it restarts).'
+    Write-Host 'DICOM file icons, preview and thumbnails unregistered (Explorer frees the DLL when it restarts).'
     return
 }
 
@@ -56,31 +130,36 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 $target = Join-Path $dir "DicomShell-$hash.dll"
 if (-not (Test-Path -LiteralPath $target)) { Copy-Item -LiteralPath $Dll -Destination $target }
 
-$k = $hkcu.CreateSubKey("$classes\CLSID\$clsid")
-$k.SetValue('', 'DicomStudyCount: icons of DICOM files')
-$k = $hkcu.CreateSubKey("$classes\CLSID\$clsid\InprocServer32")
-$k.SetValue('', $target)
-$k.SetValue('ThreadingModel', 'Apartment')
+foreach ($c in @(@($clsid, 'DicomStudyCount: icons of DICOM files'), @($previewClsid, 'DicomStudyCount: preview of DICOM files'),
+                 @($thumbClsid, 'DicomStudyCount: thumbnails of DICOM files'))) {
+    $k = $hkcu.CreateSubKey("$classes\CLSID\$($c[0])")
+    $k.SetValue('', $c[1])
+    if ($c[0] -eq $previewClsid) { $k.SetValue('DisplayName', 'DICOM preview'); $k.SetValue('AppID', $prevhostAppId) }
+    $k = $hkcu.CreateSubKey("$classes\CLSID\$($c[0])\InprocServer32")
+    $k.SetValue('', $target)
+    $k.SetValue('ThreadingModel', 'Apartment')
+}
+$hkcu.CreateSubKey($previewList).SetValue($previewClsid, 'DicomStudyCount: preview of DICOM files')
 
 $s = $hkcu.CreateSubKey($state)
 foreach ($t in $types) {
     $ext = $hkcu.CreateSubKey("$classes\$($t.Ext)")
     $current = [string]$ext.GetValue('')
     if ($current -and $current -ne $t.ProgId) {
-        Write-Host "$($t.Ext) belongs to $current already: its icons are left as they are"
-        continue
+        Write-Host "$($t.Ext) belongs to $current already: it keeps its icon"
     }
-    $p = $hkcu.CreateSubKey("$classes\$($t.ProgId)")
-    $p.SetValue('', $t.Name)
-    # "%1": the icon of each file comes from its icon handler
-    $hkcu.CreateSubKey("$classes\$($t.ProgId)\DefaultIcon").SetValue('', '%1')
-    $hkcu.CreateSubKey("$classes\$($t.ProgId)\ShellEx\IconHandler").SetValue('', $clsid)
-    $ext.SetValue('', $t.ProgId)
-    $s.SetValue("Owns$($t.Ext)", 1, 'DWord')
+    else {
+        $hkcu.CreateSubKey("$classes\$($t.ProgId)").SetValue('', $t.Name)
+        Set-FileType "$classes\$($t.ProgId)" $true ($t.Ext -eq '.')
+        $ext.SetValue('', $t.ProgId)
+        $s.SetValue("Owns$($t.Ext)", 1, 'DWord')
+    }
+    # Whoever owns it (now or later): preview, thumbnails, values and the verb
+    if ($t.Ext -ne '.') { Set-FileType "$sfa\$($t.Ext)" $false $true }
 }
 [DicomIconsSetup.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)   # SHCNE_ASSOCCHANGED
 
 # Copies of earlier builds that Explorer no longer has loaded (DicomIcons-*: their older name)
 Get-ChildItem -LiteralPath $dir -Filter 'Dicom*-*.dll' | Where-Object { $_.FullName -ne $target } |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-Write-Host "DICOM file icons registered: $target"
+Write-Host "DICOM file icons, preview and thumbnails registered: $target"

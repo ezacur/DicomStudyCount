@@ -11,12 +11,32 @@
 // (DicomStudyCount.propdesc), read from the same header, plus the copies of every file found by the
 // last count ("duplicated in").
 //
-// Registered by Count-DicomStudies.ps1 -Install for .dcm and files without extension: the icons per
-// user (tools\Register-DicomIcons.ps1), the properties for the machine (tools\Register-DicomProperties.ps1).
+// And the preview (Explorer's preview pane) and the thumbnails of DICOM files, decoded with DCMTK.
+//
+// Registered by Count-DicomStudies.ps1 -Install for .dcm, .ima, .dicom and files without extension: the
+// icons, preview and thumbnails per user (tools\Register-DicomIcons.ps1), the properties for the
+// machine (tools\Register-DicomProperties.ps1).
 // It runs inside Explorer: every error ends in the generic icon or no properties, never in an exception.
 
+// DCMTK first: its configuration must come before the Windows headers it includes itself
+#include "dcmtk/config/osconfig.h"
+#include "dcmtk/dcmdata/dctk.h"
+#include "dcmtk/dcmdata/dcistrmb.h"
+#include "dcmtk/dcmdata/dcpxitem.h"
+#include "dcmtk/dcmdata/dcrledrg.h"
+#include "dcmtk/dcmimgle/dcmimage.h"
+#include "dcmtk/dcmimage/diregist.h"
+#include "dcmtk/dcmjpeg/djdecode.h"
+#include "dcmtk/dcmjpls/djdecode.h"
+#include "dcmtk/oflog/oflog.h"
+#include "openjpeg.h"
+#include <memory>
+#include <mutex>
+
 #include <windows.h>
+#include <windowsx.h>
 #include <shlobj.h>
+#include <thumbcache.h>
 #include <propsys.h>
 #include <propkey.h>
 #include <propvarutil.h>
@@ -42,6 +62,12 @@
 static const CLSID CLSID_DicomIcons = { 0xF4798986, 0x2EEA, 0x49F6, { 0x80, 0x82, 0x2F, 0xC5, 0x52, 0xCE, 0x69, 0x1B } };
 // {21329A2B-09B3-4250-9103-9267877321EB}
 static const CLSID CLSID_DicomProperties = { 0x21329A2B, 0x09B3, 0x4250, { 0x91, 0x03, 0x92, 0x67, 0x87, 0x73, 0x21, 0xEB } };
+// {F3E184D5-95DF-4BE9-9929-32FF8A59CD55}
+static const CLSID CLSID_DicomPreview = { 0xF3E184D5, 0x95DF, 0x4BE9, { 0x99, 0x29, 0x32, 0xFF, 0x8A, 0x59, 0xCD, 0x55 } };
+// {F6D7D002-C00D-4893-AC73-DC78D44316C3}
+static const CLSID CLSID_DicomThumbnails = { 0xF6D7D002, 0xC00D, 0x4893, { 0xAC, 0x73, 0xDC, 0x78, 0xD4, 0x43, 0x16, 0xC3 } };
+
+static HMODULE g_module = nullptr;
 
 static LONG g_locks = 0;            // live objects and LockServer calls
 
@@ -559,26 +585,13 @@ static Glyph Measure(HDC dc, HFONT font, const std::wstring& label)
     return g;
 }
 
-static HICON DrawIcon(int size, int color, const std::wstring& label)
+// The square of a series icon (the number in the study color) drawn at (x0, y0): the whole icon, or
+// the badge in the corner of a thumbnail
+static void DrawBadge(HDC dc, int x0, int y0, int size, int color, const std::wstring& label)
 {
-    if (size < 8 || size > 512) size = 32;
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = size;
-    bi.bmiHeader.biHeight = -size;                      // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC dc = CreateCompatibleDC(nullptr);
-    if (!dc) return nullptr;
-    HBITMAP dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dib) { DeleteDC(dc); return nullptr; }
-    HGDIOBJ oldBitmap = SelectObject(dc, dib);
-
     Rgb text = FromHex(Palette[color]);
     Rgb bg = Background(text);
-    RECT all = { 0, 0, size, size };
+    RECT all = { x0, y0, x0 + size, y0 + size };
     HBRUSH bgBrush = CreateSolidBrush(ToGdi(bg));
     FillRect(dc, &all, bgBrush);
     DeleteObject(bgBrush);
@@ -625,14 +638,33 @@ static HICON DrawIcon(int size, int color, const std::wstring& label)
     {
         HGDIOBJ old = SelectObject(dc, font);
         // Centered on the ink of the digits: baseline - digitTop is where their tops are
-        int x = (size - g.width) / 2;
-        int y = (size - g.digitHeight + 1) / 2 + g.digitTop - g.ascent;
+        int x = x0 + (size - g.width) / 2;
+        int y = y0 + (size - g.digitHeight + 1) / 2 + g.digitTop - g.ascent;
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, ToGdi(text));
         TextOutW(dc, x, y, label.c_str(), static_cast<int>(label.size()));
         SelectObject(dc, old);
         DeleteObject(font);
     }
+}
+
+static HICON DrawIcon(int size, int color, const std::wstring& label)
+{
+    if (size < 8 || size > 512) size = 32;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;                      // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return nullptr;
+    HBITMAP dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib) { DeleteDC(dc); return nullptr; }
+    HGDIOBJ oldBitmap = SelectObject(dc, dib);
+    DrawBadge(dc, 0, 0, size, color, label);
     GdiFlush();
 
     // GDI leaves the alpha channel at 0: the whole square is opaque, but for the four corners
@@ -776,16 +808,17 @@ static std::wstring Widen(const std::string& s, const std::string& charset = std
     return w;
 }
 
-// 5 case-sensitive characters from the 64-bit FNV-1a of a UID: for the StudyInstanceUID, the same as
-// the study tags of the folder comments ("[MR-hwmA0]"), FolderComments.StudyTag in Count-DicomStudies.ps1
-static std::wstring Hash5(const std::string& uid)
+// 6 case-sensitive characters (62 possible each) from the 64-bit FNV-1a of a UID: for the
+// StudyInstanceUID, the same as the study tags of the folder comments, FolderComments.StudyTag in
+// src\DicomStudyCount.cs
+static std::wstring Hash6(const std::string& uid)
 {
     static const wchar_t Base62[] = L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     unsigned long long h = 14695981039346656037ULL;
     for (unsigned char c : uid) { h ^= c; h *= 1099511628211ULL; }
-    unsigned long long v = h % 916132832ULL;                // 62^5
-    wchar_t chars[6] = {};
-    for (int i = 4; i >= 0; i--) { chars[i] = Base62[v % 62]; v /= 62; }
+    unsigned long long v = h % 56800235584ULL;              // 62^6
+    wchar_t chars[7] = {};
+    for (int i = 5; i >= 0; i--) { chars[i] = Base62[v % 62]; v /= 62; }
     return chars;
 }
 
@@ -1055,6 +1088,10 @@ static std::wstring Compression(const std::string& ts)
         { "1.2.840.10008.1.2.4.201", L"HTJ2K lossless" },
         { "1.2.840.10008.1.2.4.202", L"HTJ2K lossless" },
         { "1.2.840.10008.1.2.4.203", L"HTJ2K" },
+        { "1.2.840.10008.1.2.4.110", L"JPEG XL lossless" },
+        { "1.2.840.10008.1.2.4.111", L"JPEG XL (recompressed JPEG)" },
+        { "1.2.840.10008.1.2.4.112", L"JPEG XL" },
+        { "1.2.840.10008.1.2.8.1", L"Deflated image frames" },
     };
     if (ts.empty()) return L"none (no meta information)";
     for (auto& n : names) if (ts == n.uid) return n.name;
@@ -1255,8 +1292,8 @@ public:
         {
             Header h;
             if (ReadHeader(path, h, UpToBurnedIn) != Kind::Dicom) return S_OK;   // not DICOM: no properties
-            if (!h.studyUid.empty()) Set(PKEY_StudyHash, Hash5(h.studyUid));
-            if (!h.seriesUid.empty()) Set(PKEY_SeriesHash, Hash5(h.seriesUid));
+            if (!h.studyUid.empty()) Set(PKEY_StudyHash, Hash6(h.studyUid));
+            if (!h.seriesUid.empty()) Set(PKEY_SeriesHash, Hash6(h.seriesUid));
             Set(PKEY_PatientID, Widen(h.patientId, h.charset));
             Set(PKEY_ImageOrientation, Widen(h.imageOrientation));
             SetInt(PKEY_InstanceNumber, h.instanceNumber);
@@ -1267,7 +1304,7 @@ public:
             FILETIME ft;
             if (Acquired(h, ft)) SetTime(PKEY_Acquired, ft);
             if (FileTimeOf(h.studyDate, std::string(), ft)) SetTime(PKEY_StudyDate, ft);
-            if (!h.frameOfReference.empty()) Set(PKEY_FrameOfReference, Hash5(h.frameOfReference));
+            if (!h.frameOfReference.empty()) Set(PKEY_FrameOfReference, Hash6(h.frameOfReference));
             if (!h.sopClass.empty()) Set(PKEY_ObjectType, ObjectType(h.sopClass));
             Set(PKEY_ImageType, Widen(h.imageType));
             SetInt(PKEY_Frames, h.numberOfFrames);
@@ -1359,7 +1396,829 @@ private:
     }
 };
 
-// One factory per class: the icons and the properties
+// ---------------------------------------------------------------------------------------------
+// Preview (Explorer's preview pane, Alt+P): the image and the whole header. It runs in prevhost.exe,
+// a process of its own (a crash there never takes Explorer down), which gives the file as a stream;
+// DCMTK reads it from memory, decodes the pixels (uncompressed, JPEG baseline / extended / lossless,
+// JPEG-LS, RLE) and renders them with the window of the header.
+
+static void InitDcmtk()
+{
+    static std::once_flag once;
+    std::call_once(once, []() {
+        OFLog::configure(OFLogger::OFF_LOG_LEVEL);       // nobody to read its messages here
+        // JPEG baseline, extended, lossless. Lossy JPEG: the color space from the JPEG markers, not
+        // from the header (some devices store YCbCr and say RGB)
+        DJDecoderRegistration::registerCodecs(EDC_guessLossyOnly);
+        DJLSDecoderRegistration::registerCodecs();       // JPEG-LS (with the CharLS inside DCMTK)
+        DcmRLEDecoderRegistration::registerCodecs();     // RLE
+    });
+}
+
+// What the preview shows: the first frame as 32-bit BGR rows (top-down), a summary line and the
+// header twice, one line per element: with the tags "(gggg,eeee)" and with their dictionary names.
+// The thumbnail: the frame, and the study and series for its badge.
+struct Rendered
+{
+    int width = 0, height = 0;
+    std::vector<DWORD> pixels;
+    std::wstring summary, tags, names;
+    std::string studyUid, seriesNumber;
+};
+
+// The value of an element as one line: text and numbers in brackets, large binary values by size
+static std::wstring ValueOf(DcmElement* e, const std::string& charset)
+{
+    const Uint32 length = e->getLength();
+    const DcmEVR vr = e->ident();
+    if (e->getTag() == DCM_PixelData) return L"(pixel data, " + std::to_wstring(length) + L" bytes)";
+    bool binary = vr == EVR_OB || vr == EVR_OW || vr == EVR_OF || vr == EVR_OD || vr == EVR_OL || vr == EVR_OV ||
+                  vr == EVR_UN || vr == EVR_ox;
+    if ((binary && length > 64) || length > 4096) return L"(" + std::to_wstring(length) + L" bytes)";
+    OFString v;
+    if (e->getOFStringArray(v).bad()) return L"(not readable)";
+    std::wstring w = Widen(std::string(v.c_str(), v.length()), charset);
+    for (auto& c : w) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+    if (w.size() > 200) w = w.substr(0, 200) + L"...";
+    return L"[" + w + L"]";
+}
+
+// One line per element; the items of a sequence indented under it
+static void Dump(DcmItem* item, const std::string& charset, int depth, std::wstring& tags, std::wstring& names)
+{
+    const std::wstring indent(static_cast<size_t>(depth) * 2, L' ');
+    for (unsigned long i = 0; i < item->card(); i++)
+    {
+        DcmElement* e = item->getElement(i);
+        if (!e) continue;
+        DcmTag tag = e->getTag();
+        wchar_t numbers[16];
+        swprintf_s(numbers, L"(%04X,%04X)", tag.getGTag(), tag.getETag());
+        std::wstring name = Widen(tag.getTagName());
+        if (name.empty() || name == Widen(DcmTag_ERROR_TagName)) name = numbers;    // not in the dictionary
+        if (name.size() < 32) name.resize(32, L' ');
+        const std::wstring vr = Widen(DcmVR(e->getVR()).getVRName());
+        if (e->ident() == EVR_SQ)
+        {
+            auto sq = static_cast<DcmSequenceOfItems*>(e);
+            std::wstring value = L"(" + std::to_wstring(sq->card()) + (sq->card() == 1 ? L" item)" : L" items)");
+            tags += indent + numbers + L" " + vr + L" " + value + L"\r\n";
+            names += indent + name + L" " + vr + L" " + value + L"\r\n";
+            for (unsigned long k = 0; k < sq->card(); k++)
+            {
+                std::wstring head = indent + L"  > item " + std::to_wstring(k + 1) + L"\r\n";
+                tags += head;
+                names += head;
+                Dump(sq->getItem(k), charset, depth + 2, tags, names);
+            }
+            continue;
+        }
+        const std::wstring value = ValueOf(e, charset);
+        tags += indent + numbers + L" " + vr + L" " + value + L"\r\n";
+        names += indent + name + L" " + vr + L" " + value + L"\r\n";
+    }
+}
+
+// JPEG 2000 (and High-Throughput JPEG 2000): DCMTK has no decoder for it, OpenJPEG decodes it
+static bool IsJpeg2000(E_TransferSyntax x)
+{
+    return x == EXS_JPEG2000LosslessOnly || x == EXS_JPEG2000 || x == EXS_JPEG2000MulticomponentLosslessOnly ||
+           x == EXS_JPEG2000Multicomponent || x == EXS_HighThroughputJPEG2000LosslessOnly ||
+           x == EXS_HighThroughputJPEG2000withRPCLOptionsLosslessOnly || x == EXS_HighThroughputJPEG2000;
+}
+
+// OpenJPEG reads the codestream from memory
+struct MemoryStream { const Uint8* data; size_t size, at; };
+static OPJ_SIZE_T MemRead(void* buffer, OPJ_SIZE_T n, void* user)
+{
+    auto m = static_cast<MemoryStream*>(user);
+    if (m->at >= m->size) return static_cast<OPJ_SIZE_T>(-1);
+    size_t k = n < m->size - m->at ? n : m->size - m->at;
+    memcpy(buffer, m->data + m->at, k);
+    m->at += k;
+    return k;
+}
+static OPJ_OFF_T MemSkip(OPJ_OFF_T n, void* user)
+{
+    auto m = static_cast<MemoryStream*>(user);
+    if (n < 0) return -1;
+    size_t k = static_cast<size_t>(n) < m->size - m->at ? static_cast<size_t>(n) : m->size - m->at;
+    m->at += k;
+    return static_cast<OPJ_OFF_T>(k);
+}
+static OPJ_BOOL MemSeek(OPJ_OFF_T n, void* user)
+{
+    auto m = static_cast<MemoryStream*>(user);
+    if (n < 0 || static_cast<size_t>(n) > m->size) return OPJ_FALSE;
+    m->at = static_cast<size_t>(n);
+    return OPJ_TRUE;
+}
+
+// The first frame of a JPEG 2000 dataset, decoded: a copy of the dataset with that frame as native
+// pixel data (Explicit VR Little Endian), which DicomImage renders as any other. Null if it cannot.
+static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe)
+{
+    DcmElement* element = nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return nullptr;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq) return nullptr;
+
+    // The fragments of the first frame (item 0 is the offset table): all of them for a single frame;
+    // for more, up to the next one that starts a codestream (SOC marker, or a JP2 signature box)
+    std::vector<Uint8> code;
+    for (unsigned long i = 1; i < seq->card(); i++)
+    {
+        DcmPixelItem* item = nullptr;
+        Uint8* bytes = nullptr;
+        if (seq->getItem(item, i).bad() || !item || item->getUint8Array(bytes).bad() || !bytes) break;
+        const Uint32 n = item->getLength();
+        bool starts = n >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0x4F) || (n >= 8 && bytes[4] == 'j' && bytes[5] == 'P'));
+        if (multiframe && !code.empty() && starts) break;
+        code.insert(code.end(), bytes, bytes + n);
+    }
+    if (code.size() < 8) return nullptr;
+    bool jp2 = !(code[0] == 0xFF && code[1] == 0x4F);
+
+    MemoryStream mem = { code.data(), code.size(), 0 };
+    opj_stream_t* stream = opj_stream_default_create(OPJ_TRUE);
+    if (!stream) return nullptr;
+    opj_stream_set_read_function(stream, MemRead);
+    opj_stream_set_skip_function(stream, MemSkip);
+    opj_stream_set_seek_function(stream, MemSeek);
+    opj_stream_set_user_data(stream, &mem, nullptr);
+    opj_stream_set_user_data_length(stream, code.size());
+    opj_codec_t* codec = opj_create_decompress(jp2 ? OPJ_CODEC_JP2 : OPJ_CODEC_J2K);
+    opj_image_t* image = nullptr;
+    opj_dparameters_t options;
+    opj_set_default_decoder_parameters(&options);
+    bool ok = codec && opj_setup_decoder(codec, &options) && opj_read_header(stream, codec, &image) &&
+              opj_decode(codec, stream, image) && opj_end_decompress(codec, stream);
+    opj_stream_destroy(stream);
+    if (codec) opj_destroy_codec(codec);
+
+    DcmDataset* out = nullptr;
+    if (ok && image && image->numcomps >= 1)
+    {
+        const OPJ_UINT32 samples = image->numcomps >= 3 ? 3 : 1;
+        const opj_image_comp_t* c = image->comps;
+        const OPJ_UINT32 w = c[0].w, h = c[0].h, prec = c[0].prec, sgnd = c[0].sgnd;
+        bool same = w > 0 && h > 0 && prec >= 1 && prec <= 16;
+        for (OPJ_UINT32 k = 0; k < samples && same; k++)
+            same = c[k].w == w && c[k].h == h && c[k].prec == prec && c[k].sgnd == sgnd && c[k].data;
+        if (same)
+        {
+            out = new DcmDataset(*ds);
+            out->findAndDeleteElement(DCM_PixelData);
+            const size_t n = static_cast<size_t>(w) * h;
+            const bool bytes = prec <= 8 && !sgnd;
+            if (bytes)
+            {
+                std::vector<Uint8> v(n * samples);
+                for (size_t i = 0; i < n; i++)
+                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint8>(c[k].data[i]);
+                out->putAndInsertUint8Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
+            }
+            else
+            {
+                std::vector<Uint16> v(n * samples);
+                for (size_t i = 0; i < n; i++)
+                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint16>(c[k].data[i]);
+                out->putAndInsertUint16Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
+            }
+            out->putAndInsertUint16(DCM_SamplesPerPixel, static_cast<Uint16>(samples));
+            out->putAndInsertUint16(DCM_Rows, static_cast<Uint16>(h));
+            out->putAndInsertUint16(DCM_Columns, static_cast<Uint16>(w));
+            out->putAndInsertUint16(DCM_BitsAllocated, bytes ? 8 : 16);
+            out->putAndInsertUint16(DCM_BitsStored, static_cast<Uint16>(prec));
+            out->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(prec - 1));
+            out->putAndInsertUint16(DCM_PixelRepresentation, sgnd ? 1 : 0);
+            out->findAndDeleteElement(DCM_NumberOfFrames);
+            if (samples == 3)
+            {
+                // OpenJPEG undoes the color transform of the codestream: RGB
+                out->putAndInsertString(DCM_PhotometricInterpretation, "RGB");
+                out->putAndInsertUint16(DCM_PlanarConfiguration, 0);
+            }
+            else
+            {
+                OFString photometric;
+                out->findAndGetOFString(DCM_PhotometricInterpretation, photometric);
+                if (photometric != "MONOCHROME1") out->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+                out->findAndDeleteElement(DCM_PlanarConfiguration);
+            }
+        }
+    }
+    if (image) opj_image_destroy(image);
+    return out;
+}
+
+static Rendered RenderDicom(const std::vector<char>& data, bool header = true)
+{
+    Rendered r;
+    InitDcmtk();
+    DcmInputBufferStream in;
+    in.setBuffer(data.data(), static_cast<offile_off_t>(data.size()));
+    in.setEos();
+    DcmFileFormat ff;
+    ff.transferInit();
+    OFCondition st = ff.read(in, EXS_Unknown, EGL_noChange, DCM_MaxReadLength);
+    ff.transferEnd();
+    if (st.bad())
+    {
+        // Deflated files: this DCMTK has no zlib (as the one of I3Dfileformat)
+        const char deflate[] = "1.2.840.10008.1.2.1.99";
+        bool deflated = std::search(data.begin(), data.begin() + (data.size() < 4096 ? data.size() : 4096),
+                                    deflate, deflate + sizeof(deflate) - 1) != data.begin() + (data.size() < 4096 ? data.size() : 4096);
+        r.summary = deflated ? L"Deflated DICOM: not shown by this preview" : L"Not readable as DICOM: " + Widen(st.text());
+        return r;
+    }
+    DcmDataset* ds = ff.getDataset();
+
+    OFString charset, sopClass, tsUid;
+    ds->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    ds->findAndGetOFString(DCM_SOPClassUID, sopClass);
+    const E_TransferSyntax xfer = ds->getOriginalXfer();
+    tsUid = DcmXfer(xfer).getXferID();
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+
+    OFString studyUid, seriesNumber;
+    ds->findAndGetOFString(DCM_StudyInstanceUID, studyUid);
+    ds->findAndGetOFString(DCM_SeriesNumber, seriesNumber);
+    r.studyUid = studyUid.c_str();
+    r.seriesNumber = seriesNumber.c_str();
+
+    if (header)
+    {
+        const std::wstring meta = L"# File meta information\r\n", dataset = L"\r\n# Dataset\r\n";
+        r.tags = meta;
+        r.names = meta;
+        Dump(ff.getMetaInfo(), std::string(), 0, r.tags, r.names);
+        r.tags += dataset;
+        r.names += dataset;
+        Dump(ds, charset.c_str(), 0, r.tags, r.names);
+    }
+
+    r.summary = sopClass.empty() ? L"DICOM" : ObjectType(sopClass.c_str());
+    if (ds->tagExists(DCM_PixelData))
+    {
+        // Only the first frame is decoded: a multi-frame file can be large. JPEG 2000 by OpenJPEG first.
+        std::unique_ptr<DcmDataset> decoded;
+        if (IsJpeg2000(xfer)) decoded.reset(DecodeJpeg2000(ds, frames > 1));
+        DicomImage image(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer,
+                         CIF_UsePartialAccessToPixelData, 0, 1);
+        if (image.getStatus() == EIS_Normal)
+        {
+            if (image.isMonochrome())
+            {
+                if (image.getWindowCount() > 0) image.setWindow(0);
+                else image.setMinMaxWindow();
+            }
+            r.width = static_cast<int>(image.getWidth());
+            r.height = static_cast<int>(image.getHeight());
+            const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
+            if (out && r.width > 0 && r.height > 0)
+            {
+                const size_t n = static_cast<size_t>(r.width) * r.height;
+                r.pixels.resize(n);
+                bool mono = image.isMonochrome() != 0;
+                for (size_t i = 0; i < n; i++)
+                {
+                    DWORD red = mono ? out[i] : out[3 * i], green = mono ? out[i] : out[3 * i + 1], blue = mono ? out[i] : out[3 * i + 2];
+                    r.pixels[i] = (red << 16) | (green << 8) | blue;
+                }
+            }
+            r.summary += L"  -  " + std::to_wstring(r.width) + L" x " + std::to_wstring(r.height);
+            if (frames > 1) r.summary += L"  -  frame 1 of " + std::to_wstring(frames);
+        }
+        else
+        {
+            // Compressed with something there is no decoder for here (JPEG 2000, HTJ2K, MPEG, HEVC...)
+            DcmXfer x(xfer);
+            bool decodable = !x.isEncapsulated() || xfer == EXS_RLELossless || xfer == EXS_JPEGLSLossless ||
+                             xfer == EXS_JPEGLSLossy || x.getJPEGProcess8Bit() != 0;
+            if (IsJpeg2000(xfer) && !decoded) r.summary += L"  -  image not shown: its JPEG 2000 data could not be decoded";
+            else r.summary += decodable || decoded ? L"  -  image not shown: " + Widen(DicomImage::getString(image.getStatus()))
+                                                   : L"  -  image not shown: " + Compression(tsUid.c_str()) + L" is not supported";
+        }
+    }
+    else r.summary += L"  -  no image";
+    r.summary += L"  -  compression: " + Compression(tsUid.c_str());
+    return r;
+}
+
+// The whole file in memory, up to 1 GB
+static HRESULT ReadAll(IStream* stream, std::vector<char>& data)
+{
+    STATSTG stat = {};
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) stat.cbSize.QuadPart = 0;
+    if (stat.cbSize.QuadPart > (1ULL << 30)) return E_OUTOFMEMORY;
+    LARGE_INTEGER zero = {};
+    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    data.resize(static_cast<size_t>(stat.cbSize.QuadPart));
+    size_t got = 0;
+    while (true)
+    {
+        if (got == data.size()) data.resize(got + 1024 * 1024);
+        ULONG n = 0;
+        HRESULT hr = stream->Read(data.data() + got, static_cast<ULONG>(data.size() - got), &n);
+        if (FAILED(hr)) return hr;
+        got += n;
+        if (n == 0 || hr == S_FALSE) break;
+    }
+    data.resize(got);
+    return S_OK;
+}
+
+class PreviewHandler : public IInitializeWithStream, public IPreviewHandler, public IPreviewHandlerVisuals,
+                       public IOleWindow, public IObjectWithSite
+{
+public:
+    PreviewHandler() { InterlockedIncrement(&g_locks); }
+    virtual ~PreviewHandler()
+    {
+        Unload();
+        if (site) site->Release();
+        InterlockedDecrement(&g_locks);
+    }
+
+    // IUnknown
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == IID_IPreviewHandler) *ppv = static_cast<IPreviewHandler*>(this);
+        else if (riid == IID_IInitializeWithStream) *ppv = static_cast<IInitializeWithStream*>(this);
+        else if (riid == IID_IPreviewHandlerVisuals) *ppv = static_cast<IPreviewHandlerVisuals*>(this);
+        else if (riid == IID_IOleWindow) *ppv = static_cast<IOleWindow*>(this);
+        else if (riid == IID_IObjectWithSite) *ppv = static_cast<IObjectWithSite*>(this);
+        else return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refs); }
+    IFACEMETHODIMP_(ULONG) Release() override
+    {
+        LONG r = InterlockedDecrement(&refs);
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // IInitializeWithStream
+    IFACEMETHODIMP Initialize(IStream* s, DWORD) override
+    {
+        if (!s) return E_INVALIDARG;
+        if (stream) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        stream = s;
+        stream->AddRef();
+        return S_OK;
+    }
+
+    // IPreviewHandler
+    IFACEMETHODIMP SetWindow(HWND hwnd, const RECT* rc) override
+    {
+        if (!hwnd || !rc) return E_INVALIDARG;
+        parent = hwnd;
+        bounds = *rc;
+        if (wnd)
+        {
+            ::SetParent(wnd, parent);
+            Place();
+        }
+        return S_OK;
+    }
+    IFACEMETHODIMP SetRect(const RECT* rc) override
+    {
+        if (!rc) return E_INVALIDARG;
+        bounds = *rc;
+        if (wnd) Place();
+        return S_OK;
+    }
+    IFACEMETHODIMP DoPreview() override
+    {
+        if (wnd) return S_OK;
+        if (!stream || !parent) return E_UNEXPECTED;
+        try
+        {
+            std::vector<char> data;
+            HRESULT hr = ReadAll(stream, data);
+            if (FAILED(hr)) return hr;
+            view = RenderDicom(data);
+        }
+        catch (...) { view = Rendered(); view.summary = L"This file cannot be shown"; }
+        return CreateWindows();
+    }
+    IFACEMETHODIMP Unload() override
+    {
+        if (wnd) { DestroyWindow(wnd); wnd = nullptr; edit = nullptr; }
+        if (font) { DeleteObject(font); font = nullptr; }
+        if (linkFont) { DeleteObject(linkFont); linkFont = nullptr; }
+        if (background) { DeleteObject(background); background = nullptr; }
+        if (stream) { stream->Release(); stream = nullptr; }
+        view = Rendered();
+        return S_OK;
+    }
+    IFACEMETHODIMP SetFocus() override
+    {
+        if (!edit) return S_FALSE;
+        ::SetFocus(edit);
+        return S_OK;
+    }
+    IFACEMETHODIMP QueryFocus(HWND* focus) override
+    {
+        if (!focus) return E_INVALIDARG;
+        *focus = GetFocus();
+        return *focus ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    }
+    IFACEMETHODIMP TranslateAccelerator(MSG* msg) override
+    {
+        if (!msg) return E_INVALIDARG;
+        // In the header: Ctrl+A selects it all, Ctrl+C (or Ctrl+Insert) copies the selection, Ctrl+T
+        // switches between tags and names. Explorer would take Ctrl+C to copy the file.
+        if (msg->message == WM_KEYDOWN && edit && GetFocus() == edit && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            switch (msg->wParam)
+            {
+            case 'A': SendMessageW(edit, EM_SETSEL, 0, -1); return S_OK;
+            case 'C': case VK_INSERT: SendMessageW(edit, WM_COPY, 0, 0); return S_OK;
+            case 'T': Switch(); return S_OK;
+            }
+        }
+        // Keys this window does not use go back to Explorer (the frame)
+        IPreviewHandlerFrame* frame = nullptr;
+        HRESULT hr = S_FALSE;
+        if (site && SUCCEEDED(site->QueryInterface(IID_PPV_ARGS(&frame))))
+        {
+            hr = frame->TranslateAccelerator(msg);
+            frame->Release();
+        }
+        return hr;
+    }
+
+    // IPreviewHandlerVisuals: the colors of Explorer's theme (dark mode included)
+    IFACEMETHODIMP SetBackgroundColor(COLORREF color) override
+    {
+        backColor = color;
+        if (background) { DeleteObject(background); background = nullptr; }
+        if (wnd) InvalidateRect(wnd, nullptr, TRUE);
+        if (edit) InvalidateRect(edit, nullptr, TRUE);
+        return S_OK;
+    }
+    IFACEMETHODIMP SetFont(const LOGFONTW*) override { return S_OK; }
+    IFACEMETHODIMP SetTextColor(COLORREF color) override
+    {
+        textColor = color;
+        if (wnd) InvalidateRect(wnd, nullptr, TRUE);
+        if (edit) InvalidateRect(edit, nullptr, TRUE);
+        return S_OK;
+    }
+
+    // IOleWindow
+    IFACEMETHODIMP GetWindow(HWND* hwnd) override
+    {
+        if (!hwnd) return E_INVALIDARG;
+        *hwnd = parent;
+        return S_OK;
+    }
+    IFACEMETHODIMP ContextSensitiveHelp(BOOL) override { return E_NOTIMPL; }
+
+    // IObjectWithSite
+    IFACEMETHODIMP SetSite(IUnknown* s) override
+    {
+        if (site) site->Release();
+        site = s;
+        if (site) site->AddRef();
+        return S_OK;
+    }
+    IFACEMETHODIMP GetSite(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        return site ? site->QueryInterface(riid, ppv) : E_FAIL;
+    }
+
+private:
+    LONG refs = 1;
+    IStream* stream = nullptr;
+    IUnknown* site = nullptr;
+    HWND parent = nullptr, wnd = nullptr, edit = nullptr;
+    RECT bounds = {};
+    RECT imageArea = {}, summaryArea = {}, switchArea = {};
+    Rendered view;
+    HFONT font = nullptr, linkFont = nullptr;
+    HBRUSH background = nullptr;
+    COLORREF backColor = GetSysColor(COLOR_WINDOW), textColor = GetSysColor(COLOR_WINDOWTEXT);
+
+    HBRUSH Background()
+    {
+        if (!background) background = CreateSolidBrush(backColor);
+        return background;
+    }
+
+    HRESULT CreateWindows()
+    {
+        static ATOM cls = 0;
+        if (!cls)
+        {
+            WNDCLASSEXW wc = { sizeof(wc) };
+            wc.lpfnWndProc = WndProc;
+            wc.hInstance = g_module;
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            wc.lpszClassName = L"DicomStudyCountPreview";
+            cls = RegisterClassExW(&wc);
+            if (!cls && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
+        }
+        // Its (invisible) title is the summary line: for screen readers and tests
+        wnd = CreateWindowExW(0, L"DicomStudyCountPreview", view.summary.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                              bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                              parent, nullptr, g_module, this);
+        if (!wnd) return HRESULT_FROM_WIN32(GetLastError());
+        edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                               ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
+                               0, 0, 10, 10, wnd, nullptr, g_module, nullptr);
+        UINT dpi = GetDpiForWindow(wnd);
+        font = CreateFontW(-MulDiv(9, dpi ? dpi : 96, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        linkFont = CreateFontW(-MulDiv(9, dpi ? dpi : 96, 72), 0, 0, 0, FW_NORMAL, FALSE, TRUE, FALSE, DEFAULT_CHARSET,
+                               OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        if (edit)
+        {
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+            SendMessageW(edit, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
+            SetWindowTextW(edit, (ShowNames() ? view.names : view.tags).c_str());
+        }
+        Place();
+        return S_OK;
+    }
+
+    // Tags or names: the last choice, for every preview (HKCU\Software\DicomStudyCount\Preview)
+    static bool ShowNames()
+    {
+        DWORD value = 0, size = sizeof(value);
+        return RegGetValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview", L"HeaderNames",
+                            RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS && value != 0;
+    }
+
+    void Switch()
+    {
+        if (!edit || (view.tags.empty() && view.names.empty())) return;
+        DWORD names = ShowNames() ? 0 : 1;
+        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview", L"HeaderNames", REG_DWORD,
+                        &names, sizeof(names));
+        // Both have the same lines: the same ones stay in sight
+        LRESULT first = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        SetWindowTextW(edit, (names ? view.names : view.tags).c_str());
+        SendMessageW(edit, EM_LINESCROLL, 0, first);
+        InvalidateRect(wnd, &switchArea, TRUE);
+    }
+
+    const wchar_t* SwitchLabel() const { return ShowNames() ? L"Show tags (Ctrl+T)" : L"Show names (Ctrl+T)"; }
+
+    void Place()
+    {
+        SetWindowPos(wnd, nullptr, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        Layout();
+    }
+
+    // The image on top (up to 60 % of the height, never stretched beyond its aspect), the summary
+    // line under it, the header below
+    void Layout()
+    {
+        RECT c;
+        GetClientRect(wnd, &c);
+        const int w = c.right, h = c.bottom, line = MulDiv(22, GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96, 96);
+        int imageHeight = 0;
+        if (view.width > 0 && view.height > 0)
+        {
+            imageHeight = h * 6 / 10;
+            int fit = static_cast<int>(static_cast<long long>(w) * view.height / view.width);
+            if (fit < imageHeight) imageHeight = fit;
+        }
+        imageArea = { 0, 0, w, imageHeight };
+        summaryArea = { 4, imageHeight, w - 4, imageHeight + line };
+        if (edit) MoveWindow(edit, 0, imageHeight + line, w, h - imageHeight - line > 0 ? h - imageHeight - line : 0, TRUE);
+        InvalidateRect(wnd, nullptr, TRUE);
+    }
+
+    void Paint(HDC dc)
+    {
+        RECT c;
+        GetClientRect(wnd, &c);
+        FillRect(dc, &c, Background());
+        if (!view.pixels.empty())
+        {
+            // Fitted into the image area, keeping the aspect ratio, centered
+            int aw = imageArea.right - imageArea.left, ah = imageArea.bottom - imageArea.top;
+            int dw = aw, dh = static_cast<int>(static_cast<long long>(aw) * view.height / view.width);
+            if (dh > ah) { dh = ah; dw = static_cast<int>(static_cast<long long>(ah) * view.width / view.height); }
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth = view.width;
+            bi.bmiHeader.biHeight = -view.height;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            StretchDIBits(dc, (aw - dw) / 2, (ah - dh) / 2, dw, dh, 0, 0, view.width, view.height,
+                          view.pixels.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        }
+        HGDIOBJ old = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+        SetBkMode(dc, TRANSPARENT);
+        ::SetTextColor(dc, textColor);
+        RECT text = summaryArea;
+        switchArea = {};
+        if (!view.tags.empty())
+        {
+            // At the right of the summary, underlined: the switch between tags and names
+            SelectObject(dc, linkFont ? linkFont : font);
+            const wchar_t* label = SwitchLabel();
+            SIZE ext = {};
+            GetTextExtentPoint32W(dc, label, static_cast<int>(wcslen(label)), &ext);
+            switchArea = { summaryArea.right - ext.cx, summaryArea.top, summaryArea.right, summaryArea.bottom };
+            if (switchArea.left > summaryArea.left + ext.cx)
+            {
+                DrawTextW(dc, label, -1, &switchArea, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                text.right = switchArea.left - 12;
+            }
+            else switchArea = {};
+            SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+        }
+        DrawTextW(dc, view.summary.c_str(), -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, old);
+    }
+
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+    {
+        auto self = reinterpret_cast<PreviewHandler*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        switch (msg)
+        {
+        case WM_NCCREATE:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                              reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+            break;
+        case WM_SIZE:
+            if (self && self->wnd) self->Layout();
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_SETCURSOR:
+            if (self && LOWORD(lp) == HTCLIENT)
+            {
+                POINT pt;
+                GetCursorPos(&pt);
+                ScreenToClient(hwnd, &pt);
+                if (PtInRect(&self->switchArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (self)
+            {
+                POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                if (PtInRect(&self->switchArea, pt)) self->Switch();
+            }
+            return 0;
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (self) self->Paint(dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_CTLCOLORSTATIC:                         // the header (a read-only edit control)
+        case WM_CTLCOLOREDIT:
+            if (self)
+            {
+                SetBkColor(reinterpret_cast<HDC>(wp), self->backColor);
+                ::SetTextColor(reinterpret_cast<HDC>(wp), self->textColor);
+                return reinterpret_cast<LRESULT>(self->Background());
+            }
+            break;
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+};
+
+// Thumbnails (Explorer's medium icons and larger): the first frame, with the series icon as a badge in
+// its lower right corner. DICOM without an image (reports, DICOMDIR...) fails, and keeps its icon.
+class ThumbnailProvider : public IInitializeWithStream, public IThumbnailProvider
+{
+public:
+    ThumbnailProvider() { InterlockedIncrement(&g_locks); }
+    virtual ~ThumbnailProvider()
+    {
+        if (stream) stream->Release();
+        InterlockedDecrement(&g_locks);
+    }
+
+    // IUnknown
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (riid == IID_IUnknown || riid == IID_IThumbnailProvider) *ppv = static_cast<IThumbnailProvider*>(this);
+        else if (riid == IID_IInitializeWithStream) *ppv = static_cast<IInitializeWithStream*>(this);
+        else return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refs); }
+    IFACEMETHODIMP_(ULONG) Release() override
+    {
+        LONG r = InterlockedDecrement(&refs);
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // IInitializeWithStream
+    IFACEMETHODIMP Initialize(IStream* s, DWORD) override
+    {
+        if (!s) return E_INVALIDARG;
+        if (stream) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        stream = s;
+        stream->AddRef();
+        return S_OK;
+    }
+
+    // IThumbnailProvider: at most cx x cx, keeping the aspect ratio
+    IFACEMETHODIMP GetThumbnail(UINT cx, HBITMAP* bitmap, WTS_ALPHATYPE* alpha) override
+    {
+        if (!bitmap || !alpha) return E_POINTER;
+        *bitmap = nullptr;
+        if (!stream || cx == 0) return E_UNEXPECTED;
+        try
+        {
+            std::vector<char> data;
+            HRESULT hr = ReadAll(stream, data);
+            if (FAILED(hr)) return hr;
+            Rendered r = RenderDicom(data, false);
+            if (r.pixels.empty()) return E_FAIL;
+            int w = static_cast<int>(cx), h = static_cast<int>(cx);
+            if (r.width >= r.height) h = static_cast<int>(static_cast<long long>(cx) * r.height / r.width);
+            else w = static_cast<int>(static_cast<long long>(cx) * r.width / r.height);
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth = w;
+            bi.bmiHeader.biHeight = -h;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            HDC dc = CreateCompatibleDC(nullptr);
+            if (!dc) return E_FAIL;
+            HBITMAP dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!dib) { DeleteDC(dc); return E_OUTOFMEMORY; }
+            HGDIOBJ old = SelectObject(dc, dib);
+
+            BITMAPINFO src = bi;
+            src.bmiHeader.biWidth = r.width;
+            src.bmiHeader.biHeight = -r.height;
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            StretchDIBits(dc, 0, 0, w, h, 0, 0, r.width, r.height, r.pixels.data(), &src, DIB_RGB_COLORS, SRCCOPY);
+
+            // The badge: a quarter of the thumbnail size, up to half the shorter side (narrow images),
+            // from 16 px; none on tiny thumbnails
+            int badge = static_cast<int>(cx) / 4;
+            if (badge > (w < h ? w : h) / 2) badge = (w < h ? w : h) / 2;
+            if (badge >= 16)
+            {
+                int color = r.studyUid.empty() ? NoStudyColor : ColorIndex(r.studyUid);
+                std::wstring label;
+                for (char c : r.seriesNumber) if (label.size() < 6 && c != ' ') label += static_cast<wchar_t>(static_cast<unsigned char>(c));
+                if (label.empty()) label = L"?";
+                DrawBadge(dc, w - badge, h - badge, badge, color, label);
+            }
+            GdiFlush();
+            auto px = static_cast<DWORD*>(bits);
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) px[i] |= 0xFF000000;
+            SelectObject(dc, old);
+            DeleteDC(dc);
+            *bitmap = dib;
+            *alpha = WTSAT_RGB;
+            return S_OK;
+        }
+        catch (...) { return E_FAIL; }
+    }
+
+private:
+    LONG refs = 1;
+    IStream* stream = nullptr;
+};
+
+// One factory per class: the icons, the properties, the preview and the thumbnails
 template <class T>
 class ClassFactory : public IClassFactory
 {
@@ -1396,6 +2255,8 @@ public:
 
 static ClassFactory<IconHandler> g_iconFactory;
 static ClassFactory<PropertyHandler> g_propertyFactory;
+static ClassFactory<PreviewHandler> g_previewFactory;
+static ClassFactory<ThumbnailProvider> g_thumbnailFactory;
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv)
 {
@@ -1403,6 +2264,8 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv)
     *ppv = nullptr;
     if (clsid == CLSID_DicomIcons) return g_iconFactory.QueryInterface(riid, ppv);
     if (clsid == CLSID_DicomProperties) return g_propertyFactory.QueryInterface(riid, ppv);
+    if (clsid == CLSID_DicomPreview) return g_previewFactory.QueryInterface(riid, ppv);
+    if (clsid == CLSID_DicomThumbnails) return g_thumbnailFactory.QueryInterface(riid, ppv);
     return CLASS_E_CLASSNOTAVAILABLE;
 }
 
@@ -1413,6 +2276,6 @@ STDAPI DllCanUnloadNow()
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(module);
+    if (reason == DLL_PROCESS_ATTACH) { g_module = module; DisableThreadLibraryCalls(module); }
     return TRUE;
 }

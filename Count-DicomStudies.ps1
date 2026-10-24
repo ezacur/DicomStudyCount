@@ -56,6 +56,15 @@ param(
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$ToggleColumns,
 
+    # Removes the "downloaded from the Internet" mark from the DICOM files of the folder and its
+    # subfolders, so that Windows shows them in the preview pane (their contents are not touched)
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch]$Unblock,
+
+    # -Path is a DICOM file: opens the folders of its copies found by the counts, with them selected
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch]$ShowDuplicates,
+
     # Opens a window with the folder tree and the comment of every folder (reads desktop.ini only)
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$ShowTree,
@@ -88,7 +97,8 @@ $menuEntries = @(
     @{ Name = '1Count'; Label = 'Count studies'; Args = '-WriteComments' },
     @{ Name = '2Tree'; Label = 'Show tree'; Args = '-ShowTree' },
     @{ Name = '3Clean'; Label = 'Clean'; Args = '-Clean' },
-    @{ Name = '4Columns'; Label = 'Show/hide DICOM columns'; Args = '-ToggleColumns' }
+    @{ Name = '4Columns'; Label = 'Show/hide DICOM columns'; Args = '-ToggleColumns' },
+    @{ Name = '5Unblock'; Label = 'Unblock (allow preview)'; Args = '-Unblock' }
 )
 # The DICOM columns of the files (bin\DicomStudyCount.propdesc), in the order they are shown
 $dicomColumns = 'StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber', 'SeriesDescription',
@@ -160,14 +170,16 @@ if ($Install) {
     }
     # Icons of the DICOM files (bin\DicomShell.dll, registered for the user)
     $shellDll = Join-Path $PSScriptRoot 'bin\DicomShell.dll'
-    & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Dll $shellDll
+    & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Dll $shellDll -Script $PSCommandPath
     # The columns of the DICOM files: Windows takes property handlers from HKLM only. No UAC prompt
     # when the DLL and the column schema installed are already these ones.
     $sha = [Security.Cryptography.SHA256]::Create()
     $dllHash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($shellDll))[0..7] | ForEach-Object { $_.ToString('x2') })
     $server = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{21329A2B-09B3-4250-9103-9267877321EB}\InprocServer32')
     $installedSchema = Join-Path $env:ProgramFiles 'DicomStudyCount\DicomStudyCount.propdesc'
+    $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
     $upToDate = $server -and [IO.Path]::GetFileName([string]$server.GetValue('')) -eq "DicomShell-$dllHash.dll" -and
+        @('.', '.dcm', '.ima', '.dicom' | Where-Object { -not [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$handlers\$_") }).Count -eq 0 -and
         (Test-Path -LiteralPath $installedSchema) -and
         ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'bin\DicomStudyCount.propdesc')).Hash)
     if ($upToDate) { Write-Host 'DICOM columns already installed and up to date' }
@@ -792,7 +804,8 @@ function Show-DicomTree([string]$root) {
     # Single-study folders have comments starting with their study tag, "[CT-xxxxx] dd/MMM/yyyy ...";
     # the tag identifies the study in the tree (colors, "Expand to studies")
     function Get-StudyUid([string]$comment) {
-        if ($comment -cmatch '^\[([A-Z0-9]+-[0-9A-Za-z]{5})\] ') { return $Matches[1] }
+        # 6 characters; 5 in the comments written by earlier versions, until counted again
+        if ($comment -cmatch '^\[([A-Z0-9]+-[0-9A-Za-z]{5,6})\] ') { return $Matches[1] }
         $null
     }
 
@@ -1143,6 +1156,20 @@ try {
     if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
     # Long form: the same folder through an 8.3 short name ("ERNEST~1") must be the same location
     $root = [DicomStudyCount.Paths]::Long((Resolve-Path -LiteralPath $Path).ProviderPath)
+
+    if ($ShowDuplicates) {
+        $copies = [DicomStudyCount.Duplicates]::Of($copiesDir, $root) | ForEach-Object { $_ -replace ' \(differs\)$', '' }
+        $shown = if ($copies) { [DicomStudyCount.Duplicates]::Show([string[]]$copies) } else { 0 }
+        if (-not $shown) {
+            # Run from the context menu without a console: the answer goes in a message box
+            Add-Type -AssemblyName System.Windows.Forms
+            $message = if ($copies) { "The copies found by the last count no longer exist:`n`n" + ($copies -join "`n") }
+                       else { "No copies of this file were found by the counts.`n`nCount the folders that may hold copies (DICOM > Count) and try again." }
+            [void][Windows.Forms.MessageBox]::Show($message + "`n`n$root", 'DICOM duplicates', 'OK', 'Information')
+        }
+        return
+    }
+
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "Not a folder: $root" }
 
     if ($ShowTree) {
@@ -1152,6 +1179,14 @@ try {
 
     if ($ToggleColumns) {
         Switch-DicomColumns $root
+        return
+    }
+
+    if ($Unblock) {
+        $r = [DicomStudyCount.Unblocker]::Run($root, [Environment]::ProcessorCount)
+        Write-Host ("Unblocked {0:N0} DICOM files in {1}" -f $r[0], $root)
+        if ($r[1]) { Write-Host ("Left marked: {0:N0} files that are not DICOM" -f $r[1]) }
+        if ($r[2]) { Write-Host ("Could not unblock {0:N0} files" -f $r[2]) -ForegroundColor Yellow }
         return
     }
 
