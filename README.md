@@ -80,9 +80,23 @@ tree** opens the whole folder tree with one color per study.
   folder. The image is the first frame, with the window of its header. Dragging over it changes the
   window: right widens it (less contrast), up makes it brighter. Dragging with the right button zooms
   around where it started (up: in, down: out); dragging with the middle button, or Shift and the left
-  one, moves the zoomed image. (The wheel zooms too, when Explorer lets it reach the preview: it
-  usually keeps it for its list of files.) A double click goes back to the
-  header's window, fitted. The bar between the tabs and the image moves (remembered for every preview).
+  one, moves the zoomed image. A double click goes back to the header's window, fitted. The bar
+  between the tabs and the image moves (remembered for every preview).
+
+  Under the image, a bar steps through the frames of a multi-frame file, or else through the slices of
+  its series (the files of the folder with its SeriesInstanceUID, in the order of their Z level, then
+  of their InstanceNumber): its slider, and a button for the cine (the frames at the pace of the file,
+  the slices at 10 a second). After a click on the image, the keys do the same: Left / Right the
+  frames (or the slices), Up / Down and Page Up / Page Down the slices, Home / End, and Space for the
+  cine (also the wheel, when Explorer lets it reach the preview: it usually keeps it for its list of
+  files). The window dragged stays from slice to slice; the header and the values of the columns
+  follow the slice shown when the stepping stops. The series is read in the background, once per
+  folder while it does not change.
+
+  The *Overlay* check box of that bar (remembered) writes on the image what viewers show in its
+  corners, never who the patient is: modality, series, description and image number; date and time,
+  device and protocol; Z level, slice thickness, pixel spacing and size; the window and zoom; and the
+  patient directions at the sides (R/L, A/P, H/F, from ImageOrientationPatient).
   Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
   JPEG 2000 pixel data (not deflated files). It uses DCMTK and OpenJPEG, inside the same DLL.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
@@ -235,7 +249,7 @@ menu, so the menu cannot tell a counted folder from one that is not.
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
-| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
 | Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (when they had none) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 

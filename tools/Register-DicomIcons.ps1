@@ -69,6 +69,8 @@ function Set-FileType([string]$key, [bool]$icon, [bool]$rest) {
         # "%1": the icon of each file comes from its icon handler
         $hkcu.CreateSubKey("$key\DefaultIcon").SetValue('', '%1')
         $hkcu.CreateSubKey("$key\ShellEx\IconHandler").SetValue('', $clsid)
+        # No icon of the program over the thumbnails (the console of the verb, on the series badge)
+        $hkcu.CreateSubKey($key).SetValue('TypeOverlay', '')
     }
     if (-not $rest) { return }
     $hkcu.CreateSubKey("$key\$previewShellEx").SetValue('', $previewClsid)

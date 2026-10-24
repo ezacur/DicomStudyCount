@@ -1425,29 +1425,34 @@ static void InitDcmtk()
     });
 }
 
-// The decoded image of the preview, kept to change its window (brightness / contrast) while the mouse
-// drags over it. Monochrome: the window of DCMTK, on the values of the pixels. Color: the same on
-// the rendered RGB (0..255), from center 127.5 and width 255 (the image as it is).
+// The decoded file of the preview, kept to change its frame, and its window (brightness / contrast)
+// while the mouse drags over it. Monochrome: the window of DCMTK, on the values of the pixels. Color:
+// the same on the rendered RGB (0..255), from center 127.5 and width 255 (the image as it is).
 struct Imaging
 {
     std::unique_ptr<DcmFileFormat> file;
     std::unique_ptr<DcmDataset> decoded;           // JPEG 2000, decoded by OpenJPEG
     std::unique_ptr<DicomImage> image;             // destroyed first: it reads the two above
+    E_TransferSyntax xfer = EXS_Unknown;
     bool mono = false;
     std::vector<DWORD> color;
     double center = 127.5, width = 255, center0 = 127.5, width0 = 255, low = 0, high = 255;
 };
 
-// What the preview shows: the first frame as 32-bit BGR rows (top-down), a summary line and the
-// header twice, one line per element: with the tags "(gggg,eeee)" and with their dictionary names.
-// The thumbnail: the frame, and the study and series for its badge.
+// What the preview shows: one frame as 32-bit BGR rows (top-down), a summary line, the header twice
+// (one line per element: with the tags "(gggg,eeee)" and with their dictionary names) and the text of
+// the overlay. The thumbnail: the first frame, and the study and series for its badge.
 struct Rendered
 {
     int width = 0, height = 0;
     std::vector<DWORD> pixels;
     std::wstring summary, tags, names;
     std::string studyUid, seriesNumber;
-    std::shared_ptr<Imaging> imaging;              // only in the preview
+    int frames = 1, frame = 0;
+    double frameTime = 0;                          // ms from frame to frame (the cine), 0 if not known
+    std::wstring corners[3];                       // the overlay: top left, top right, bottom left (lines)
+    std::wstring sides[4];                         // the patient directions at the left, top, right, bottom
+    std::shared_ptr<Imaging> imaging;              // only in the preview (the file, even without image)
 };
 
 // The pixels of the frame with the current window of its imaging
@@ -1534,6 +1539,121 @@ static void Dump(DcmItem* item, const std::string& charset, int depth, std::wstr
     }
 }
 
+// The header twice: with the tags and with the dictionary names
+static void DumpHeader(DcmFileFormat& ff, std::wstring& tags, std::wstring& names)
+{
+    OFString charset;
+    ff.getDataset()->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    const std::wstring meta = L"# File meta information\r\n", dataset = L"\r\n# Dataset\r\n";
+    tags = meta;
+    names = meta;
+    Dump(ff.getMetaInfo(), std::string(), 0, tags, names);
+    tags += dataset;
+    names += dataset;
+    Dump(ff.getDataset(), charset.c_str(), 0, tags, names);
+}
+
+// "20230405" and "101233.5" as "2023-04-05 10:12:33"
+static std::wstring DateTimeText(const std::string& date, const std::string& time)
+{
+    std::string s;
+    if (date.size() >= 8) s = date.substr(0, 4) + "-" + date.substr(4, 2) + "-" + date.substr(6, 2);
+    if (time.size() >= 4)
+    {
+        if (!s.empty()) s += " ";
+        s += time.substr(0, 2) + ":" + time.substr(2, 2);
+        if (time.size() >= 6 && time[4] >= '0' && time[4] <= '9') s += ":" + time.substr(4, 2);
+    }
+    return Widen(s);
+}
+
+// The patient directions (DICOM: x to the left, y to the back, z to the head) of a direction of the
+// image: its main components, the largest first
+static std::wstring Direction(double x, double y, double z)
+{
+    struct Axis { double v; wchar_t plus, minus; } axes[3] = { { x, L'L', L'R' }, { y, L'P', L'A' }, { z, L'H', L'F' } };
+    std::sort(std::begin(axes), std::end(axes), [](const Axis& a, const Axis& b) { return std::fabs(a.v) > std::fabs(b.v); });
+    std::wstring s;
+    for (const Axis& a : axes) if (std::fabs(a.v) >= 0.25) s += a.v > 0 ? a.plus : a.minus;
+    return s;
+}
+
+// The overlay: what viewers write in the corners of the image, never who the patient is. The series
+// and the image at the top left, when and with what at the top right, where the slice is and its size
+// at the bottom left. The window and the zoom (bottom right) change, so the preview writes them.
+static void Annotate(Rendered& r, DcmDataset* ds)
+{
+    OFString cs;
+    ds->findAndGetOFString(DCM_SpecificCharacterSet, cs);
+    const std::string charset = cs.c_str();
+    auto get = [&](const DcmTagKey& key, bool deep = false) {
+        OFString v;
+        ds->findAndGetOFStringArray(key, v, deep);       // deep: in the functional groups of enhanced files
+        return std::string(v.c_str(), v.length());
+    };
+    auto add = [](std::wstring& corner, const std::wstring& line) {
+        if (!line.empty()) corner += (corner.empty() ? L"" : L"\n") + line;
+    };
+    wchar_t buffer[128];
+
+    std::wstring series = Widen(get(DCM_Modality));
+    const std::string number = get(DCM_SeriesNumber);
+    if (!number.empty()) series += (series.empty() ? L"Series " : L"  Series ") + Widen(number);
+    add(r.corners[0], series);
+    add(r.corners[0], Widen(get(DCM_SeriesDescription), charset));
+    const std::string instance = get(DCM_InstanceNumber);
+    if (!instance.empty()) add(r.corners[0], L"Image " + Widen(instance));
+
+    const std::string at = get(DCM_AcquisitionDateTime);
+    std::wstring when = at.size() >= 8 ? DateTimeText(at.substr(0, 8), at.substr(8)) : std::wstring();
+    if (when.empty()) when = DateTimeText(get(DCM_AcquisitionDate), get(DCM_AcquisitionTime));
+    if (when.empty()) when = DateTimeText(get(DCM_ContentDate), get(DCM_ContentTime));
+    if (when.empty()) when = DateTimeText(get(DCM_SeriesDate), get(DCM_SeriesTime));
+    if (when.empty()) when = DateTimeText(get(DCM_StudyDate), get(DCM_StudyTime));
+    add(r.corners[1], when);
+    std::wstring device = Widen(get(DCM_Manufacturer), charset);
+    const std::wstring model = Widen(get(DCM_ManufacturerModelName), charset);
+    if (!model.empty()) device += (device.empty() ? L"" : L" ") + model;
+    add(r.corners[1], device);
+    add(r.corners[1], Widen(get(DCM_ProtocolName), charset));
+
+    Header h;
+    h.imagePosition = get(DCM_ImagePositionPatient, true);
+    h.imageOrientation = get(DCM_ImageOrientationPatient, true);
+    double z = 0, thickness = 0, spacing[2] = {};
+    if (ZLevel(h, z) || Numbers(get(DCM_SliceLocation), &z, 1))
+    {
+        swprintf_s(buffer, L"Z %.1f mm", z);
+        add(r.corners[2], buffer);
+    }
+    if (Numbers(get(DCM_SliceThickness, true), &thickness, 1))
+    {
+        swprintf_s(buffer, L"Thickness %.3g mm", thickness);
+        add(r.corners[2], buffer);
+    }
+    if (Numbers(get(DCM_PixelSpacing, true), spacing, 2))
+    {
+        swprintf_s(buffer, L"Pixel %.3g x %.3g mm", spacing[0], spacing[1]);
+        add(r.corners[2], buffer);
+    }
+    if (r.width > 0)
+    {
+        swprintf_s(buffer, L"%d x %d", r.width, r.height);
+        add(r.corners[2], buffer);
+    }
+
+    // The rows go to the right along the first 3 numbers of ImageOrientationPatient, the columns down
+    // along the other 3
+    double o[6];
+    if (Numbers(h.imageOrientation, o, 6))
+    {
+        r.sides[0] = Direction(-o[0], -o[1], -o[2]);
+        r.sides[1] = Direction(-o[3], -o[4], -o[5]);
+        r.sides[2] = Direction(o[0], o[1], o[2]);
+        r.sides[3] = Direction(o[3], o[4], o[5]);
+    }
+}
+
 // JPEG 2000 (and High-Throughput JPEG 2000): DCMTK has no decoder for it, OpenJPEG decodes it
 static bool IsJpeg2000(E_TransferSyntax x)
 {
@@ -1569,9 +1689,9 @@ static OPJ_BOOL MemSeek(OPJ_OFF_T n, void* user)
     return OPJ_TRUE;
 }
 
-// The first frame of a JPEG 2000 dataset, decoded: a copy of the dataset with that frame as native
-// pixel data (Explicit VR Little Endian), which DicomImage renders as any other. Null if it cannot.
-static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe)
+// A frame of a JPEG 2000 dataset, decoded: a copy of the dataset with that frame as native pixel data
+// (Explicit VR Little Endian), which DicomImage renders as any other. Null if it cannot.
+static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
 {
     DcmElement* element = nullptr;
     if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return nullptr;
@@ -1582,9 +1702,10 @@ static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe)
     DcmPixelSequence* seq = nullptr;
     if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq) return nullptr;
 
-    // The fragments of the first frame (item 0 is the offset table): all of them for a single frame;
-    // for more, up to the next one that starts a codestream (SOC marker, or a JP2 signature box)
+    // The fragments of the frame (item 0 is the offset table): all of them for a single frame; for more,
+    // a frame starts at each fragment that starts a codestream (SOC marker, or a JP2 signature box)
     std::vector<Uint8> code;
+    int at = -1;                                    // the frame of the fragment
     for (unsigned long i = 1; i < seq->card(); i++)
     {
         DcmPixelItem* item = nullptr;
@@ -1592,7 +1713,12 @@ static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe)
         if (seq->getItem(item, i).bad() || !item || item->getUint8Array(bytes).bad() || !bytes) break;
         const Uint32 n = item->getLength();
         bool starts = n >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0x4F) || (n >= 8 && bytes[4] == 'j' && bytes[5] == 'P'));
-        if (multiframe && !code.empty() && starts) break;
+        if (multiframe)
+        {
+            if (at < 0 || starts) at++;
+            if (at > frame) break;
+            if (at < frame) continue;
+        }
         code.insert(code.end(), bytes, bytes + n);
     }
     if (code.size() < 8) return nullptr;
@@ -1671,7 +1797,88 @@ static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe)
     return out;
 }
 
-static Rendered RenderDicom(const std::vector<char>& data, bool header = true)
+// One frame of the file into the pixels, by a DicomImage of its own (a JPEG 2000 one decoded first by
+// OpenJPEG). Its window: the one of the header, or the range of the pixels; `keep`: the one in use, as
+// the frames change. An empty string if it is shown; if not, why (and no pixels).
+static std::wstring ShowFrame(Rendered& r, int frame, bool keep)
+{
+    Imaging* im = r.imaging.get();
+    if (!im || !im->file) return L"no image";
+    const double center = im->center, width = im->width;
+    const bool mono = im->mono;
+    im->image.reset();
+    im->decoded.reset();
+    r.pixels.clear();
+    r.width = r.height = 0;
+    DcmFileFormat& ff = *im->file;
+    auto& decoded = im->decoded;
+    if (IsJpeg2000(im->xfer))
+    {
+        decoded.reset(DecodeJpeg2000(ff.getDataset(), r.frames > 1, frame));
+        if (!decoded) return L"its JPEG 2000 data could not be decoded";
+    }
+    im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
+                                             decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData,
+                                             decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    DicomImage& image = *im->image;
+    if (image.getStatus() != EIS_Normal)
+    {
+        // Compressed with something there is no decoder for here (MPEG, HEVC...)
+        DcmXfer x(im->xfer);
+        bool decodable = !x.isEncapsulated() || im->xfer == EXS_RLELossless || im->xfer == EXS_JPEGLSLossless ||
+                         im->xfer == EXS_JPEGLSLossy || x.getJPEGProcess8Bit() != 0 || decoded;
+        std::wstring why = decodable ? Widen(DicomImage::getString(image.getStatus()))
+                                     : Compression(x.getXferID()) + L" is not supported";
+        im->image.reset();
+        decoded.reset();
+        return why;
+    }
+    r.frame = frame;
+    const int w = static_cast<int>(image.getWidth()), h = static_cast<int>(image.getHeight());
+    im->mono = image.isMonochrome() != 0;
+    if (im->mono)
+    {
+        // The window of the header, or the range of the pixels; the range bounds the dragging
+        if (image.getWindowCount() > 0) image.setWindow(0);
+        else image.setMinMaxWindow();
+        image.getMinMaxValues(im->low, im->high);
+        if (!image.getWindow(im->center, im->width) || im->width < 1)
+        {
+            im->center = (im->low + im->high) / 2;
+            im->width = im->high - im->low + 1;
+        }
+        im->center0 = im->center;
+        im->width0 = im->width;
+        if (keep && mono) { im->center = center; im->width = width; }
+    }
+    else
+    {
+        const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
+        if (!out || w <= 0 || h <= 0)
+        {
+            im->image.reset();
+            decoded.reset();
+            return L"its pixels could not be rendered";
+        }
+        const size_t n = static_cast<size_t>(w) * h;
+        im->color.resize(n);
+        for (size_t i = 0; i < n; i++)
+            im->color[i] = (static_cast<DWORD>(out[3 * i]) << 16) | (out[3 * i + 1] << 8) | out[3 * i + 2];
+        im->center0 = 127.5;
+        im->width0 = 255;
+        if (!(keep && !mono)) { im->center = im->center0; im->width = im->width0; }
+    }
+    r.width = w;
+    r.height = h;
+    Rewindow(r);
+    return std::wstring();
+}
+
+// The preview reads the whole file once (Everything: the header too); stepping through a series, each
+// file without its header (Image: it is written when the stepping stops). The thumbnail: only pixels.
+enum class Render { Thumbnail, Image, Everything };
+
+static Rendered RenderDicom(const std::vector<char>& data, Render what = Render::Everything)
 {
     Rendered r;
     InitDcmtk();
@@ -1695,13 +1902,18 @@ static Rendered RenderDicom(const std::vector<char>& data, bool header = true)
     }
     DcmDataset* ds = ff.getDataset();
 
-    OFString charset, sopClass, tsUid;
-    ds->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    OFString sopClass, tsUid;
     ds->findAndGetOFString(DCM_SOPClassUID, sopClass);
-    const E_TransferSyntax xfer = ds->getOriginalXfer();
-    tsUid = DcmXfer(xfer).getXferID();
+    im->xfer = ds->getOriginalXfer();
+    tsUid = DcmXfer(im->xfer).getXferID();
     Sint32 frames = 1;
     if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+    r.frames = frames;
+    // The cine: FrameTime (ms), or the frame rate of the device
+    Float64 rate = 0;
+    if (ds->findAndGetFloat64(DCM_FrameTime, r.frameTime).bad() || !(r.frameTime > 0)) r.frameTime = 0;
+    if (r.frameTime == 0 && ds->findAndGetFloat64(DCM_RecommendedDisplayFrameRate, rate).good() && rate > 0) r.frameTime = 1000 / rate;
+    if (r.frameTime == 0 && ds->findAndGetFloat64(DCM_CineRate, rate).good() && rate > 0) r.frameTime = 1000 / rate;
 
     OFString studyUid, seriesNumber;
     ds->findAndGetOFString(DCM_StudyInstanceUID, studyUid);
@@ -1709,78 +1921,51 @@ static Rendered RenderDicom(const std::vector<char>& data, bool header = true)
     r.studyUid = studyUid.c_str();
     r.seriesNumber = seriesNumber.c_str();
 
-    if (header)
-    {
-        const std::wstring meta = L"# File meta information\r\n", dataset = L"\r\n# Dataset\r\n";
-        r.tags = meta;
-        r.names = meta;
-        Dump(ff.getMetaInfo(), std::string(), 0, r.tags, r.names);
-        r.tags += dataset;
-        r.names += dataset;
-        Dump(ds, charset.c_str(), 0, r.tags, r.names);
-    }
+    if (what == Render::Everything) DumpHeader(ff, r.tags, r.names);
 
     r.summary = sopClass.empty() ? L"DICOM" : ObjectType(sopClass.c_str());
+    r.imaging = im;
     if (ds->tagExists(DCM_PixelData))
     {
-        // Only the first frame is decoded: a multi-frame file can be large. JPEG 2000 by OpenJPEG first.
-        auto& decoded = im->decoded;
-        if (IsJpeg2000(xfer)) decoded.reset(DecodeJpeg2000(ds, frames > 1));
-        im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
-                                                 decoded ? EXS_LittleEndianExplicit : xfer, CIF_UsePartialAccessToPixelData, 0, 1);
-        DicomImage& image = *im->image;
-        if (image.getStatus() == EIS_Normal)
+        // Only the frame shown is decoded: a multi-frame file can be large
+        const std::wstring why = ShowFrame(r, 0, false);
+        if (why.empty())
         {
-            r.width = static_cast<int>(image.getWidth());
-            r.height = static_cast<int>(image.getHeight());
-            im->mono = image.isMonochrome() != 0;
-            if (im->mono)
-            {
-                // The window of the header, or the range of the pixels; the range bounds the dragging
-                if (image.getWindowCount() > 0) image.setWindow(0);
-                else image.setMinMaxWindow();
-                image.getMinMaxValues(im->low, im->high);
-                if (!image.getWindow(im->center, im->width) || im->width < 1)
-                {
-                    im->center = (im->low + im->high) / 2;
-                    im->width = im->high - im->low + 1;
-                }
-                im->center0 = im->center;
-                im->width0 = im->width;
-                r.imaging = im;
-                Rewindow(r);
-            }
-            else
-            {
-                const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
-                if (out && r.width > 0 && r.height > 0)
-                {
-                    const size_t n = static_cast<size_t>(r.width) * r.height;
-                    r.pixels.resize(n);
-                    for (size_t i = 0; i < n; i++)
-                        r.pixels[i] = (static_cast<DWORD>(out[3 * i]) << 16) | (out[3 * i + 1] << 8) | out[3 * i + 2];
-                    if (header) im->color = r.pixels;
-                    r.imaging = im;
-                }
-            }
-            if (!header) r.imaging.reset();          // the thumbnail: only its pixels
             r.summary += L"  -  " + std::to_wstring(r.width) + L" x " + std::to_wstring(r.height);
-            if (frames > 1) r.summary += L"  -  frame 1 of " + std::to_wstring(frames);
+            if (frames > 1) r.summary += L"  -  " + std::to_wstring(frames) + L" frames";
         }
-        else
-        {
-            // Compressed with something there is no decoder for here (JPEG 2000, HTJ2K, MPEG, HEVC...)
-            DcmXfer x(xfer);
-            bool decodable = !x.isEncapsulated() || xfer == EXS_RLELossless || xfer == EXS_JPEGLSLossless ||
-                             xfer == EXS_JPEGLSLossy || x.getJPEGProcess8Bit() != 0;
-            if (IsJpeg2000(xfer) && !decoded) r.summary += L"  -  image not shown: its JPEG 2000 data could not be decoded";
-            else r.summary += decodable || decoded ? L"  -  image not shown: " + Widen(DicomImage::getString(image.getStatus()))
-                                                   : L"  -  image not shown: " + Compression(tsUid.c_str()) + L" is not supported";
-        }
+        else r.summary += L"  -  image not shown: " + why;
     }
     else r.summary += L"  -  no image";
     r.summary += L"  -  compression: " + Compression(tsUid.c_str());
+    if (what == Render::Thumbnail) r.imaging.reset();       // only its pixels
+    else Annotate(r, ds);
     return r;
+}
+
+// The whole file in memory, up to 1 GB: the other files of the series
+static bool ReadPath(const std::wstring& path, std::vector<char>& data)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {};
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart <= (1LL << 30);
+    if (ok)
+    {
+        data.resize(static_cast<size_t>(size.QuadPart));
+        size_t got = 0;
+        while (ok && got < data.size())
+        {
+            DWORD n = 0;
+            const DWORD want = static_cast<DWORD>((std::min)(data.size() - got, static_cast<size_t>(1) << 24));
+            ok = ReadFile(h, data.data() + got, want, &n, nullptr) && n > 0;
+            got += n;
+        }
+        data.resize(got);
+    }
+    CloseHandle(h);
+    return ok;
 }
 
 // The whole file in memory, up to 1 GB
@@ -1910,6 +2095,141 @@ static HANDLE ThemedControls()
     return context;
 }
 
+// The series of a file, for the preview to step through it: the files of its folder with its
+// SeriesInstanceUID, in the order of their slices (the Z level, as the column), then of their
+// InstanceNumber and names. The headers of a folder are read once and kept for the next previews (of
+// the last few folders) while the folder does not change (its last write time).
+class FolderHeaders
+{
+public:
+    // Empty if it cannot be known, or if `cancel` is set while the folder is read
+    std::vector<std::wstring> SeriesOf(const std::wstring& path, const std::wstring& folder, volatile LONG* cancel)
+    {
+        std::vector<std::wstring> files;
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        if (folder.empty() || !GetFileAttributesExW(folder.c_str(), GetFileExInfoStandard, &a)) return files;
+        const std::wstring key = Lower(folder);
+        std::vector<Entry> entries;
+        bool known = false;
+        AcquireSRWLockShared(&lock);
+        auto it = folders.find(key);
+        if (it != folders.end() && CompareFileTime(&it->second.written, &a.ftLastWriteTime) == 0)
+        {
+            entries = it->second.entries;
+            known = true;
+        }
+        ReleaseSRWLockShared(&lock);
+        if (!known)
+        {
+            if (!Read(folder, entries, cancel)) return files;
+            AcquireSRWLockExclusive(&lock);
+            if (folders.size() >= 8) folders.clear();
+            folders[key] = { a.ftLastWriteTime, entries };
+            ReleaseSRWLockExclusive(&lock);
+        }
+        const std::wstring self = Lower(path);
+        auto me = std::find_if(entries.begin(), entries.end(), [&](const Entry& e) { return Lower(e.path) == self; });
+        if (me == entries.end()) return files;
+        const std::string uid = me->seriesUid;
+        std::vector<Entry> series;
+        for (auto& e : entries) if (e.seriesUid == uid) series.push_back(e);
+        const bool allZ = std::all_of(series.begin(), series.end(), [](const Entry& e) { return e.hasZ; });
+        std::sort(series.begin(), series.end(), [&](const Entry& x, const Entry& y) {
+            if (allZ && x.z != y.z) return x.z < y.z;
+            if (x.instance != y.instance) return x.instance < y.instance;
+            return CompareStringOrdinal(x.path.c_str(), -1, y.path.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+        });
+        for (auto& e : series) files.push_back(e.path);
+        return files;
+    }
+
+private:
+    struct Entry { std::wstring path; std::string seriesUid; bool hasZ = false; double z = 0; long instance = 0; };
+    struct Folder { FILETIME written; std::vector<Entry> entries; };
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::unordered_map<std::wstring, Folder> folders;          // lowercase path
+
+    static std::wstring Lower(std::wstring s)
+    {
+        if (!s.empty()) CharLowerBuffW(&s[0], static_cast<DWORD>(s.size()));
+        return s;
+    }
+
+    // The header of every file, up to ImageOrientationPatient
+    static bool Read(const std::wstring& folder, std::vector<Entry>& entries, volatile LONG* cancel)
+    {
+        WIN32_FIND_DATAW fd;
+        HANDLE find = FindFirstFileExW((folder + (folder.back() == L'\\' ? L"*" : L"\\*")).c_str(), FindExInfoBasic, &fd,
+                                       FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) return false;
+        bool done = true;
+        do
+        {
+            if (*cancel) { done = false; break; }
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) continue;
+            Entry e;
+            e.path = folder + (folder.back() == L'\\' ? L"" : L"\\") + fd.cFileName;
+            Header h;
+            if (ReadHeader(e.path.c_str(), h, 0x00200037) != Kind::Dicom || h.seriesUid.empty()) continue;
+            e.seriesUid = h.seriesUid;
+            e.hasZ = ZLevel(h, e.z);
+            e.instance = atol(h.instanceNumber.c_str());
+            entries.push_back(std::move(e));
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+        return done;
+    }
+};
+
+static FolderHeaders g_folderHeaders;
+
+// A preview asks for its series in a thread of its own (a folder can have thousands of files), which
+// posts `message` to its window when it has it
+struct SeriesScan
+{
+    std::wstring path, folder;
+    HWND window = nullptr;
+    UINT message = 0;
+    volatile LONG cancel = 0;
+    std::vector<std::wstring> files;                // written before the message, read after it
+};
+
+static DWORD WINAPI ScanSeries(void* param)
+{
+    auto scan = static_cast<std::shared_ptr<SeriesScan>*>(param);
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);   // low disk priority too
+    try
+    {
+        (*scan)->files = g_folderHeaders.SeriesOf((*scan)->path, (*scan)->folder, &(*scan)->cancel);
+        if (!(*scan)->cancel) PostMessageW((*scan)->window, (*scan)->message, 0, 0);
+    }
+    catch (...) {}
+    delete scan;
+    FreeLibraryAndExitThread(g_module, 0);         // the reference StartSeriesScan took
+}
+
+static std::shared_ptr<SeriesScan> StartSeriesScan(const std::wstring& path, const std::wstring& folder, HWND window, UINT message)
+{
+    auto scan = std::make_shared<SeriesScan>();
+    scan->path = path;
+    scan->folder = folder;
+    scan->window = window;
+    scan->message = message;
+    // The DLL stays loaded until the thread ends
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&ScanSeries), &self)) return nullptr;
+    auto param = new (std::nothrow) std::shared_ptr<SeriesScan>(scan);
+    HANDLE thread = param ? CreateThread(nullptr, 0, ScanSeries, param, 0, nullptr) : nullptr;
+    if (!thread)
+    {
+        delete param;
+        FreeLibrary(self);
+        return nullptr;
+    }
+    CloseHandle(thread);
+    return scan;
+}
+
 class PreviewHandler : public IInitializeWithItem, public IPreviewHandler, public IPreviewHandlerVisuals,
                        public IOleWindow, public IObjectWithSite
 {
@@ -2003,7 +2323,12 @@ public:
     }
     IFACEMETHODIMP Unload() override
     {
+        if (scan) { InterlockedExchange(&scan->cancel, 1); scan.reset(); }
         if (wnd) { DestroyWindow(wnd); wnd = nullptr; edit = nullptr; list = nullptr; }
+        series.clear();
+        slice = -1;
+        current.clear();
+        playing = stale = windowSet = false;
         for (HFONT* f : { &font, &uiFont, &boldFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
         if (background) { DeleteObject(background); background = nullptr; }
         if (item) { item->Release(); item = nullptr; }
@@ -2033,6 +2358,7 @@ public:
         // columns the same with rows. Ctrl+T: between the two headers. Explorer would take Ctrl+C to
         // copy the file.
         HWND focus = GetFocus();
+        if (msg->message == WM_KEYDOWN && focus && focus == wnd && Key(msg->wParam)) return S_OK;
         if (msg->message == WM_KEYDOWN && focus && (focus == edit || focus == list) && (GetKeyState(VK_CONTROL) & 0x8000))
         {
             switch (msg->wParam)
@@ -2103,17 +2429,26 @@ public:
 
 private:
     enum { TabColumns, TabHeader, TabTags, TabCount };
-    enum class Drag { None, Split, Window, Pan, Zoom };
-    static constexpr UINT WM_READCOLUMNS = WM_APP + 1;
-    static constexpr const wchar_t* Key = L"Software\\DicomStudyCount\\Preview";
+    enum class Drag { None, Split, Window, Pan, Zoom, Track };
+    static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2;
+    static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2;
+    static constexpr const wchar_t* Settings = L"Software\\DicomStudyCount\\Preview";
 
     LONG refs = 1;
     IShellItem* item = nullptr;
     IUnknown* site = nullptr;
     std::wstring path, folder, note;
+    std::wstring current;                           // the file shown: the path, or another one of its series
+    std::shared_ptr<SeriesScan> scan;
+    std::vector<std::wstring> series;               // the files of its series, in order (empty until read)
+    int slice = -1;                                 // the one shown, in `series`
+    bool overlay = true, playing = false;
+    bool stale = false;                             // its header and values are those of a slice shown before
+    bool windowSet = false;                         // the window dragged: it stays from slice to slice
     HWND parent = nullptr, wnd = nullptr, edit = nullptr, list = nullptr;
     RECT bounds = {};
     RECT tabArea = {}, tabRects[TabCount] = {}, contentArea = {}, splitArea = {}, imageArea = {}, statusArea = {};
+    RECT barArea = {}, playRect = {}, trackRect = {}, overlayRect = {};
     int tab = TabColumns;
     int split = 450;                                // the share of the top panel, in thousandths
     Drag drag = Drag::None;
@@ -2173,7 +2508,9 @@ private:
         if (!folder.empty())
             tab = static_cast<int>(ReadDword(L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), TabColumns));
         if (tab < 0 || tab >= TabCount) tab = TabColumns;
-        split = static_cast<int>(ReadDword(Key, L"Split", 450));
+        split = static_cast<int>(ReadDword(Settings, L"Split", 450));
+        overlay = ReadDword(Settings, L"Overlay", 1) != 0;
+        current = path;
         // Its (invisible) title is the summary line: for screen readers and tests
         wnd = CreateWindowExW(0, L"DicomStudyCountPreview", view.summary.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                               bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
@@ -2211,6 +2548,8 @@ private:
         ShowContent();
         // Which columns Explorer shows: after DoPreview has returned, Explorer is not waiting for it
         if (list) PostMessageW(wnd, WM_READCOLUMNS, 0, 0);
+        // The other files of its series, to step through them
+        if (!view.pixels.empty() && !path.empty()) scan = StartSeriesScan(path, folder, wnd, WM_SERIES);
         return S_OK;
     }
 
@@ -2229,21 +2568,11 @@ private:
         c.cx = Px(300);
         ListView_InsertColumn(list, 1, &c);
 
-        IPropertyStore* values = nullptr;
-        if (!path.empty())
-        {
-            auto handler = new (std::nothrow) PropertyHandler();
-            if (handler)
-            {
-                if (SUCCEEDED(handler->Initialize(path.c_str(), STGM_READ))) handler->QueryInterface(IID_PPV_ARGS(&values));
-                handler->Release();
-            }
-        }
         filling = true;
         for (int i = 0; i < static_cast<int>(ARRAYSIZE(g_columnKeys)); i++)
         {
             const PROPERTYKEY& key = *g_columnKeys[i];
-            std::wstring name, value;
+            std::wstring name;
             IPropertyDescription* d = nullptr;
             if (SUCCEEDED(PSGetPropertyDescription(key, IID_PPV_ARGS(&d))))
             {
@@ -2254,6 +2583,35 @@ private:
             }
             if (name.empty()) name = L"DICOM column " + std::to_wstring(key.pid);
             if (name.compare(0, 6, L"DICOM ") == 0 && name.size() > 6) name = name.substr(6);   // all of them are
+            LVITEMW row = {};
+            row.mask = LVIF_TEXT | LVIF_PARAM;
+            row.iItem = i;
+            row.pszText = const_cast<wchar_t*>(name.c_str());
+            row.lParam = i;
+            ListView_InsertItem(list, &row);
+        }
+        filling = false;
+        FillValues(path);
+        ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
+    }
+
+    // The values of the columns for a file (the one shown)
+    void FillValues(const std::wstring& file)
+    {
+        IPropertyStore* values = nullptr;
+        if (!file.empty())
+        {
+            auto handler = new (std::nothrow) PropertyHandler();
+            if (handler)
+            {
+                if (SUCCEEDED(handler->Initialize(file.c_str(), STGM_READ))) handler->QueryInterface(IID_PPV_ARGS(&values));
+                handler->Release();
+            }
+        }
+        for (int i = 0; i < ListView_GetItemCount(list) && i < static_cast<int>(ARRAYSIZE(g_columnKeys)); i++)
+        {
+            const PROPERTYKEY& key = *g_columnKeys[i];
+            std::wstring value;
             PROPVARIANT v;
             PropVariantInit(&v);
             if (values && SUCCEEDED(values->GetValue(key, &v)) && v.vt != VT_EMPTY)
@@ -2266,17 +2624,9 @@ private:
                 }
             }
             PropVariantClear(&v);
-            LVITEMW row = {};
-            row.mask = LVIF_TEXT | LVIF_PARAM;
-            row.iItem = i;
-            row.pszText = const_cast<wchar_t*>(name.c_str());
-            row.lParam = i;
-            int at = ListView_InsertItem(list, &row);
-            ListView_SetItemText(list, at, 1, const_cast<wchar_t*>(value.c_str()));
+            ListView_SetItemText(list, i, 1, const_cast<wchar_t*>(value.c_str()));
         }
-        filling = false;
         if (values) values->Release();
-        ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
     }
 
     // The checks: the columns the Explorer window of the folder shows
@@ -2358,6 +2708,7 @@ private:
     void SelectTab(int t)
     {
         if (t == tab || t < 0 || t >= TabCount) return;
+        Settle();
         const bool headers = (t == TabHeader || t == TabTags) && (tab == TabHeader || tab == TabTags);
         LRESULT first = headers ? SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
         tab = t;
@@ -2411,8 +2762,9 @@ private:
         Layout();
     }
 
-    // From the top: the tabs, their content, the bar that moves the split, the image, the status line
-    // (the summary, and the window of the image). Without an image the content takes its place.
+    // From the top: the tabs, their content, the bar that moves the split, the image, the image bar
+    // (frames or slices, the overlay), the status line (the summary, and the window of the image).
+    // Without an image the content takes their place.
     void Layout()
     {
         RECT c;
@@ -2423,17 +2775,19 @@ private:
         const int top = tabArea.bottom, bottom = h - line > top ? h - line : top;
         if (!view.pixels.empty())
         {
-            int y = top + static_cast<int>(static_cast<long long>(bottom - top - bar) * split / 1000);
-            if (y > bottom - bar - line) y = bottom - bar - line;
+            const int image = bottom - line > top ? bottom - line : top;
+            int y = top + static_cast<int>(static_cast<long long>(image - top - bar) * split / 1000);
+            if (y > image - bar - line) y = image - bar - line;
             if (y < top + line) y = top + line;
             contentArea = { 0, top, w, y };
             splitArea = { 0, y, w, y + bar };
-            imageArea = { 0, y + bar, w, bottom };
+            imageArea = { 0, y + bar, w, image };
+            barArea = { 0, image, w, bottom };
         }
         else
         {
             contentArea = { 0, top, w, bottom };
-            splitArea = imageArea = {};
+            splitArea = imageArea = barArea = {};
         }
         const int ch = contentArea.bottom - contentArea.top > 0 ? contentArea.bottom - contentArea.top : 0;
         if (edit) MoveWindow(edit, 0, contentArea.top, w, ch, TRUE);
@@ -2511,12 +2865,17 @@ private:
                               view.pixels.data() + static_cast<size_t>(y0) * view.width, &bi, DIB_RGB_COLORS, SRCCOPY);
                 RestoreDC(dc, saved);
             }
+            // The overlay, on the part of the image in sight
+            RECT shown = { static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top)),
+                           static_cast<LONG>(std::lround(left + view.width * scale)), static_cast<LONG>(std::lround(top + view.height * scale)) };
+            if (overlay && IntersectRect(&shown, &shown, &imageArea)) PaintOverlay(dc, shown);
         }
+        PaintBar(dc);
 
         // The status line: the summary (or a note), and at its right the window of the image
         SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
         RECT text = statusArea;
-        if (Imaging* im = view.imaging.get())
+        if (Imaging* im = view.pixels.empty() ? nullptr : view.imaging.get())
         {
             wchar_t window[128], zoomed[32] = L"";
             if (zoom > 1) swprintf_s(zoomed, L"Zoom %.0f%%   ", zoom * 100);
@@ -2537,6 +2896,308 @@ private:
         SelectObject(dc, old);
     }
 
+    // The overlay: the corners (Annotate), the window and the zoom at the bottom right, the patient
+    // directions in the middle of the sides. Light text with a dark shadow, readable on any image.
+    void PaintOverlay(HDC dc, const RECT& r)
+    {
+        const int saved = SaveDC(dc);
+        IntersectClipRect(dc, r.left, r.top, r.right, r.bottom);
+        SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
+        TEXTMETRICW tm = {};
+        GetTextMetricsW(dc, &tm);
+        // The corners leave room for the directions at the middle of the top and the bottom
+        const int m = Px(6), height = tm.tmHeight, half = (r.right - r.left) / 2 - m - Px(16);
+        auto draw = [&](RECT box, const std::wstring& s, UINT align) {
+            if (s.empty()) return;
+            RECT shadow = box;
+            OffsetRect(&shadow, Px(1), Px(1));
+            ::SetTextColor(dc, RGB(0, 0, 0));
+            DrawTextW(dc, s.c_str(), -1, &shadow, align | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            ::SetTextColor(dc, RGB(235, 235, 235));
+            DrawTextW(dc, s.c_str(), -1, &box, align | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        };
+        // The lines of a corner, down from the top or up from the bottom, in half the width
+        auto corner = [&](const std::wstring& text, bool right, bool bottom) {
+            std::vector<std::wstring> lines;
+            for (size_t at = 0; !text.empty() && at <= text.size();)
+            {
+                size_t end = text.find(L'\n', at);
+                if (end == std::wstring::npos) end = text.size();
+                lines.push_back(text.substr(at, end - at));
+                at = end + 1;
+            }
+            int y = bottom ? r.bottom - m - static_cast<int>(lines.size()) * height : r.top + m;
+            for (const auto& line : lines)
+            {
+                draw({ right ? r.right - m - half : r.left + m, y, right ? r.right - m : r.left + m + half, y + height }, line,
+                     right ? DT_RIGHT : DT_LEFT);
+                y += height;
+            }
+        };
+        std::wstring topLeft = view.corners[0];
+        if (view.frames > 1)
+            topLeft += (topLeft.empty() ? L"Frame " : L"\nFrame ") + std::to_wstring(view.frame + 1) + L" / " + std::to_wstring(view.frames);
+        corner(topLeft, false, false);
+        corner(view.corners[1], true, false);
+        corner(view.corners[2], false, true);
+        if (Imaging* im = view.imaging.get())
+        {
+            wchar_t text[96];
+            if (im->mono) swprintf_s(text, L"C %.0f  W %.0f", im->center, im->width);
+            else swprintf_s(text, L"Brightness %+.0f  Contrast %.0f%%", 127.5 - im->center, 25500.0 / im->width);
+            std::wstring bottomRight = text;
+            if (zoom > 1)
+            {
+                swprintf_s(text, L"\nZoom %.0f%%", zoom * 100);
+                bottomRight += text;
+            }
+            corner(bottomRight, true, true);
+        }
+        const int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+        draw({ r.left + m, cy - height / 2, cx, cy + height }, view.sides[0], DT_LEFT);
+        draw({ r.left, r.top + m, r.right, r.top + m + height }, view.sides[1], DT_CENTER);
+        draw({ cx, cy - height / 2, r.right - m, cy + height }, view.sides[2], DT_RIGHT);
+        draw({ r.left, r.bottom - m - height, r.right, r.bottom - m }, view.sides[3], DT_CENTER);
+        RestoreDC(dc, saved);
+    }
+
+    // The image bar: play / pause and the slider of the frames (of a multi-frame file) or of the slices
+    // (of its series) with where it is, and the check box of the overlay at the right
+    void PaintBar(HDC dc)
+    {
+        playRect = trackRect = overlayRect = {};
+        if (barArea.bottom <= barArea.top) return;
+        SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
+        const int cy = (barArea.top + barArea.bottom) / 2;
+        int left = barArea.left + Px(6), right = barArea.right - Px(6);
+        HBRUSH accent = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT)), ink = CreateSolidBrush(textColor);
+        HBRUSH groove = CreateSolidBrush(Dim(30)), border = CreateSolidBrush(Dim(60));
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN)), oldBrush = SelectObject(dc, ink);
+
+        static const wchar_t label[] = L"Overlay";
+        SIZE ext = {};
+        GetTextExtentPoint32W(dc, label, ARRAYSIZE(label) - 1, &ext);
+        const int box = Px(13);
+        overlayRect = { right - ext.cx - Px(6) - box, barArea.top, right, barArea.bottom };
+        RECT square = { overlayRect.left, cy - box / 2, overlayRect.left + box, cy - box / 2 + box };
+        if (overlay)
+        {
+            FillRect(dc, &square, accent);
+            HPEN pen = CreatePen(PS_SOLID, Px(2), RGB(255, 255, 255));
+            SelectObject(dc, pen);
+            POINT check[3] = { { square.left + box * 22 / 100, cy }, { square.left + box * 42 / 100, cy + box * 22 / 100 },
+                               { square.left + box * 78 / 100, cy - box * 22 / 100 } };
+            Polyline(dc, check, 3);
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            DeleteObject(pen);
+        }
+        else FrameRect(dc, &square, border);
+        ::SetTextColor(dc, textColor);
+        RECT text = { square.right + Px(6), barArea.top, right, barArea.bottom };
+        DrawTextW(dc, label, -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        right = overlayRect.left - Px(14);
+
+        const int n = Count(), at = Position();
+        if (n > 1 && at >= 0)
+        {
+            const int s = Px(10);
+            playRect = { left, barArea.top, left + Px(20), barArea.bottom };
+            const int px = (playRect.left + playRect.right) / 2;
+            if (playing)
+            {
+                RECT a = { px - s / 2, cy - s / 2, px - s / 2 + s * 35 / 100, cy - s / 2 + s };
+                RECT b = { px + s / 2 - s * 35 / 100, cy - s / 2, px + s / 2, cy - s / 2 + s };
+                FillRect(dc, &a, ink);
+                FillRect(dc, &b, ink);
+            }
+            else
+            {
+                POINT play[3] = { { px - s / 2 + 1, cy - s / 2 }, { px - s / 2 + 1, cy + s / 2 }, { px + s / 2, cy } };
+                Polygon(dc, play, 3);
+            }
+            left = playRect.right + Px(8);
+
+            wchar_t where[96];
+            if (view.frames > 1 && series.size() > 1)
+                swprintf_s(where, L"Frame %d / %d   File %d / %d", at + 1, n, slice + 1, static_cast<int>(series.size()));
+            else swprintf_s(where, view.frames > 1 ? L"Frame %d / %d" : L"Slice %d / %d", at + 1, n);
+            GetTextExtentPoint32W(dc, where, static_cast<int>(wcslen(where)), &ext);
+            RECT w = { right - ext.cx, barArea.top, right, barArea.bottom };
+            if (w.left > left + Px(40))
+            {
+                ::SetTextColor(dc, Dim(70));
+                DrawTextW(dc, where, -1, &w, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                right = w.left - Px(12);
+            }
+            if (right - left > Px(30))
+            {
+                trackRect = { left, barArea.top, right, barArea.bottom };
+                const int x = left + static_cast<int>(static_cast<long long>(right - left) * at / (n - 1));
+                RECT track = { left, cy - Px(1), right, cy - Px(1) + Px(2) }, done = { left, track.top, x, track.bottom };
+                FillRect(dc, &track, groove);
+                FillRect(dc, &done, accent);
+                SelectObject(dc, accent);
+                const int k = Px(5);
+                Ellipse(dc, x - k, cy - k, x + k + 1, cy + k + 1);
+            }
+        }
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        for (HBRUSH b : { accent, ink, groove, border }) DeleteObject(b);
+    }
+
+    // The slider of the image bar: the frames of a multi-frame file, or else the files of its series
+    int Count() const { return view.frames > 1 ? view.frames : static_cast<int>(series.size()); }
+    int Position() const { return view.frames > 1 ? view.frame : slice; }
+    void GoTo(int i)
+    {
+        if (view.frames > 1) GoFrame(i);
+        else GoSlice(i);
+    }
+    void Step(int delta)
+    {
+        const int n = Count();
+        if (n > 1 && Position() >= 0) GoTo((std::max)(0, (std::min)(n - 1, Position() + delta)));
+    }
+
+    // Another frame of the file, with the same window
+    void GoFrame(int f)
+    {
+        if (f < 0 || f >= view.frames || f == view.frame || !view.imaging) return;
+        const bool had = !view.pixels.empty();
+        std::wstring why;
+        try { why = ShowFrame(view, f, true); }
+        catch (...) { why = L"it cannot be shown"; }
+        if (!why.empty()) view.frame = f;           // no image, and the stepping goes on from there
+        Shown(had);
+    }
+
+    // Another file of the series: the window dragged stays, and the zoom while the size of the image
+    // does. Its header and the values of its columns, when the stepping stops (Settle).
+    void GoSlice(int i)
+    {
+        if (i < 0 || i >= static_cast<int>(series.size()) || i == slice) return;
+        Rendered next;
+        try
+        {
+            std::vector<char> data;
+            if (ReadPath(series[i], data)) next = RenderDicom(data, Render::Image);
+            else next.summary = L"This file cannot be read";
+        }
+        catch (...) { next = Rendered(); next.summary = L"This file cannot be shown"; }
+        Imaging* before = view.imaging.get();
+        Imaging* after = next.imaging.get();
+        if (windowSet && before && after && after->image && before->mono == after->mono)
+        {
+            after->center = before->center;
+            after->width = before->width;
+            Rewindow(next);
+        }
+        const bool had = !view.pixels.empty();
+        if (next.width != view.width || next.height != view.height) zoom = 1;
+        view = std::move(next);
+        slice = i;
+        current = series[i];
+        stale = true;
+        SetTimer(wnd, TimerSettle, 300, nullptr);
+        SetWindowTextW(wnd, view.summary.c_str());
+        Shown(had);
+    }
+
+    // After a frame or a slice: the image, its bar and the status line again (all, if the image came or went)
+    void Shown(bool had)
+    {
+        KeepView();
+        if (had != !view.pixels.empty())
+        {
+            Layout();
+            return;
+        }
+        InvalidateRect(wnd, &imageArea, FALSE);
+        InvalidateRect(wnd, &barArea, FALSE);
+        InvalidateRect(wnd, &statusArea, FALSE);
+    }
+
+    // When the stepping stops: the header and the values of the columns of the file shown
+    void Settle()
+    {
+        if (wnd) KillTimer(wnd, TimerSettle);
+        if (!stale) return;
+        stale = false;
+        try
+        {
+            if (view.imaging && view.imaging->file) DumpHeader(*view.imaging->file, view.tags, view.names);
+        }
+        catch (...) { view.tags = view.names = L"(the header cannot be shown)"; }
+        if (edit)
+        {
+            const LRESULT first = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+            SetWindowTextW(edit, (tab == TabTags ? view.tags : view.names).c_str());
+            SendMessageW(edit, EM_LINESCROLL, 0, first);
+        }
+        if (list) FillValues(current);
+    }
+
+    // The series has been read: where this file is in it
+    void Series()
+    {
+        std::vector<std::wstring> files = std::move(scan->files);
+        scan.reset();
+        for (size_t i = 0; i < files.size(); i++)
+            if (CompareStringOrdinal(files[i].c_str(), -1, current.c_str(), -1, TRUE) == CSTR_EQUAL)
+            {
+                slice = static_cast<int>(i);
+                series = std::move(files);
+                break;
+            }
+        InvalidateRect(wnd, &barArea, FALSE);
+    }
+
+    // The cine: the frames at the pace of the file, the slices at 10 a second, round and round
+    void Play(bool on)
+    {
+        playing = on && Count() > 1;
+        if (playing)
+        {
+            const double ms = view.frames > 1 && view.frameTime > 0 ? view.frameTime : 100;
+            SetTimer(wnd, TimerCine, static_cast<UINT>((std::max)(15.0, (std::min)(1000.0, ms))), nullptr);
+        }
+        else
+        {
+            KillTimer(wnd, TimerCine);
+            if (stale) SetTimer(wnd, TimerSettle, 300, nullptr);     // the header of the slice it stopped at
+        }
+        InvalidateRect(wnd, &barArea, FALSE);
+    }
+
+    // The keys of the image, when it has the focus (a click on it): Left / Right the frames (or the
+    // slices), Up / Down and Page Up / Page Down the slices, Home / End the first and the last, Space
+    // the cine
+    bool Key(WPARAM key)
+    {
+        if (view.pixels.empty() && Count() < 2) return false;
+        switch (key)
+        {
+        case VK_LEFT: Step(-1); return true;
+        case VK_RIGHT: Step(1); return true;
+        case VK_UP: case VK_PRIOR: GoSlice(slice - 1); return true;
+        case VK_DOWN: case VK_NEXT: GoSlice(slice + 1); return true;
+        case VK_HOME: GoTo(0); return true;
+        case VK_END: GoTo(Count() - 1); return true;
+        case VK_SPACE: Play(!playing); return true;
+        }
+        return false;
+    }
+
+    // Dragging along the slider
+    void TrackTo(POINT pt)
+    {
+        const int n = Count();
+        if (n < 2 || trackRect.right <= trackRect.left) return;
+        const double t = static_cast<double>(pt.x - trackRect.left) / (trackRect.right - trackRect.left);
+        GoTo(static_cast<int>(std::lround((std::max)(0.0, (std::min)(1.0, t)) * (n - 1))));
+    }
+
     // Dragging over the image: right widens the window (less contrast), up lowers its center (brighter).
     // The whole range of the pixels in the height of the image area.
     void MoveWindowTo(POINT pt)
@@ -2548,6 +3209,7 @@ private:
         im->width = dragWidth + (pt.x - dragFrom.x) * step;
         im->center = dragCenter + (pt.y - dragFrom.y) * step;
         if (im->width < 1) im->width = 1;
+        windowSet = true;
         Redraw();
     }
 
@@ -2571,13 +3233,6 @@ private:
         }
         viewX = (std::max)(0.0, (std::min)(static_cast<double>(view.width), viewX));
         viewY = (std::max)(0.0, (std::min)(static_cast<double>(view.height), viewY));
-    }
-
-    // The wheel: zoom by 1.25 a notch, keeping the point under the cursor where it is (Explorer keeps the
-    // wheel for its own list, so it seldom gets here: dragging with the right button does the same)
-    void ZoomAt(POINT pt, int delta)
-    {
-        SetZoom(pt, zoom * std::pow(1.25, delta / static_cast<double>(WHEEL_DELTA)));
     }
 
     // Dragging with the right button: up zooms in, down out (x2 every 100 pixels), around where it started
@@ -2654,6 +3309,25 @@ private:
         case WM_READCOLUMNS:
             if (self && self->list) self->ReadColumns();
             return 0;
+        case WM_SERIES:
+            if (self && self->scan) self->Series();
+            return 0;
+        case WM_TIMER:
+            if (self && wp == TimerSettle)
+            {
+                if (self->playing) KillTimer(hwnd, TimerSettle);     // again when it stops
+                else self->Settle();
+            }
+            else if (self && wp == TimerCine)
+            {
+                const int n = self->Count();
+                if (n < 2 || self->Position() < 0) self->Play(false);
+                else self->GoTo((self->Position() + 1) % n);
+            }
+            return 0;
+        case WM_KEYDOWN:
+            if (self && self->Key(wp)) return 0;
+            break;
         case WM_SETCURSOR:
             if (self && LOWORD(lp) == HTCLIENT)
             {
@@ -2661,6 +3335,8 @@ private:
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
                 for (const RECT& r : self->tabRects) if (PtInRect(&r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+                for (const RECT* r : { &self->playRect, &self->trackRect, &self->overlayRect })
+                    if (PtInRect(r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
                 if (PtInRect(&self->splitArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZENS)); return TRUE; }
                 if (self->view.imaging && PtInRect(&self->imageArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZEALL)); return TRUE; }
             }
@@ -2670,7 +3346,24 @@ private:
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 for (int t = 0; t < TabCount; t++) if (PtInRect(&self->tabRects[t], pt)) { self->SelectTab(t); return 0; }
+                // The image and its bar take the keys (frames, slices) after a click
+                if (PtInRect(&self->imageArea, pt) || PtInRect(&self->barArea, pt)) ::SetFocus(hwnd);
                 if (PtInRect(&self->splitArea, pt)) { self->drag = Drag::Split; self->dragFrom = pt; SetCapture(hwnd); }
+                else if (PtInRect(&self->playRect, pt)) self->Play(!self->playing);
+                else if (PtInRect(&self->overlayRect, pt))
+                {
+                    self->overlay = !self->overlay;
+                    DWORD value = self->overlay ? 1 : 0;
+                    RegSetKeyValueW(HKEY_CURRENT_USER, Settings, L"Overlay", REG_DWORD, &value, sizeof(value));
+                    InvalidateRect(hwnd, &self->imageArea, FALSE);
+                    InvalidateRect(hwnd, &self->barArea, FALSE);
+                }
+                else if (PtInRect(&self->trackRect, pt))
+                {
+                    self->drag = Drag::Track;
+                    SetCapture(hwnd);
+                    self->TrackTo(pt);
+                }
                 else if (self->view.imaging && PtInRect(&self->imageArea, pt))
                     self->StartImageDrag((wp & MK_SHIFT) ? Drag::Pan : Drag::Window, pt);
             }
@@ -2682,9 +3375,10 @@ private:
                 if (self->drag == Drag::Window) self->MoveWindowTo(pt);
                 else if (self->drag == Drag::Pan) self->PanTo(pt);
                 else if (self->drag == Drag::Zoom) self->ZoomTo(pt);
+                else if (self->drag == Drag::Track) self->TrackTo(pt);
                 else
                 {
-                    const int top = self->tabArea.bottom, room = self->statusArea.top - top - (self->splitArea.bottom - self->splitArea.top);
+                    const int top = self->tabArea.bottom, room = self->barArea.top - top - (self->splitArea.bottom - self->splitArea.top);
                     if (room > 0)
                     {
                         int s = static_cast<int>(static_cast<long long>(pt.y - top) * 1000 / room);
@@ -2699,17 +3393,22 @@ private:
             if (self && self->drag == Drag::None)
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                if (PtInRect(&self->imageArea, pt) && self->Scale() > 0) self->StartImageDrag(msg == WM_RBUTTONDOWN ? Drag::Zoom : Drag::Pan, pt);
+                if (PtInRect(&self->imageArea, pt) && self->Scale() > 0)
+                {
+                    ::SetFocus(hwnd);
+                    self->StartImageDrag(msg == WM_RBUTTONDOWN ? Drag::Zoom : Drag::Pan, pt);
+                }
             }
             return 0;
         case WM_MOUSEWHEEL:
+            // Over the image (when Explorer lets it get here): the frames or slices, as in the viewers
             if (self)
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };   // in screen coordinates
                 ScreenToClient(hwnd, &pt);
-                if (PtInRect(&self->imageArea, pt) && self->Scale() > 0)
+                if ((PtInRect(&self->imageArea, pt) || PtInRect(&self->barArea, pt)) && self->Count() > 1)
                 {
-                    self->ZoomAt(pt, GET_WHEEL_DELTA_WPARAM(wp));
+                    self->Step(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1);
                     return 0;
                 }
             }
@@ -2728,7 +3427,7 @@ private:
                 if (self->drag == Drag::Split)
                 {
                     DWORD value = static_cast<DWORD>(self->split);
-                    RegSetKeyValueW(HKEY_CURRENT_USER, Key, L"Split", REG_DWORD, &value, sizeof(value));
+                    RegSetKeyValueW(HKEY_CURRENT_USER, Settings, L"Split", REG_DWORD, &value, sizeof(value));
                 }
                 self->drag = Drag::None;
                 ReleaseCapture();
@@ -2738,14 +3437,16 @@ private:
             if (self) self->drag = Drag::None;
             return 0;
         case WM_LBUTTONDBLCLK:
-            // On the image: its first window again, fitted
-            if (self && self->view.imaging)
+            // On the image: its first window again, fitted. Elsewhere, the second click of a pair.
+            if (self)
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                if (PtInRect(&self->imageArea, pt))
+                if (!PtInRect(&self->imageArea, pt)) return WndProc(hwnd, WM_LBUTTONDOWN, wp, lp);
+                if (self->view.imaging)
                 {
                     self->view.imaging->center = self->view.imaging->center0;
                     self->view.imaging->width = self->view.imaging->width0;
+                    self->windowSet = false;
                     self->zoom = 1;
                     self->KeepView();
                     self->Redraw();
@@ -2850,7 +3551,7 @@ public:
             std::vector<char> data;
             HRESULT hr = ReadAll(stream, data);
             if (FAILED(hr)) return hr;
-            Rendered r = RenderDicom(data, false);
+            Rendered r = RenderDicom(data, Render::Thumbnail);
             if (r.pixels.empty()) return E_FAIL;
             int w = static_cast<int>(cx), h = static_cast<int>(cx);
             if (r.width >= r.height) h = static_cast<int>(static_cast<long long>(cx) * r.height / r.width);
