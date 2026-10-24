@@ -78,8 +78,11 @@ tree** opens the whole folder tree with one color per study.
 
   Text and rows can be selected and copied (Ctrl+A, Ctrl+C). The tab chosen is remembered for each
   folder. The image is the first frame, with the window of its header. Dragging over it changes the
-  window: right widens it (less contrast), up makes it brighter. A double click goes back to the
-  header's window. The bar between the tabs and the image moves (remembered for every preview).
+  window: right widens it (less contrast), up makes it brighter. Dragging with the right button zooms
+  around where it started (up: in, down: out); dragging with the middle button, or Shift and the left
+  one, moves the zoomed image. (The wheel zooms too, when Explorer lets it reach the preview: it
+  usually keeps it for its list of files.) A double click goes back to the
+  header's window, fitted. The bar between the tabs and the image moves (remembered for every preview).
   Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
   JPEG 2000 pixel data (not deflated files). It uses DCMTK and OpenJPEG, inside the same DLL.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the

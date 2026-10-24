@@ -2103,7 +2103,7 @@ public:
 
 private:
     enum { TabColumns, TabHeader, TabTags, TabCount };
-    enum class Drag { None, Split, Window };
+    enum class Drag { None, Split, Window, Pan, Zoom };
     static constexpr UINT WM_READCOLUMNS = WM_APP + 1;
     static constexpr const wchar_t* Key = L"Software\\DicomStudyCount\\Preview";
 
@@ -2118,7 +2118,8 @@ private:
     int split = 450;                                // the share of the top panel, in thousandths
     Drag drag = Drag::None;
     POINT dragFrom = {};
-    double dragCenter = 0, dragWidth = 0;
+    double dragCenter = 0, dragWidth = 0, dragViewX = 0, dragViewY = 0, dragZoom = 1;
+    double zoom = 1, viewX = 0, viewY = 0;          // the zoom over the fit, and the image point in the middle
     bool filling = false;                           // the checks change from the code, not from a click
     Rendered view;
     HFONT font = nullptr, uiFont = nullptr, boldFont = nullptr;
@@ -2204,6 +2205,7 @@ private:
             SetWindowTextW(edit, (tab == TabTags ? view.tags : view.names).c_str());
         }
         if (list) FillColumns();
+        KeepView();
         Recolor();
         Place();
         ShowContent();
@@ -2479,23 +2481,36 @@ private:
         }
         DeleteObject(line);
 
-        if (!view.pixels.empty())
+        const double scale = Scale();
+        if (scale > 0)
         {
-            // Fitted into the image area, keeping the aspect ratio, centered
-            int aw = imageArea.right - imageArea.left, ah = imageArea.bottom - imageArea.top;
-            int dw = aw, dh = static_cast<int>(static_cast<long long>(aw) * view.height / view.width);
-            if (dh > ah) { dh = ah; dw = static_cast<int>(static_cast<long long>(ah) * view.width / view.height); }
-            BITMAPINFO bi = {};
-            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-            bi.bmiHeader.biWidth = view.width;
-            bi.bmiHeader.biHeight = -view.height;
-            bi.bmiHeader.biPlanes = 1;
-            bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB;
-            SetStretchBltMode(dc, HALFTONE);
-            SetBrushOrgEx(dc, 0, 0, nullptr);
-            StretchDIBits(dc, imageArea.left + (aw - dw) / 2, imageArea.top + (ah - dh) / 2, dw, dh, 0, 0, view.width, view.height,
-                          view.pixels.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+            // Fitted into the image area (zoom 1, centered), or the part of it in sight: only the rows and
+            // columns in the area are stretched, those from the first one in a DIB of their own
+            const double left = (imageArea.left + imageArea.right) / 2.0 - viewX * scale;
+            const double top = (imageArea.top + imageArea.bottom) / 2.0 - viewY * scale;
+            const int x0 = (std::max)(0, static_cast<int>(std::floor((imageArea.left - left) / scale)));
+            const int x1 = (std::min)(view.width, static_cast<int>(std::ceil((imageArea.right - left) / scale)));
+            const int y0 = (std::max)(0, static_cast<int>(std::floor((imageArea.top - top) / scale)));
+            const int y1 = (std::min)(view.height, static_cast<int>(std::ceil((imageArea.bottom - top) / scale)));
+            if (x1 > x0 && y1 > y0)
+            {
+                const int dx = static_cast<int>(std::lround(left + x0 * scale)), dy = static_cast<int>(std::lround(top + y0 * scale));
+                BITMAPINFO bi = {};
+                bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+                bi.bmiHeader.biWidth = view.width;
+                bi.bmiHeader.biHeight = -(y1 - y0);
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+                const int saved = SaveDC(dc);
+                IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                StretchDIBits(dc, dx, dy, static_cast<int>(std::lround(left + x1 * scale)) - dx,
+                              static_cast<int>(std::lround(top + y1 * scale)) - dy, x0, 0, x1 - x0, y1 - y0,
+                              view.pixels.data() + static_cast<size_t>(y0) * view.width, &bi, DIB_RGB_COLORS, SRCCOPY);
+                RestoreDC(dc, saved);
+            }
         }
 
         // The status line: the summary (or a note), and at its right the window of the image
@@ -2503,9 +2518,10 @@ private:
         RECT text = statusArea;
         if (Imaging* im = view.imaging.get())
         {
-            wchar_t window[96];
-            if (im->mono) swprintf_s(window, L"Center %.0f   Width %.0f", im->center, im->width);
-            else swprintf_s(window, L"Brightness %+.0f   Contrast %.0f%%", 127.5 - im->center, 25500.0 / im->width);
+            wchar_t window[128], zoomed[32] = L"";
+            if (zoom > 1) swprintf_s(zoomed, L"Zoom %.0f%%   ", zoom * 100);
+            if (im->mono) swprintf_s(window, L"%sCenter %.0f   Width %.0f", zoomed, im->center, im->width);
+            else swprintf_s(window, L"%sBrightness %+.0f   Contrast %.0f%%", zoomed, 127.5 - im->center, 25500.0 / im->width);
             ::SetTextColor(dc, Dim(70));
             SIZE ext = {};
             GetTextExtentPoint32W(dc, window, static_cast<int>(wcslen(window)), &ext);
@@ -2533,6 +2549,85 @@ private:
         im->center = dragCenter + (pt.y - dragFrom.y) * step;
         if (im->width < 1) im->width = 1;
         Redraw();
+    }
+
+    // Screen pixels per image pixel: the fit into the image area, times the zoom
+    double Scale() const
+    {
+        if (view.pixels.empty() || view.width <= 0 || view.height <= 0) return 0;
+        const double fit = (std::min)(static_cast<double>(imageArea.right - imageArea.left) / view.width,
+                                      static_cast<double>(imageArea.bottom - imageArea.top) / view.height);
+        return fit > 0 ? fit * zoom : 0;
+    }
+
+    // The point of the image at the center of the area: inside the image, the middle of it unzoomed
+    void KeepView()
+    {
+        if (zoom <= 1)
+        {
+            zoom = 1;
+            viewX = view.width / 2.0;
+            viewY = view.height / 2.0;
+        }
+        viewX = (std::max)(0.0, (std::min)(static_cast<double>(view.width), viewX));
+        viewY = (std::max)(0.0, (std::min)(static_cast<double>(view.height), viewY));
+    }
+
+    // The wheel: zoom by 1.25 a notch, keeping the point under the cursor where it is (Explorer keeps the
+    // wheel for its own list, so it seldom gets here: dragging with the right button does the same)
+    void ZoomAt(POINT pt, int delta)
+    {
+        SetZoom(pt, zoom * std::pow(1.25, delta / static_cast<double>(WHEEL_DELTA)));
+    }
+
+    // Dragging with the right button: up zooms in, down out (x2 every 100 pixels), around where it started
+    void ZoomTo(POINT pt)
+    {
+        SetZoom(dragFrom, dragZoom * std::pow(2.0, (dragFrom.y - pt.y) / static_cast<double>(Px(100))));
+    }
+
+    // A new zoom (1 to 64), the image point at `pt` staying there
+    void SetZoom(POINT pt, double next)
+    {
+        const double before = Scale();
+        if (before <= 0) return;
+        const double cx = (imageArea.left + imageArea.right) / 2.0, cy = (imageArea.top + imageArea.bottom) / 2.0;
+        const double px = viewX + (pt.x - cx) / before, py = viewY + (pt.y - cy) / before;
+        zoom = (std::max)(1.0, (std::min)(64.0, next));
+        const double after = Scale();
+        viewX = px - (pt.x - cx) / after;
+        viewY = py - (pt.y - cy) / after;
+        KeepView();
+        InvalidateRect(wnd, &imageArea, FALSE);
+        InvalidateRect(wnd, &statusArea, FALSE);
+    }
+
+    // On the image: the left button drags the window, the right one the zoom, the middle one (or Shift
+    // and the left one) the image itself
+    void StartImageDrag(Drag what, POINT pt)
+    {
+        drag = what;
+        dragFrom = pt;
+        if (view.imaging)
+        {
+            dragCenter = view.imaging->center;
+            dragWidth = view.imaging->width;
+        }
+        dragViewX = viewX;
+        dragViewY = viewY;
+        dragZoom = zoom;
+        SetCapture(wnd);
+    }
+
+    // Dragging with the middle button (or Shift and the left one): the zoomed image follows the mouse
+    void PanTo(POINT pt)
+    {
+        const double scale = Scale();
+        if (scale <= 0) return;
+        viewX = dragViewX - (pt.x - dragFrom.x) / scale;
+        viewY = dragViewY - (pt.y - dragFrom.y) / scale;
+        KeepView();
+        InvalidateRect(wnd, &imageArea, FALSE);
     }
 
     void Redraw()
@@ -2575,14 +2670,9 @@ private:
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 for (int t = 0; t < TabCount; t++) if (PtInRect(&self->tabRects[t], pt)) { self->SelectTab(t); return 0; }
-                if (PtInRect(&self->splitArea, pt)) self->drag = Drag::Split;
+                if (PtInRect(&self->splitArea, pt)) { self->drag = Drag::Split; self->dragFrom = pt; SetCapture(hwnd); }
                 else if (self->view.imaging && PtInRect(&self->imageArea, pt))
-                {
-                    self->drag = Drag::Window;
-                    self->dragCenter = self->view.imaging->center;
-                    self->dragWidth = self->view.imaging->width;
-                }
-                if (self->drag != Drag::None) { self->dragFrom = pt; SetCapture(hwnd); }
+                    self->StartImageDrag((wp & MK_SHIFT) ? Drag::Pan : Drag::Window, pt);
             }
             return 0;
         case WM_MOUSEMOVE:
@@ -2590,6 +2680,8 @@ private:
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 if (self->drag == Drag::Window) self->MoveWindowTo(pt);
+                else if (self->drag == Drag::Pan) self->PanTo(pt);
+                else if (self->drag == Drag::Zoom) self->ZoomTo(pt);
                 else
                 {
                     const int top = self->tabArea.bottom, room = self->statusArea.top - top - (self->splitArea.bottom - self->splitArea.top);
@@ -2600,6 +2692,34 @@ private:
                         self->Layout();
                     }
                 }
+            }
+            return 0;
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+            if (self && self->drag == Drag::None)
+            {
+                POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                if (PtInRect(&self->imageArea, pt) && self->Scale() > 0) self->StartImageDrag(msg == WM_RBUTTONDOWN ? Drag::Zoom : Drag::Pan, pt);
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (self)
+            {
+                POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };   // in screen coordinates
+                ScreenToClient(hwnd, &pt);
+                if (PtInRect(&self->imageArea, pt) && self->Scale() > 0)
+                {
+                    self->ZoomAt(pt, GET_WHEEL_DELTA_WPARAM(wp));
+                    return 0;
+                }
+            }
+            break;
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+            if (self && (self->drag == Drag::Pan || self->drag == Drag::Zoom))
+            {
+                self->drag = Drag::None;
+                ReleaseCapture();
             }
             return 0;
         case WM_LBUTTONUP:
@@ -2618,7 +2738,7 @@ private:
             if (self) self->drag = Drag::None;
             return 0;
         case WM_LBUTTONDBLCLK:
-            // On the image: its first window again
+            // On the image: its first window again, fitted
             if (self && self->view.imaging)
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -2626,6 +2746,8 @@ private:
                 {
                     self->view.imaging->center = self->view.imaging->center0;
                     self->view.imaging->width = self->view.imaging->width0;
+                    self->zoom = 1;
+                    self->KeepView();
                     self->Redraw();
                 }
             }
