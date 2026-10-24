@@ -21,6 +21,7 @@ $bin = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand
 if (-not $Dll) { $Dll = Join-Path $bin 'DicomShell.dll' }
 
 $clsid = '{21329A2B-09B3-4250-9103-9267877321EB}'
+$previewClsid = '{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}'     # the preview, see below
 $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
 $state = 'SOFTWARE\DicomStudyCount\PropertyHandler'      # what was registered, to undo only that
 $extensions = '.', '.dcm', '.ima', '.dicom'                 # '.': files without extension
@@ -46,6 +47,7 @@ if ($Uninstall) {
         if ($s -and $s.GetValue("Owns$ext") -eq 1 -and $k -and $k.GetValue('') -eq $clsid) { Remove-Key "$handlers\$ext" }
     }
     Remove-Key "SOFTWARE\Classes\CLSID\$clsid"
+    Remove-Key "SOFTWARE\Classes\CLSID\$previewClsid"
     Remove-Key $state
     Write-Host 'DICOM properties unregistered (Explorer frees the DLL when it restarts).'
     return
@@ -71,6 +73,12 @@ $k.SetValue('DisableProcessIsolation', 1, 'DWord')
 $k = $hklm.CreateSubKey("SOFTWARE\Classes\CLSID\$clsid\InprocServer32")
 $k.SetValue('', $target)
 $k.SetValue('ThreadingModel', 'Both')
+
+# The preview (registered per user by Register-DicomIcons.ps1) at medium integrity, not the low one of
+# prevhost.exe: its tab "Columns" changes the columns of the Explorer window, which a low-integrity
+# process cannot reach. Explorer takes this value only from HKLM, never from the user's classes.
+$k = $hklm.CreateSubKey("SOFTWARE\Classes\CLSID\$previewClsid")
+$k.SetValue('DisableLowILProcessIsolation', 1, 'DWord')
 
 $s = $hklm.CreateSubKey($state)
 foreach ($ext in $extensions) {

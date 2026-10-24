@@ -36,6 +36,10 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h>
+#include <shlwapi.h>
+#include <exdisp.h>
+#include <commctrl.h>
+#include <uxtheme.h>
 #include <thumbcache.h>
 #include <propsys.h>
 #include <propkey.h>
@@ -54,6 +58,10 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "propsys.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 #pragma comment(linker, "/EXPORT:DllGetClassObject,PRIVATE")
 #pragma comment(linker, "/EXPORT:DllCanUnloadNow,PRIVATE")
@@ -1397,10 +1405,12 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
-// Preview (Explorer's preview pane, Alt+P): the image and the whole header. It runs in prevhost.exe,
-// a process of its own (a crash there never takes Explorer down), which gives the file as a stream;
-// DCMTK reads it from memory, decodes the pixels (uncompressed, JPEG baseline / extended / lossless,
-// JPEG-LS, RLE) and renders them with the window of the header.
+// Preview (Explorer's preview pane, Alt+P): three tabs (the DICOM columns of Explorer, to show or hide
+// them; the header with names; the header with tags) over the image, whose window drags with the
+// mouse. It runs in prevhost.exe, a process of its own (a crash there never takes Explorer down), at
+// medium integrity (DisableLowILProcessIsolation), to reach the Explorer window for its columns.
+// DCMTK reads the file from memory, decodes the pixels (uncompressed, JPEG baseline / extended /
+// lossless, JPEG-LS, RLE; JPEG 2000 with OpenJPEG) and renders them with the window of the header.
 
 static void InitDcmtk()
 {
@@ -1415,6 +1425,19 @@ static void InitDcmtk()
     });
 }
 
+// The decoded image of the preview, kept to change its window (brightness / contrast) while the mouse
+// drags over it. Monochrome: the window of DCMTK, on the values of the pixels. Color: the same on
+// the rendered RGB (0..255), from center 127.5 and width 255 (the image as it is).
+struct Imaging
+{
+    std::unique_ptr<DcmFileFormat> file;
+    std::unique_ptr<DcmDataset> decoded;           // JPEG 2000, decoded by OpenJPEG
+    std::unique_ptr<DicomImage> image;             // destroyed first: it reads the two above
+    bool mono = false;
+    std::vector<DWORD> color;
+    double center = 127.5, width = 255, center0 = 127.5, width0 = 255, low = 0, high = 255;
+};
+
 // What the preview shows: the first frame as 32-bit BGR rows (top-down), a summary line and the
 // header twice, one line per element: with the tags "(gggg,eeee)" and with their dictionary names.
 // The thumbnail: the frame, and the study and series for its badge.
@@ -1424,7 +1447,39 @@ struct Rendered
     std::vector<DWORD> pixels;
     std::wstring summary, tags, names;
     std::string studyUid, seriesNumber;
+    std::shared_ptr<Imaging> imaging;              // only in the preview
 };
+
+// The pixels of the frame with the current window of its imaging
+static void Rewindow(Rendered& r)
+{
+    Imaging* im = r.imaging.get();
+    if (!im || !im->image || r.width <= 0 || r.height <= 0) return;
+    const size_t n = static_cast<size_t>(r.width) * r.height;
+    r.pixels.resize(n);
+    if (im->width < 1) im->width = 1;
+    if (im->mono)
+    {
+        im->image->setWindow(im->center, im->width);
+        const Uint8* out = static_cast<const Uint8*>(im->image->getOutputData(8, 0, 0));
+        if (!out) return;
+        for (size_t i = 0; i < n; i++) r.pixels[i] = (static_cast<DWORD>(out[i]) << 16) | (out[i] << 8) | out[i];
+        return;
+    }
+    // Color: one table for the three channels
+    BYTE table[256];
+    const double from = im->center - im->width / 2;
+    for (int v = 0; v < 256; v++)
+    {
+        double x = (v - from) * 255.0 / im->width;
+        table[v] = static_cast<BYTE>(x < 0 ? 0 : x > 255 ? 255 : x + 0.5);
+    }
+    for (size_t i = 0; i < n && i < im->color.size(); i++)
+    {
+        DWORD c = im->color[i];
+        r.pixels[i] = (static_cast<DWORD>(table[(c >> 16) & 0xFF]) << 16) | (table[(c >> 8) & 0xFF] << 8) | table[c & 0xFF];
+    }
+}
 
 // The value of an element as one line: text and numbers in brackets, large binary values by size
 static std::wstring ValueOf(DcmElement* e, const std::string& charset)
@@ -1623,7 +1678,9 @@ static Rendered RenderDicom(const std::vector<char>& data, bool header = true)
     DcmInputBufferStream in;
     in.setBuffer(data.data(), static_cast<offile_off_t>(data.size()));
     in.setEos();
-    DcmFileFormat ff;
+    auto im = std::make_shared<Imaging>();
+    im->file = std::make_unique<DcmFileFormat>();
+    DcmFileFormat& ff = *im->file;
     ff.transferInit();
     OFCondition st = ff.read(in, EXS_Unknown, EGL_noChange, DCM_MaxReadLength);
     ff.transferEnd();
@@ -1667,31 +1724,46 @@ static Rendered RenderDicom(const std::vector<char>& data, bool header = true)
     if (ds->tagExists(DCM_PixelData))
     {
         // Only the first frame is decoded: a multi-frame file can be large. JPEG 2000 by OpenJPEG first.
-        std::unique_ptr<DcmDataset> decoded;
+        auto& decoded = im->decoded;
         if (IsJpeg2000(xfer)) decoded.reset(DecodeJpeg2000(ds, frames > 1));
-        DicomImage image(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer,
-                         CIF_UsePartialAccessToPixelData, 0, 1);
+        im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
+                                                 decoded ? EXS_LittleEndianExplicit : xfer, CIF_UsePartialAccessToPixelData, 0, 1);
+        DicomImage& image = *im->image;
         if (image.getStatus() == EIS_Normal)
         {
-            if (image.isMonochrome())
-            {
-                if (image.getWindowCount() > 0) image.setWindow(0);
-                else image.setMinMaxWindow();
-            }
             r.width = static_cast<int>(image.getWidth());
             r.height = static_cast<int>(image.getHeight());
-            const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
-            if (out && r.width > 0 && r.height > 0)
+            im->mono = image.isMonochrome() != 0;
+            if (im->mono)
             {
-                const size_t n = static_cast<size_t>(r.width) * r.height;
-                r.pixels.resize(n);
-                bool mono = image.isMonochrome() != 0;
-                for (size_t i = 0; i < n; i++)
+                // The window of the header, or the range of the pixels; the range bounds the dragging
+                if (image.getWindowCount() > 0) image.setWindow(0);
+                else image.setMinMaxWindow();
+                image.getMinMaxValues(im->low, im->high);
+                if (!image.getWindow(im->center, im->width) || im->width < 1)
                 {
-                    DWORD red = mono ? out[i] : out[3 * i], green = mono ? out[i] : out[3 * i + 1], blue = mono ? out[i] : out[3 * i + 2];
-                    r.pixels[i] = (red << 16) | (green << 8) | blue;
+                    im->center = (im->low + im->high) / 2;
+                    im->width = im->high - im->low + 1;
+                }
+                im->center0 = im->center;
+                im->width0 = im->width;
+                r.imaging = im;
+                Rewindow(r);
+            }
+            else
+            {
+                const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
+                if (out && r.width > 0 && r.height > 0)
+                {
+                    const size_t n = static_cast<size_t>(r.width) * r.height;
+                    r.pixels.resize(n);
+                    for (size_t i = 0; i < n; i++)
+                        r.pixels[i] = (static_cast<DWORD>(out[3 * i]) << 16) | (out[3 * i + 1] << 8) | out[3 * i + 2];
+                    if (header) im->color = r.pixels;
+                    r.imaging = im;
                 }
             }
+            if (!header) r.imaging.reset();          // the thumbnail: only its pixels
             r.summary += L"  -  " + std::to_wstring(r.width) + L" x " + std::to_wstring(r.height);
             if (frames > 1) r.summary += L"  -  frame 1 of " + std::to_wstring(frames);
         }
@@ -1734,7 +1806,111 @@ static HRESULT ReadAll(IStream* stream, std::vector<char>& data)
     return S_OK;
 }
 
-class PreviewHandler : public IInitializeWithStream, public IPreviewHandler, public IPreviewHandlerVisuals,
+// The DICOM columns, as the tab "Columns" of the preview lists them: the order of Properties > Details
+static const PROPERTYKEY* const g_columnKeys[] = {
+    &PKEY_StudyHash, &PKEY_SeriesHash, &PKEY_Modality, &PKEY_SeriesNumber, &PKEY_InstanceNumber, &PKEY_SeriesDescription,
+    &PKEY_Protocol, &PKEY_Plane, &PKEY_Acquired, &PKEY_TriggerTime, &PKEY_ZLevel, &PKEY_Rows, &PKEY_Columns,
+    &PKEY_PixelSpacing, &PKEY_SliceThickness, &PKEY_Frames, &PKEY_ImageType, &PKEY_ObjectType, &PKEY_Compression,
+    &PKEY_Manufacturer, &PKEY_FrameOfReference, &PKEY_StudyDate, &PKEY_PatientID, &PKEY_SensitiveData,
+    &PKEY_ImageOrientation, &PKEY_StudyUid, &PKEY_SeriesUid, &PKEY_DuplicatedIn };
+
+static std::wstring LongPath(const std::wstring& path)
+{
+    wchar_t buffer[32768];
+    DWORD n = GetLongPathNameW(path.c_str(), buffer, ARRAYSIZE(buffer));
+    return n > 0 && n < ARRAYSIZE(buffer) ? std::wstring(buffer, n) : path;
+}
+
+// The columns of the Explorer window (or tab) that shows a folder: the one the preview pane is in,
+// or else any. Null if no Explorer window shows it. Explorer is another process: this needs the
+// preview at medium integrity (DisableLowILProcessIsolation), a low one is denied ShellWindows.
+static IColumnManager* ColumnsOf(const std::wstring& folder, HWND pane)
+{
+    if (folder.empty()) return nullptr;
+    const std::wstring want = LongPath(folder);
+    const HWND top = pane ? GetAncestor(pane, GA_ROOT) : nullptr;
+    IShellWindows* windows = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&windows)))) return nullptr;
+    IColumnManager* found = nullptr;
+    bool foundInPane = false;
+    long count = 0;
+    windows->get_Count(&count);
+    for (long i = 0; i < count && !foundInPane; i++)
+    {
+        VARIANT index;
+        VariantInit(&index);
+        index.vt = VT_I4;
+        index.lVal = i;
+        IDispatch* d = nullptr;
+        if (windows->Item(index, &d) != S_OK || !d) continue;
+        SHANDLE_PTR hwnd = 0;
+        IWebBrowserApp* app = nullptr;
+        if (SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&app)))) { app->get_HWND(&hwnd); app->Release(); }
+        IShellBrowser* browser = nullptr;
+        IShellView* view = nullptr;
+        if (SUCCEEDED(IUnknown_QueryService(d, SID_STopLevelBrowser, IID_PPV_ARGS(&browser))))
+        {
+            browser->QueryActiveShellView(&view);
+            browser->Release();
+        }
+        d->Release();
+        if (!view) continue;
+        wchar_t path[MAX_PATH] = L"";
+        IFolderView* fv = nullptr;
+        IPersistFolder2* pf = nullptr;
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&fv))) && SUCCEEDED(fv->GetFolder(IID_PPV_ARGS(&pf))) &&
+            SUCCEEDED(pf->GetCurFolder(&pidl)))
+            SHGetPathFromIDListW(pidl, path);
+        if (pidl) CoTaskMemFree(pidl);
+        if (pf) pf->Release();
+        if (fv) fv->Release();
+        if (path[0] && CompareStringOrdinal(LongPath(path).c_str(), -1, want.c_str(), -1, TRUE) == CSTR_EQUAL)
+        {
+            const bool inPane = top && reinterpret_cast<HWND>(hwnd) == top;
+            IColumnManager* m = nullptr;
+            if ((!found || inPane) && SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&m))))
+            {
+                if (found) found->Release();
+                found = m;
+                foundInPane = inPane;
+            }
+        }
+        view->Release();
+    }
+    windows->Release();
+    return found;
+}
+
+static std::vector<PROPERTYKEY> VisibleColumns(IColumnManager* m)
+{
+    UINT n = 0;
+    std::vector<PROPERTYKEY> keys;
+    if (FAILED(m->GetColumnCount(CM_ENUM_VISIBLE, &n))) return keys;
+    keys.resize(n);
+    if (FAILED(m->GetColumns(CM_ENUM_VISIBLE, keys.data(), n))) keys.clear();
+    return keys;
+}
+
+// The common controls 6 (themed check boxes and headers) for a DLL without a manifest of its own:
+// the one of shell32.dll (resource 124), as an activation context
+static HANDLE ThemedControls()
+{
+    static HANDLE context = [] {
+        wchar_t shell32[MAX_PATH];
+        UINT n = GetSystemDirectoryW(shell32, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH - 12) return INVALID_HANDLE_VALUE;
+        wcscat_s(shell32, L"\\shell32.dll");
+        ACTCTXW a = { sizeof(a) };
+        a.dwFlags = ACTCTX_FLAG_RESOURCE_NAME_VALID;
+        a.lpSource = shell32;
+        a.lpResourceName = MAKEINTRESOURCEW(124);
+        return CreateActCtxW(&a);
+    }();
+    return context;
+}
+
+class PreviewHandler : public IInitializeWithItem, public IPreviewHandler, public IPreviewHandlerVisuals,
                        public IOleWindow, public IObjectWithSite
 {
 public:
@@ -1752,7 +1928,7 @@ public:
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
         if (riid == IID_IUnknown || riid == IID_IPreviewHandler) *ppv = static_cast<IPreviewHandler*>(this);
-        else if (riid == IID_IInitializeWithStream) *ppv = static_cast<IInitializeWithStream*>(this);
+        else if (riid == IID_IInitializeWithItem) *ppv = static_cast<IInitializeWithItem*>(this);
         else if (riid == IID_IPreviewHandlerVisuals) *ppv = static_cast<IPreviewHandlerVisuals*>(this);
         else if (riid == IID_IOleWindow) *ppv = static_cast<IOleWindow*>(this);
         else if (riid == IID_IObjectWithSite) *ppv = static_cast<IObjectWithSite*>(this);
@@ -1768,13 +1944,22 @@ public:
         return r;
     }
 
-    // IInitializeWithStream
-    IFACEMETHODIMP Initialize(IStream* s, DWORD) override
+    // IInitializeWithItem (not a stream): the path is needed, for the folder (its tab, its Explorer
+    // window) and for the values of the columns. The host asks for a stream first, so there is none.
+    IFACEMETHODIMP Initialize(IShellItem* i, DWORD) override
     {
-        if (!s) return E_INVALIDARG;
-        if (stream) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
-        stream = s;
-        stream->AddRef();
+        if (!i) return E_INVALIDARG;
+        if (item) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        item = i;
+        item->AddRef();
+        PWSTR p = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p)
+        {
+            path = p;
+            CoTaskMemFree(p);
+            size_t slash = path.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) folder = path.substr(0, slash == 2 && path[1] == L':' ? 3 : slash);
+        }
         return S_OK;
     }
 
@@ -1801,11 +1986,15 @@ public:
     IFACEMETHODIMP DoPreview() override
     {
         if (wnd) return S_OK;
-        if (!stream || !parent) return E_UNEXPECTED;
+        if (!item || !parent) return E_UNEXPECTED;
         try
         {
+            IStream* stream = nullptr;
+            HRESULT hr = item->BindToHandler(nullptr, BHID_Stream, IID_PPV_ARGS(&stream));
+            if (FAILED(hr)) return hr;
             std::vector<char> data;
-            HRESULT hr = ReadAll(stream, data);
+            hr = ReadAll(stream, data);
+            stream->Release();
             if (FAILED(hr)) return hr;
             view = RenderDicom(data);
         }
@@ -1814,18 +2003,21 @@ public:
     }
     IFACEMETHODIMP Unload() override
     {
-        if (wnd) { DestroyWindow(wnd); wnd = nullptr; edit = nullptr; }
-        if (font) { DeleteObject(font); font = nullptr; }
-        if (linkFont) { DeleteObject(linkFont); linkFont = nullptr; }
+        if (wnd) { DestroyWindow(wnd); wnd = nullptr; edit = nullptr; list = nullptr; }
+        for (HFONT* f : { &font, &uiFont, &boldFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
         if (background) { DeleteObject(background); background = nullptr; }
-        if (stream) { stream->Release(); stream = nullptr; }
+        if (item) { item->Release(); item = nullptr; }
+        path.clear();
+        folder.clear();
+        note.clear();
         view = Rendered();
         return S_OK;
     }
     IFACEMETHODIMP SetFocus() override
     {
-        if (!edit) return S_FALSE;
-        ::SetFocus(edit);
+        HWND content = Content();
+        if (!content) return S_FALSE;
+        ::SetFocus(content);
         return S_OK;
     }
     IFACEMETHODIMP QueryFocus(HWND* focus) override
@@ -1837,15 +2029,25 @@ public:
     IFACEMETHODIMP TranslateAccelerator(MSG* msg) override
     {
         if (!msg) return E_INVALIDARG;
-        // In the header: Ctrl+A selects it all, Ctrl+C (or Ctrl+Insert) copies the selection, Ctrl+T
-        // switches between tags and names. Explorer would take Ctrl+C to copy the file.
-        if (msg->message == WM_KEYDOWN && edit && GetFocus() == edit && (GetKeyState(VK_CONTROL) & 0x8000))
+        // In the header: Ctrl+A selects it all, Ctrl+C (or Ctrl+Insert) copies the selection; in the
+        // columns the same with rows. Ctrl+T: between the two headers. Explorer would take Ctrl+C to
+        // copy the file.
+        HWND focus = GetFocus();
+        if (msg->message == WM_KEYDOWN && focus && (focus == edit || focus == list) && (GetKeyState(VK_CONTROL) & 0x8000))
         {
             switch (msg->wParam)
             {
-            case 'A': SendMessageW(edit, EM_SETSEL, 0, -1); return S_OK;
-            case 'C': case VK_INSERT: SendMessageW(edit, WM_COPY, 0, 0); return S_OK;
-            case 'T': Switch(); return S_OK;
+            case 'A':
+                if (focus == edit) SendMessageW(edit, EM_SETSEL, 0, -1);
+                else ListView_SetItemState(list, -1, LVIS_SELECTED, LVIS_SELECTED);
+                return S_OK;
+            case 'C': case VK_INSERT:
+                if (focus == edit) SendMessageW(edit, WM_COPY, 0, 0);
+                else CopyRows();
+                return S_OK;
+            case 'T':
+                SelectTab(tab == TabHeader ? TabTags : TabHeader);
+                return S_OK;
             }
         }
         // Keys this window does not use go back to Explorer (the frame)
@@ -1864,16 +2066,14 @@ public:
     {
         backColor = color;
         if (background) { DeleteObject(background); background = nullptr; }
-        if (wnd) InvalidateRect(wnd, nullptr, TRUE);
-        if (edit) InvalidateRect(edit, nullptr, TRUE);
+        Recolor();
         return S_OK;
     }
     IFACEMETHODIMP SetFont(const LOGFONTW*) override { return S_OK; }
     IFACEMETHODIMP SetTextColor(COLORREF color) override
     {
         textColor = color;
-        if (wnd) InvalidateRect(wnd, nullptr, TRUE);
-        if (edit) InvalidateRect(edit, nullptr, TRUE);
+        Recolor();
         return S_OK;
     }
 
@@ -1902,14 +2102,26 @@ public:
     }
 
 private:
+    enum { TabColumns, TabHeader, TabTags, TabCount };
+    enum class Drag { None, Split, Window };
+    static constexpr UINT WM_READCOLUMNS = WM_APP + 1;
+    static constexpr const wchar_t* Key = L"Software\\DicomStudyCount\\Preview";
+
     LONG refs = 1;
-    IStream* stream = nullptr;
+    IShellItem* item = nullptr;
     IUnknown* site = nullptr;
-    HWND parent = nullptr, wnd = nullptr, edit = nullptr;
+    std::wstring path, folder, note;
+    HWND parent = nullptr, wnd = nullptr, edit = nullptr, list = nullptr;
     RECT bounds = {};
-    RECT imageArea = {}, summaryArea = {}, switchArea = {};
+    RECT tabArea = {}, tabRects[TabCount] = {}, contentArea = {}, splitArea = {}, imageArea = {}, statusArea = {};
+    int tab = TabColumns;
+    int split = 450;                                // the share of the top panel, in thousandths
+    Drag drag = Drag::None;
+    POINT dragFrom = {};
+    double dragCenter = 0, dragWidth = 0;
+    bool filling = false;                           // the checks change from the code, not from a click
     Rendered view;
-    HFONT font = nullptr, linkFont = nullptr;
+    HFONT font = nullptr, uiFont = nullptr, boldFont = nullptr;
     HBRUSH background = nullptr;
     COLORREF backColor = GetSysColor(COLOR_WINDOW), textColor = GetSysColor(COLOR_WINDOWTEXT);
 
@@ -1919,12 +2131,36 @@ private:
         return background;
     }
 
+    // Between the background and the text: lines and the inactive tabs
+    COLORREF Dim(int percent) const
+    {
+        auto mix = [&](int shift) {
+            return ((((textColor >> shift) & 0xFF) * percent + ((backColor >> shift) & 0xFF) * (100 - percent)) / 100) << shift;
+        };
+        return static_cast<COLORREF>(mix(0) | mix(8) | mix(16));
+    }
+
+    int Px(int n) const
+    {
+        UINT dpi = wnd ? GetDpiForWindow(wnd) : 96;
+        return MulDiv(n, dpi ? dpi : 96, 96);
+    }
+
+    HWND Content() const { return tab == TabColumns ? list : edit; }
+
+    static DWORD ReadDword(const wchar_t* key, const wchar_t* name, DWORD fallback)
+    {
+        DWORD value = 0, size = sizeof(value);
+        return RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS ? value : fallback;
+    }
+
     HRESULT CreateWindows()
     {
         static ATOM cls = 0;
         if (!cls)
         {
             WNDCLASSEXW wc = { sizeof(wc) };
+            wc.style = CS_DBLCLKS;
             wc.lpfnWndProc = WndProc;
             wc.hInstance = g_module;
             wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -1932,51 +2168,239 @@ private:
             cls = RegisterClassExW(&wc);
             if (!cls && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
         }
+        // The tab of this folder (the columns at first), and the split of every preview
+        if (!folder.empty())
+            tab = static_cast<int>(ReadDword(L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), TabColumns));
+        if (tab < 0 || tab >= TabCount) tab = TabColumns;
+        split = static_cast<int>(ReadDword(Key, L"Split", 450));
         // Its (invisible) title is the summary line: for screen readers and tests
         wnd = CreateWindowExW(0, L"DicomStudyCountPreview", view.summary.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                               bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
                               parent, nullptr, g_module, this);
         if (!wnd) return HRESULT_FROM_WIN32(GetLastError());
-        edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+        const int points9 = -MulDiv(9, GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96, 72);
+        font = CreateFontW(points9, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        uiFont = CreateFontW(points9, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        boldFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                               OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        // The controls of the common controls 6 (themed), not the old ones prevhost.exe would give
+        ULONG_PTR cookie = 0;
+        HANDLE context = ThemedControls();
+        bool active = context != INVALID_HANDLE_VALUE && ActivateActCtx(context, &cookie);
+        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
+        InitCommonControlsEx(&icc);
+        edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
                                ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
                                0, 0, 10, 10, wnd, nullptr, g_module, nullptr);
-        UINT dpi = GetDpiForWindow(wnd);
-        font = CreateFontW(-MulDiv(9, dpi ? dpi : 96, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                           OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-        linkFont = CreateFontW(-MulDiv(9, dpi ? dpi : 96, 72), 0, 0, 0, FW_NORMAL, FALSE, TRUE, FALSE, DEFAULT_CHARSET,
-                               OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
+                               0, 0, 10, 10, wnd, nullptr, g_module, nullptr);
+        if (active) DeactivateActCtx(0, cookie);
         if (edit)
         {
             SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
             SendMessageW(edit, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
-            SetWindowTextW(edit, (ShowNames() ? view.names : view.tags).c_str());
+            SetWindowTextW(edit, (tab == TabTags ? view.tags : view.names).c_str());
         }
+        if (list) FillColumns();
+        Recolor();
         Place();
+        ShowContent();
+        // Which columns Explorer shows: after DoPreview has returned, Explorer is not waiting for it
+        if (list) PostMessageW(wnd, WM_READCOLUMNS, 0, 0);
         return S_OK;
     }
 
-    // Tags or names: the last choice, for every preview (HKCU\Software\DicomStudyCount\Preview)
-    static bool ShowNames()
+    // One row per DICOM column: its name and its value for this file, checked if the Explorer window
+    // of the folder shows it (WM_READCOLUMNS)
+    void FillColumns()
     {
-        DWORD value = 0, size = sizeof(value);
-        return RegGetValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview", L"HeaderNames",
-                            RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS && value != 0;
+        SendMessageW(list, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), FALSE);
+        ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        LVCOLUMNW c = {};
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = const_cast<wchar_t*>(L"Column");
+        c.cx = Px(170);
+        ListView_InsertColumn(list, 0, &c);
+        c.pszText = const_cast<wchar_t*>(L"Value");
+        c.cx = Px(300);
+        ListView_InsertColumn(list, 1, &c);
+
+        IPropertyStore* values = nullptr;
+        if (!path.empty())
+        {
+            auto handler = new (std::nothrow) PropertyHandler();
+            if (handler)
+            {
+                if (SUCCEEDED(handler->Initialize(path.c_str(), STGM_READ))) handler->QueryInterface(IID_PPV_ARGS(&values));
+                handler->Release();
+            }
+        }
+        filling = true;
+        for (int i = 0; i < static_cast<int>(ARRAYSIZE(g_columnKeys)); i++)
+        {
+            const PROPERTYKEY& key = *g_columnKeys[i];
+            std::wstring name, value;
+            IPropertyDescription* d = nullptr;
+            if (SUCCEEDED(PSGetPropertyDescription(key, IID_PPV_ARGS(&d))))
+            {
+                PWSTR s = nullptr;
+                if (SUCCEEDED(d->GetDisplayName(&s)) && s) { name = s; CoTaskMemFree(s); }
+                if (name.empty() && SUCCEEDED(d->GetCanonicalName(&s)) && s) { name = s; CoTaskMemFree(s); }
+                d->Release();
+            }
+            if (name.empty()) name = L"DICOM column " + std::to_wstring(key.pid);
+            if (name.compare(0, 6, L"DICOM ") == 0 && name.size() > 6) name = name.substr(6);   // all of them are
+            PROPVARIANT v;
+            PropVariantInit(&v);
+            if (values && SUCCEEDED(values->GetValue(key, &v)) && v.vt != VT_EMPTY)
+            {
+                PWSTR s = nullptr;
+                if (SUCCEEDED(PSFormatForDisplayAlloc(key, v, PDFF_DEFAULT, &s)) || SUCCEEDED(PropVariantToStringAlloc(v, &s)))
+                {
+                    value = s;
+                    CoTaskMemFree(s);
+                }
+            }
+            PropVariantClear(&v);
+            LVITEMW row = {};
+            row.mask = LVIF_TEXT | LVIF_PARAM;
+            row.iItem = i;
+            row.pszText = const_cast<wchar_t*>(name.c_str());
+            row.lParam = i;
+            int at = ListView_InsertItem(list, &row);
+            ListView_SetItemText(list, at, 1, const_cast<wchar_t*>(value.c_str()));
+        }
+        filling = false;
+        if (values) values->Release();
+        ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
     }
 
-    void Switch()
+    // The checks: the columns the Explorer window of the folder shows
+    void ReadColumns()
     {
-        if (!edit || (view.tags.empty() && view.names.empty())) return;
-        DWORD names = ShowNames() ? 0 : 1;
-        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview", L"HeaderNames", REG_DWORD,
-                        &names, sizeof(names));
-        // Both have the same lines: the same ones stay in sight
-        LRESULT first = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
-        SetWindowTextW(edit, (names ? view.names : view.tags).c_str());
-        SendMessageW(edit, EM_LINESCROLL, 0, first);
-        InvalidateRect(wnd, &switchArea, TRUE);
+        IColumnManager* m = ColumnsOf(folder, parent);
+        if (!m)
+        {
+            note = L"Columns: no Explorer window shows this folder";
+            InvalidateRect(wnd, &statusArea, TRUE);
+            return;
+        }
+        const std::vector<PROPERTYKEY> shown = VisibleColumns(m);
+        m->Release();
+        filling = true;
+        for (int i = 0; i < ListView_GetItemCount(list); i++)
+        {
+            const PROPERTYKEY& key = *g_columnKeys[i];
+            bool on = std::any_of(shown.begin(), shown.end(), [&](const PROPERTYKEY& k) { return IsEqualPropertyKey(k, key); });
+            ListView_SetCheckState(list, i, on);
+        }
+        filling = false;
     }
 
-    const wchar_t* SwitchLabel() const { return ShowNames() ? L"Show tags (Ctrl+T)" : L"Show names (Ctrl+T)"; }
+    // A check clicked: that column is added to the end of the Explorer window, or taken out of it
+    void Toggle(int row)
+    {
+        const bool on = ListView_GetCheckState(list, row) != 0;
+        const PROPERTYKEY& key = *g_columnKeys[row];
+        IColumnManager* m = ColumnsOf(folder, parent);
+        HRESULT hr = E_FAIL;
+        if (m)
+        {
+            std::vector<PROPERTYKEY> shown = VisibleColumns(m), next;
+            for (auto& k : shown) if (!IsEqualPropertyKey(k, key)) next.push_back(k);
+            if (on) next.push_back(key);
+            hr = next.empty() ? E_INVALIDARG : m->SetColumns(next.data(), static_cast<UINT>(next.size()));
+            m->Release();
+        }
+        if (FAILED(hr))
+        {
+            filling = true;
+            ListView_SetCheckState(list, row, !on);
+            filling = false;
+            note = m ? L"Columns: Explorer did not change them" : L"Columns: no Explorer window shows this folder";
+        }
+        else note.clear();
+        InvalidateRect(wnd, &statusArea, TRUE);
+    }
+
+    // The selected rows, "name<tab>value", to the clipboard
+    void CopyRows()
+    {
+        std::wstring text;
+        wchar_t buffer[4096];
+        for (int i = -1; (i = ListView_GetNextItem(list, i, LVNI_SELECTED)) >= 0;)
+        {
+            ListView_GetItemText(list, i, 0, buffer, ARRAYSIZE(buffer));
+            text += buffer;
+            text += L"\t";
+            ListView_GetItemText(list, i, 1, buffer, ARRAYSIZE(buffer));
+            text += buffer;
+            text += L"\r\n";
+        }
+        if (text.empty() || !OpenClipboard(wnd)) return;
+        EmptyClipboard();
+        const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (memory)
+        {
+            memcpy(GlobalLock(memory), text.c_str(), bytes);
+            GlobalUnlock(memory);
+            if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+        }
+        CloseClipboard();
+    }
+
+    // The tab chosen, remembered for this folder (HKCU\Software\DicomStudyCount\Preview\Tabs)
+    void SelectTab(int t)
+    {
+        if (t == tab || t < 0 || t >= TabCount) return;
+        const bool headers = (t == TabHeader || t == TabTags) && (tab == TabHeader || tab == TabTags);
+        LRESULT first = headers ? SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
+        tab = t;
+        if (edit && t != TabColumns)
+        {
+            SetWindowTextW(edit, (t == TabTags ? view.tags : view.names).c_str());
+            if (headers) SendMessageW(edit, EM_LINESCROLL, 0, first);   // both have the same lines
+        }
+        if (!folder.empty())
+        {
+            DWORD value = static_cast<DWORD>(t);
+            RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), REG_DWORD,
+                            &value, sizeof(value));
+        }
+        ShowContent();
+        if (HWND content = Content()) ::SetFocus(content);
+        InvalidateRect(wnd, &tabArea, TRUE);
+        InvalidateRect(wnd, &statusArea, TRUE);
+    }
+
+    void ShowContent()
+    {
+        if (list) ShowWindow(list, tab == TabColumns ? SW_SHOWNA : SW_HIDE);
+        if (edit) ShowWindow(edit, tab == TabColumns ? SW_HIDE : SW_SHOWNA);
+    }
+
+    void Recolor()
+    {
+        // Dark check boxes and scroll bars when Explorer is dark (themes of Windows itself)
+        const bool dark = GetRValue(backColor) * 299 + GetGValue(backColor) * 587 + GetBValue(backColor) * 114 < 128000;
+        if (list)
+        {
+            ListView_SetBkColor(list, backColor);
+            ListView_SetTextBkColor(list, backColor);
+            ListView_SetTextColor(list, textColor);
+            SetWindowTheme(list, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            InvalidateRect(list, nullptr, TRUE);
+        }
+        if (edit)
+        {
+            SetWindowTheme(edit, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+            InvalidateRect(edit, nullptr, TRUE);
+        }
+        if (wnd) InvalidateRect(wnd, nullptr, TRUE);
+    }
 
     void Place()
     {
@@ -1985,23 +2409,33 @@ private:
         Layout();
     }
 
-    // The image on top (up to 60 % of the height, never stretched beyond its aspect), the summary
-    // line under it, the header below
+    // From the top: the tabs, their content, the bar that moves the split, the image, the status line
+    // (the summary, and the window of the image). Without an image the content takes its place.
     void Layout()
     {
         RECT c;
         GetClientRect(wnd, &c);
-        const int w = c.right, h = c.bottom, line = MulDiv(22, GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96, 96);
-        int imageHeight = 0;
-        if (view.width > 0 && view.height > 0)
+        const int w = c.right, h = c.bottom, line = Px(22), bar = Px(6);
+        tabArea = { 0, 0, w, line + Px(4) };
+        statusArea = { Px(4), h - line, w - Px(4), h };
+        const int top = tabArea.bottom, bottom = h - line > top ? h - line : top;
+        if (!view.pixels.empty())
         {
-            imageHeight = h * 6 / 10;
-            int fit = static_cast<int>(static_cast<long long>(w) * view.height / view.width);
-            if (fit < imageHeight) imageHeight = fit;
+            int y = top + static_cast<int>(static_cast<long long>(bottom - top - bar) * split / 1000);
+            if (y > bottom - bar - line) y = bottom - bar - line;
+            if (y < top + line) y = top + line;
+            contentArea = { 0, top, w, y };
+            splitArea = { 0, y, w, y + bar };
+            imageArea = { 0, y + bar, w, bottom };
         }
-        imageArea = { 0, 0, w, imageHeight };
-        summaryArea = { 4, imageHeight, w - 4, imageHeight + line };
-        if (edit) MoveWindow(edit, 0, imageHeight + line, w, h - imageHeight - line > 0 ? h - imageHeight - line : 0, TRUE);
+        else
+        {
+            contentArea = { 0, top, w, bottom };
+            splitArea = imageArea = {};
+        }
+        const int ch = contentArea.bottom - contentArea.top > 0 ? contentArea.bottom - contentArea.top : 0;
+        if (edit) MoveWindow(edit, 0, contentArea.top, w, ch, TRUE);
+        if (list) MoveWindow(list, 0, contentArea.top, w, ch, TRUE);
         InvalidateRect(wnd, nullptr, TRUE);
     }
 
@@ -2010,6 +2444,41 @@ private:
         RECT c;
         GetClientRect(wnd, &c);
         FillRect(dc, &c, Background());
+        SetBkMode(dc, TRANSPARENT);
+        HGDIOBJ old = SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
+
+        // The tabs: the chosen one in bold and underlined, the others dimmed
+        static const wchar_t* const labels[TabCount] = { L"Columns", L"Header", L"Tags" };
+        int x = Px(6);
+        for (int t = 0; t < TabCount; t++)
+        {
+            SelectObject(dc, t == tab && boldFont ? boldFont : uiFont);
+            SIZE ext = {};
+            GetTextExtentPoint32W(dc, labels[t], static_cast<int>(wcslen(labels[t])), &ext);
+            tabRects[t] = { x, 0, x + ext.cx + Px(16), tabArea.bottom };
+            ::SetTextColor(dc, t == tab ? textColor : Dim(60));
+            RECT r = tabRects[t];
+            DrawTextW(dc, labels[t], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if (t == tab)
+            {
+                RECT u = { tabRects[t].left + Px(4), tabArea.bottom - Px(3), tabRects[t].right - Px(4), tabArea.bottom - Px(1) };
+                HBRUSH accent = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+                FillRect(dc, &u, accent);
+                DeleteObject(accent);
+            }
+            x = tabRects[t].right;
+        }
+        HBRUSH line = CreateSolidBrush(Dim(25));
+        RECT under = { 0, tabArea.bottom - Px(1), c.right, tabArea.bottom };
+        FillRect(dc, &under, line);
+        if (splitArea.bottom > splitArea.top)
+        {
+            const int y = (splitArea.top + splitArea.bottom) / 2;
+            RECT bar = { 0, y, c.right, y + Px(1) };
+            FillRect(dc, &bar, line);
+        }
+        DeleteObject(line);
+
         if (!view.pixels.empty())
         {
             // Fitted into the image area, keeping the aspect ratio, centered
@@ -2025,32 +2494,52 @@ private:
             bi.bmiHeader.biCompression = BI_RGB;
             SetStretchBltMode(dc, HALFTONE);
             SetBrushOrgEx(dc, 0, 0, nullptr);
-            StretchDIBits(dc, (aw - dw) / 2, (ah - dh) / 2, dw, dh, 0, 0, view.width, view.height,
+            StretchDIBits(dc, imageArea.left + (aw - dw) / 2, imageArea.top + (ah - dh) / 2, dw, dh, 0, 0, view.width, view.height,
                           view.pixels.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
         }
-        HGDIOBJ old = SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
-        SetBkMode(dc, TRANSPARENT);
-        ::SetTextColor(dc, textColor);
-        RECT text = summaryArea;
-        switchArea = {};
-        if (!view.tags.empty())
+
+        // The status line: the summary (or a note), and at its right the window of the image
+        SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
+        RECT text = statusArea;
+        if (Imaging* im = view.imaging.get())
         {
-            // At the right of the summary, underlined: the switch between tags and names
-            SelectObject(dc, linkFont ? linkFont : font);
-            const wchar_t* label = SwitchLabel();
+            wchar_t window[96];
+            if (im->mono) swprintf_s(window, L"Center %.0f   Width %.0f", im->center, im->width);
+            else swprintf_s(window, L"Brightness %+.0f   Contrast %.0f%%", 127.5 - im->center, 25500.0 / im->width);
+            ::SetTextColor(dc, Dim(70));
             SIZE ext = {};
-            GetTextExtentPoint32W(dc, label, static_cast<int>(wcslen(label)), &ext);
-            switchArea = { summaryArea.right - ext.cx, summaryArea.top, summaryArea.right, summaryArea.bottom };
-            if (switchArea.left > summaryArea.left + ext.cx)
+            GetTextExtentPoint32W(dc, window, static_cast<int>(wcslen(window)), &ext);
+            if (statusArea.right - statusArea.left > 2 * ext.cx)
             {
-                DrawTextW(dc, label, -1, &switchArea, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                text.right = switchArea.left - 12;
+                DrawTextW(dc, window, -1, &text, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                text.right -= ext.cx + Px(12);
             }
-            else switchArea = {};
-            SelectObject(dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
         }
-        DrawTextW(dc, view.summary.c_str(), -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        ::SetTextColor(dc, textColor);
+        DrawTextW(dc, (note.empty() || tab != TabColumns ? view.summary : note).c_str(), -1, &text,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, old);
+    }
+
+    // Dragging over the image: right widens the window (less contrast), up lowers its center (brighter).
+    // The whole range of the pixels in the height of the image area.
+    void MoveWindowTo(POINT pt)
+    {
+        Imaging* im = view.imaging.get();
+        if (!im) return;
+        const int area = imageArea.bottom - imageArea.top > Px(100) ? imageArea.bottom - imageArea.top : Px(100);
+        const double step = (im->high - im->low > 1 ? im->high - im->low : 1) / area;
+        im->width = dragWidth + (pt.x - dragFrom.x) * step;
+        im->center = dragCenter + (pt.y - dragFrom.y) * step;
+        if (im->width < 1) im->width = 1;
+        Redraw();
+    }
+
+    void Redraw()
+    {
+        Rewindow(view);
+        InvalidateRect(wnd, &imageArea, FALSE);
+        InvalidateRect(wnd, &statusArea, FALSE);
     }
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -2067,27 +2556,106 @@ private:
             return 0;
         case WM_ERASEBKGND:
             return 1;
+        case WM_READCOLUMNS:
+            if (self && self->list) self->ReadColumns();
+            return 0;
         case WM_SETCURSOR:
             if (self && LOWORD(lp) == HTCLIENT)
             {
                 POINT pt;
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
-                if (PtInRect(&self->switchArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+                for (const RECT& r : self->tabRects) if (PtInRect(&r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+                if (PtInRect(&self->splitArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZENS)); return TRUE; }
+                if (self->view.imaging && PtInRect(&self->imageArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZEALL)); return TRUE; }
             }
             break;
-        case WM_LBUTTONUP:
+        case WM_LBUTTONDOWN:
             if (self)
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                if (PtInRect(&self->switchArea, pt)) self->Switch();
+                for (int t = 0; t < TabCount; t++) if (PtInRect(&self->tabRects[t], pt)) { self->SelectTab(t); return 0; }
+                if (PtInRect(&self->splitArea, pt)) self->drag = Drag::Split;
+                else if (self->view.imaging && PtInRect(&self->imageArea, pt))
+                {
+                    self->drag = Drag::Window;
+                    self->dragCenter = self->view.imaging->center;
+                    self->dragWidth = self->view.imaging->width;
+                }
+                if (self->drag != Drag::None) { self->dragFrom = pt; SetCapture(hwnd); }
             }
             return 0;
+        case WM_MOUSEMOVE:
+            if (self && self->drag != Drag::None)
+            {
+                POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                if (self->drag == Drag::Window) self->MoveWindowTo(pt);
+                else
+                {
+                    const int top = self->tabArea.bottom, room = self->statusArea.top - top - (self->splitArea.bottom - self->splitArea.top);
+                    if (room > 0)
+                    {
+                        int s = static_cast<int>(static_cast<long long>(pt.y - top) * 1000 / room);
+                        self->split = s < 0 ? 0 : s > 1000 ? 1000 : s;
+                        self->Layout();
+                    }
+                }
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (self && self->drag != Drag::None)
+            {
+                if (self->drag == Drag::Split)
+                {
+                    DWORD value = static_cast<DWORD>(self->split);
+                    RegSetKeyValueW(HKEY_CURRENT_USER, Key, L"Split", REG_DWORD, &value, sizeof(value));
+                }
+                self->drag = Drag::None;
+                ReleaseCapture();
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (self) self->drag = Drag::None;
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            // On the image: its first window again
+            if (self && self->view.imaging)
+            {
+                POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                if (PtInRect(&self->imageArea, pt))
+                {
+                    self->view.imaging->center = self->view.imaging->center0;
+                    self->view.imaging->width = self->view.imaging->width0;
+                    self->Redraw();
+                }
+            }
+            return 0;
+        case WM_NOTIFY:
+            if (self && self->list && reinterpret_cast<NMHDR*>(lp)->hwndFrom == self->list &&
+                reinterpret_cast<NMHDR*>(lp)->code == LVN_ITEMCHANGED && !self->filling)
+            {
+                auto change = reinterpret_cast<NMLISTVIEW*>(lp);
+                if ((change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK) &&
+                    (change->uOldState & LVIS_STATEIMAGEMASK))     // not the first check box of a new row
+                    self->Toggle(change->iItem);
+            }
+            break;
         case WM_PAINT:
         {
+            // Painted aside, then copied: no flicker while the window of the image is dragged
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
-            if (self) self->Paint(dc);
+            RECT c;
+            GetClientRect(hwnd, &c);
+            HDC memory = CreateCompatibleDC(dc);
+            HBITMAP bitmap = CreateCompatibleBitmap(dc, c.right > 0 ? c.right : 1, c.bottom > 0 ? c.bottom : 1);
+            HGDIOBJ old = SelectObject(memory, bitmap);
+            if (self) self->Paint(memory);
+            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+                   memory, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+            SelectObject(memory, old);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
             EndPaint(hwnd, &ps);
             return 0;
         }

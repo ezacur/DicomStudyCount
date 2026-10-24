@@ -10,7 +10,8 @@ param(
     [Parameter(Mandatory = $true)] [string]$Out,
     [string]$Dll,
     [int]$Width = 700,
-    [int]$Height = 900
+    [int]$Height = 900,
+    [switch]$Dark          # the colors of Explorer in dark mode
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
@@ -21,14 +22,14 @@ using System; using System.Drawing; using System.Runtime.InteropServices;
 public static class PreviewTest {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string p);
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] static extern IntPtr GetProcAddress(IntPtr m, string n);
-    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)] static extern int SHCreateStreamOnFileEx(string file, uint mode, uint attrs, bool create, IntPtr template, out IntPtr stream);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHCreateItemFromParsingName(string path, IntPtr bc, ref Guid riid, out IntPtr item);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint f);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     delegate int GetClassObject(ref Guid c, ref Guid i, [MarshalAs(UnmanagedType.Interface)] out IClassFactory f);
     [ComImport, Guid("00000001-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IClassFactory { void CreateInstance([MarshalAs(UnmanagedType.IUnknown)] object o, ref Guid i, [MarshalAs(UnmanagedType.IUnknown)] out object r); void LockServer(bool l); }
-    [ComImport, Guid("b824b49d-22ac-4161-ac8a-9916e8fa3f7f"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IInitializeWithStream { void Initialize(IntPtr stream, uint mode); }
+    [ComImport, Guid("7f73be3f-fb79-493c-a6c7-7ee14e245841"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IInitializeWithItem { void Initialize(IntPtr item, uint mode); }
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [ComImport, Guid("8895b1c6-b41f-4c1c-a562-0d564250836f"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IPreviewHandler {
@@ -42,15 +43,18 @@ public static class PreviewTest {
         Marshal.ThrowExceptionForHR(get(ref c, ref i, out f));
     }
     // Shows the file in the panel, lets it paint, saves a picture of it
-    public static void Show(string file, System.Windows.Forms.Control panel, string png) {
+    [ComImport, Guid("196bf9a5-b346-4ef0-aa1e-5dcdb76768b1"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPreviewHandlerVisuals { void SetBackgroundColor(uint c); void SetFont(IntPtr f); void SetTextColor(uint c); }
+    public static void Show(string file, System.Windows.Forms.Control panel, string png, bool dark) {
         Guid i = typeof(IPreviewHandler).GUID; object o;
         f.CreateInstance(null, ref i, out o);
-        IntPtr stream;
-        Marshal.ThrowExceptionForHR(SHCreateStreamOnFileEx(file, 0x20 /* STGM_SHARE_DENY_WRITE */, 0, false, IntPtr.Zero, out stream));
-        ((IInitializeWithStream)o).Initialize(stream, 0);
-        Marshal.Release(stream);
+        IntPtr item; Guid itemId = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");    // IShellItem
+        Marshal.ThrowExceptionForHR(SHCreateItemFromParsingName(file, IntPtr.Zero, ref itemId, out item));
+        ((IInitializeWithItem)o).Initialize(item, 0);
+        Marshal.Release(item);
         var ph = (IPreviewHandler)o;
         var rc = new RECT { Right = panel.ClientSize.Width, Bottom = panel.ClientSize.Height };
+        if (dark) { ((IPreviewHandlerVisuals)o).SetBackgroundColor(0x202020); ((IPreviewHandlerVisuals)o).SetTextColor(0xFFFFFF); panel.BackColor = Color.FromArgb(32, 32, 32); }
         ph.SetWindow(panel.Handle, ref rc);
         ph.DoPreview();
         for (int k = 0; k < 20; k++) { System.Windows.Forms.Application.DoEvents(); System.Threading.Thread.Sleep(25); }
@@ -77,7 +81,7 @@ $n = 0
 foreach ($file in $Files) {
     $n++
     $png = Join-Path $Out ('{0:D2}_{1}.png' -f $n, ([IO.Path]::GetFileName($file) -replace '[^\w.-]', '_'))
-    try { [PreviewTest]::Show($file, $panel, $png); "ok    $file" }
+    try { [PreviewTest]::Show($file, $panel, $png, $Dark); "ok    $file" }
     catch { "ERROR $file : $($_.Exception.Message)" }
 }
 $form.Close()

@@ -68,13 +68,22 @@ tree** opens the whole folder tree with one color per study.
 - **Thumbnails** (medium icons and larger, unless *Always show icons, never thumbnails* is on): the
   first frame, with the series icon as a badge in its lower right corner. DICOM files without an image
   (reports, DICOMDIR) keep their icon.
-- **Preview of the DICOM files** (Explorer's preview pane, Alt+P): the image (the first frame, with
-  the window of its header) and, below it, the whole header, one line per attribute, with its tag
-  `(0010,0010)` or its name from the DICOM dictionary `PatientName` (*Show names* / *Show tags*, or
-  Ctrl+T; the choice is remembered). The header can be selected and copied (Ctrl+A, Ctrl+C).
+- **Preview of the DICOM files** (Explorer's preview pane, Alt+P): three tabs over the image.
+  - *Columns*: every DICOM column with its value for this file, and a check box that shows or hides
+    that column in the Explorer window of the folder (as *right-click a column header > More...*
+    would; Explorer keeps it with the folder's view).
+  - *Header*: the whole header, one line per attribute, with its name from the DICOM dictionary
+    (`PatientName`).
+  - *Tags*: the same with its tags (`(0010,0010)`). Ctrl+T switches between the two headers.
+
+  Text and rows can be selected and copied (Ctrl+A, Ctrl+C). The tab chosen is remembered for each
+  folder. The image is the first frame, with the window of its header. Dragging over it changes the
+  window: right widens it (less contrast), up makes it brighter. A double click goes back to the
+  header's window. The bar between the tabs and the image moves (remembered for every preview).
   Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
-  JPEG 2000 pixel data (not deflated files). It uses DCMTK and OpenJPEG, inside the same DLL, and
-  Windows runs it in a process of its own (`prevhost.exe`).
+  JPEG 2000 pixel data (not deflated files). It uses DCMTK and OpenJPEG, inside the same DLL.
+  Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
+  usual low one: the low one cannot reach the Explorer window, and the *Columns* tab needs it.
 - **Hovering a DICOM file** shows its modality, series number and description, instance number,
   plane, Z level, acquisition time and copies; those and more are in the Details pane (Alt+Shift+P)
   and in *Properties > Details*.
@@ -223,8 +232,8 @@ menu, so the menu cannot tell a counted folder from one that is not.
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
-| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), and `HKCU\Software\DicomStudyCount\Preview` (tags or names) | `-Uninstall` (Explorer frees the DLL when it restarts) |
-| Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID`, the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (when they had none) and the registered schema | `-Uninstall` (asks for administrator rights) |
+| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (when they had none) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 
 The tool never modifies, moves or deletes DICOM files. The reports and the index contain file paths

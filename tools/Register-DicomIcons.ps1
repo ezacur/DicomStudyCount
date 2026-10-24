@@ -32,6 +32,7 @@ $previewList = 'Software\Microsoft\Windows\CurrentVersion\PreviewHandlers'
 $classes = 'Software\Classes'
 $sfa = 'Software\Classes\SystemFileAssociations'
 $state = 'Software\DicomStudyCount\IconHandler'      # what was registered, to undo only that
+$previewSettings = 'Software\DicomStudyCount\Preview'  # the split, and the tab of each folder
 $types = @(
     @{ Ext = '.'; ProgId = 'DicomStudyCount.NoExtension'; Name = 'File' },
     @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' },
@@ -117,6 +118,7 @@ if ($Uninstall) {
     $list = $hkcu.OpenSubKey($previewList, $true)
     if ($list) { $list.DeleteValue($previewClsid, $false) }
     Remove-Key $state
+    Remove-Key $previewSettings
     [DicomIconsSetup.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)   # SHCNE_ASSOCCHANGED
     Write-Host 'DICOM file icons, preview and thumbnails unregistered (Explorer frees the DLL when it restarts).'
     return
@@ -134,12 +136,16 @@ foreach ($c in @(@($clsid, 'DicomStudyCount: icons of DICOM files'), @($previewC
                  @($thumbClsid, 'DicomStudyCount: thumbnails of DICOM files'))) {
     $k = $hkcu.CreateSubKey("$classes\CLSID\$($c[0])")
     $k.SetValue('', $c[1])
+    # (Its DisableLowILProcessIsolation goes to HKLM, where Explorer reads it: Register-DicomProperties.ps1)
     if ($c[0] -eq $previewClsid) { $k.SetValue('DisplayName', 'DICOM preview'); $k.SetValue('AppID', $prevhostAppId) }
     $k = $hkcu.CreateSubKey("$classes\CLSID\$($c[0])\InprocServer32")
     $k.SetValue('', $target)
     $k.SetValue('ThreadingModel', 'Apartment')
 }
 $hkcu.CreateSubKey($previewList).SetValue($previewClsid, 'DicomStudyCount: preview of DICOM files')
+# Tags or names, of the preview before its tabs
+$p = $hkcu.OpenSubKey($previewSettings, $true)
+if ($p) { $p.DeleteValue('HeaderNames', $false) }
 
 $s = $hkcu.CreateSubKey($state)
 foreach ($t in $types) {

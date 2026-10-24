@@ -178,7 +178,10 @@ if ($Install) {
     $server = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{21329A2B-09B3-4250-9103-9267877321EB}\InprocServer32')
     $installedSchema = Join-Path $env:ProgramFiles 'DicomStudyCount\DicomStudyCount.propdesc'
     $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
+    # (and the preview at medium integrity, also from HKLM)
+    $preview = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}')
     $upToDate = $server -and [IO.Path]::GetFileName([string]$server.GetValue('')) -eq "DicomShell-$dllHash.dll" -and
+        $preview -and $preview.GetValue('DisableLowILProcessIsolation') -eq 1 -and
         @('.', '.dcm', '.ima', '.dicom' | Where-Object { -not [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$handlers\$_") }).Count -eq 0 -and
         (Test-Path -LiteralPath $installedSchema) -and
         ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'bin\DicomStudyCount.propdesc')).Hash)
