@@ -744,7 +744,7 @@ namespace DicomStudyCount
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint size);
 
-        // The long form of a path ("C:\Users\ERNEST~1\x" -> "C:\Users\ErnestoCorify\x"): the same folder
+        // The long form of a path ("C:\Users\JOHNDO~1\x" -> "C:\Users\JohnDoe\x"): the same folder
         // reached through its 8.3 short name would otherwise be another location in the index (and its
         // files copies of themselves). The path as it is if Windows cannot tell.
         public static string Long(string path)

@@ -13,6 +13,9 @@
 //
 // And the preview (Explorer's preview pane) and the thumbnails of DICOM files, decoded with DCMTK.
 //
+// And the DICOM explorer: a window of its own, run by rundll32 (ExploreW), with the DICOM files of a
+// folder as a tree of patients, studies, series, orientations, positions and images.
+//
 // Registered by Count-DicomStudies.ps1 -Install for .dcm, .ima, .dicom and files without extension: the
 // icons, preview and thumbnails per user (tools\Register-DicomIcons.ps1), the properties for the
 // machine (tools\Register-DicomProperties.ps1).
@@ -25,6 +28,7 @@
 #include "dcmtk/dcmdata/dcpxitem.h"
 #include "dcmtk/dcmdata/dcrledrg.h"
 #include "dcmtk/dcmimgle/dcmimage.h"
+#include "dcmtk/dcmimgle/dipixel.h"
 #include "dcmtk/dcmimage/diregist.h"
 #include "dcmtk/dcmjpeg/djdecode.h"
 #include "dcmtk/dcmjpls/djdecode.h"
@@ -36,6 +40,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <shlwapi.h>
 #include <exdisp.h>
 #include <commctrl.h>
@@ -44,11 +49,19 @@
 #include <propsys.h>
 #include <propkey.h>
 #include <propvarutil.h>
+#include <wincodec.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <functional>
+#include <map>
 #include <new>
+#include <numeric>
+#include <regex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -64,9 +77,12 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "normaliz.lib")
 
 #pragma comment(linker, "/EXPORT:DllGetClassObject,PRIVATE")
 #pragma comment(linker, "/EXPORT:DllCanUnloadNow,PRIVATE")
+#pragma comment(linker, "/EXPORT:ExploreW")              // rundll32 DicomShell.dll,Explore <folder>
 
 // {F4798986-2EEA-49F6-8082-2FC552CE691B}
 static const CLSID CLSID_DicomIcons = { 0xF4798986, 0x2EEA, 0x49F6, { 0x80, 0x82, 0x2F, 0xC5, 0x52, 0xCE, 0x69, 0x1B } };
@@ -1224,6 +1240,7 @@ static std::wstring Compression(const std::string& ts)
         { "1.2.840.10008.1.2.4.111", L"JPEG XL (recompressed JPEG)" },
         { "1.2.840.10008.1.2.4.112", L"JPEG XL" },
         { "1.2.840.10008.1.2.8.1", L"Deflated image frames" },
+        { "1.3.46.670589.33.1.4.1", L"Philips PMSCT_RLE1 (private)" },
     };
     if (ts.empty()) return L"none (no meta information)";
     for (auto& n : names) if (ts == n.uid) return n.name;
@@ -1985,6 +2002,98 @@ static DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
     return out;
 }
 
+// Elscint / Philips PMSCT_RLE1 (transfer syntax 1.3.46.670589.33.1.4.1): some Elscint CT (later Picker,
+// Marconi, Philips) write the image into the private (07A1,100A), with the name of its codec in
+// (07A1,1011), and no (7FE0,0010). DCMTK has no decoder for it.
+static const char PmsctSyntax[] = "1.3.46.670589.33.1.4.1";
+
+static bool IsPmsct(DcmFileFormat& ff)
+{
+    OFString syntax, codec;
+    ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, syntax);
+    ff.getDataset()->findAndGetOFString(DcmTagKey(0x07A1, 0x1011), codec);
+    // (some say so in their transfer syntax, others only by having no pixel data)
+    return codec == "PMSCT_RLE1" && (syntax == PmsctSyntax || !ff.getDataset()->tagExists(DCM_PixelData));
+}
+
+// Its pixels, as pmsct_decode.cpp (mTools) decodes them: a run-length pass (0xA5, count - 1, byte) and
+// then a delta pass (each byte a signed step from the value before; 0x5A, low, high: a value). A copy
+// of the dataset with them as native 16-bit pixel data; null if the stream is short or broken.
+static DcmDataset* DecodePmsct(DcmDataset* ds)
+{
+    DcmElement* e = nullptr;
+    if (ds->findAndGetElement(DcmTagKey(0x07A1, 0x100A), e).bad() || !e) return nullptr;
+    const Uint32 length = e->getLength();
+    std::vector<Uint8> in(length);
+    Uint8* bytes = nullptr;
+    Uint16* words = nullptr;
+    if (e->getUint8Array(bytes).good() && bytes) memcpy(in.data(), bytes, length);
+    else if (e->getUint16Array(words).good() && words) memcpy(in.data(), words, length);
+    else return nullptr;
+    std::vector<Uint8> runs;
+    runs.reserve(static_cast<size_t>(length) * 2);
+    for (size_t i = 0; i < in.size(); i++)
+    {
+        if (in[i] != 0xA5) { runs.push_back(in[i]); continue; }
+        if (i + 2 >= in.size()) return nullptr;
+        runs.insert(runs.end(), static_cast<size_t>(in[i + 1]) + 1, in[i + 2]);
+        i += 2;
+    }
+    std::vector<Uint16> out;
+    out.reserve(runs.size());
+    Uint16 value = 0;
+    for (size_t i = 0; i < runs.size(); i++)
+    {
+        if (runs[i] == 0x5A)
+        {
+            if (i + 2 >= runs.size()) return nullptr;
+            value = static_cast<Uint16>(runs[i + 2] * 256 + runs[i + 1]);
+            i += 2;
+        }
+        else value = static_cast<Uint16>(static_cast<int>(static_cast<Sint8>(runs[i])) + value);
+        out.push_back(value);
+    }
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    const size_t n = static_cast<size_t>(rows) * columns;
+    if (n == 0 || out.size() < n) return nullptr;
+    auto copy = new DcmDataset(*ds);
+    copy->findAndDeleteElement(DcmTagKey(0x07A1, 0x100A));
+    copy->findAndDeleteElement(DCM_PixelData);
+    copy->putAndInsertUint16Array(DCM_PixelData, out.data(), static_cast<unsigned long>(n));
+    copy->putAndInsertUint16(DCM_BitsAllocated, 16);
+    Uint16 stored = 0;
+    if (copy->findAndGetUint16(DCM_BitsStored, stored).bad() || stored == 0 || stored > 16) copy->putAndInsertUint16(DCM_BitsStored, 16);
+    copy->findAndGetUint16(DCM_BitsStored, stored);
+    copy->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(stored - 1));
+    copy->putAndInsertUint16(DCM_SamplesPerPixel, 1);
+    OFString photometric;
+    if (copy->findAndGetOFString(DCM_PhotometricInterpretation, photometric).bad() || photometric.empty())
+        copy->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+    copy->findAndDeleteElement(DCM_NumberOfFrames);
+    return copy;
+}
+
+// Why a file has no image to show: it has no pixels (a report, a PDF, a presentation state...), or
+// they are in a transfer syntax that is not known here. Empty if it may have one.
+static std::wstring NoImage(DcmFileFormat& ff)
+{
+    OFString syntax;
+    ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, syntax);
+    if (IsPmsct(ff)) return std::wstring();
+    if (!syntax.empty() && DcmXfer(syntax.c_str()).getXfer() == EXS_Unknown) return Compression(syntax.c_str()) + L" is not supported";
+    if (!ff.getDataset()->tagExists(DCM_PixelData))
+    {
+        if (ff.getDataset()->tagExists(DCM_FloatPixelData) || ff.getDataset()->tagExists(DCM_DoubleFloatPixelData))
+            return L"its pixels are floating point numbers, not supported here";
+        OFString sop;
+        ff.getDataset()->findAndGetOFString(DCM_SOPClassUID, sop);
+        return L"it has no pixels (" + (sop.empty() ? std::wstring(L"no SOP class") : ObjectType(sop.c_str())) + L")";
+    }
+    return std::wstring();
+}
+
 // The records of a DICOMDIR, as a tree: each one points to the next one of its level and to the first
 // one under it by their offsets in the file, which DCMTK keeps for each record it reads. (Not by
 // DcmDicomDir, which writes the file back when it finds something to correct in it.) Never who the
@@ -2095,10 +2204,17 @@ static std::wstring ShowFrame(Rendered& r, int frame, bool keep)
     r.width = r.height = 0;
     DcmFileFormat& ff = *im->file;
     auto& decoded = im->decoded;
+    const std::wstring none = NoImage(ff);
+    if (!none.empty()) return none;
     if (IsJpeg2000(im->xfer))
     {
         decoded.reset(DecodeJpeg2000(ff.getDataset(), r.frames > 1, frame));
         if (!decoded) return L"its JPEG 2000 data could not be decoded";
+    }
+    else if (IsPmsct(ff))
+    {
+        decoded.reset(DecodePmsct(ff.getDataset()));
+        if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
     }
     im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
                                              decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData,
@@ -2189,6 +2305,7 @@ static Rendered RenderDicom(const std::vector<char>& data, Render what = Render:
     ds->findAndGetOFString(DCM_SOPClassUID, sopClass);
     im->xfer = ds->getOriginalXfer();
     tsUid = DcmXfer(im->xfer).getXferID();
+    ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, tsUid);      // (the one of the file: a private one too)
     Sint32 frames = 1;
     if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
     r.frames = frames;
@@ -2219,7 +2336,7 @@ static Rendered RenderDicom(const std::vector<char>& data, Render what = Render:
                     L", " + std::to_wstring(files) + L" files";
     }
     r.imaging = im;
-    if (ds->tagExists(DCM_PixelData))
+    if (ds->tagExists(DCM_PixelData) || IsPmsct(ff))
     {
         // Only the frame shown is decoded: a multi-frame file can be large
         const std::wstring why = ShowFrame(r, 0, false);
@@ -2758,6 +2875,46 @@ public:
         return site ? site->QueryInterface(riid, ppv) : E_FAIL;
     }
 
+    // The DICOM explorer hosts it in its window: only the image (no tabs), of the files it gives, and
+    // tells it which one is shown when the slider or the cine moves (`moved`)
+    HRESULT Host(HWND host, const RECT& rc)
+    {
+        hosted = true;
+        parent = host;
+        bounds = rc;
+        return CreateWindows();
+    }
+    void ShowFiles(const std::vector<std::wstring>& files, int index)
+    {
+        Play(false);
+        windowSet = false;
+        zoom = 1;
+        series = files;
+        slice = -1;
+        group = -1;
+        if (index >= 0 && index < static_cast<int>(files.size()))
+        {
+            GoSlice(index);
+            return;
+        }
+        const bool had = !view.pixels.empty();
+        view = Rendered();
+        view.summary = L"No image";
+        current.clear();
+        Shown(had);
+    }
+    void ShowIndex(int index) { GoSlice(index); }    // another one of the same files
+    std::function<void(int)> moved;
+    // The file shown and the window dragged over it (monochrome): the exports of the explorer take it
+    bool DraggedWindow(std::wstring& file, double& center, double& width) const
+    {
+        if (!windowSet || !view.imaging || !view.imaging->image || !view.imaging->mono) return false;
+        file = current;
+        center = view.imaging->center;
+        width = view.imaging->width;
+        return true;
+    }
+
 private:
     enum { TabColumns, TabHeader, TabTags, TabDirectory, TabCount };
     enum class Drag { None, Split, Window, Pan, Zoom, Track };
@@ -2823,6 +2980,7 @@ private:
     int slice = -1;                                 // the one shown, in `series`
     bool overlay = true, playing = false;
     bool plain = false;                             // not DICOM, and nothing before: only a line saying so
+    bool hosted = false;                            // in the DICOM explorer: the image alone
     bool stale = false;                             // its header and values are those of a slice shown before
     bool windowSet = false;                         // the window dragged: it stays from slice to slice
     HWND parent = nullptr, wnd = nullptr, edit = nullptr, list = nullptr, tree = nullptr;
@@ -2892,7 +3050,7 @@ private:
             if (!cls && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
         }
         // The tab of this folder (the columns at first), and the split of every preview
-        if (!folder.empty())
+        if (!folder.empty() && !hosted)
             tab = static_cast<int>(ReadDword(L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), TabColumns));
         if (tab < 0 || tab >= TabCount || tab == TabDirectory) tab = TabColumns;
         // A DICOMDIR opens on its tree
@@ -2913,7 +3071,7 @@ private:
                              OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         boldFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
-        if (plain)
+        if (plain || hosted)
         {
             Place();
             return S_OK;
@@ -3273,10 +3431,18 @@ private:
         RECT c;
         GetClientRect(wnd, &c);
         const int w = c.right, h = c.bottom, line = Px(22), bar = Px(6);
-        tabArea = { 0, 0, w, line + Px(4) };
+        tabArea = { 0, 0, w, hosted ? 0 : line + Px(4) };
         statusArea = { Px(4), h - line, w - Px(4), h };
         const int top = tabArea.bottom, bottom = h - line > top ? h - line : top;
-        if (!view.pixels.empty())
+        if (hosted)
+        {
+            // The image over all of it, its bar under it
+            const int image = bottom - line > top ? bottom - line : top;
+            contentArea = splitArea = {};
+            imageArea = { 0, top, w, image };
+            barArea = { 0, image, w, bottom };
+        }
+        else if (!view.pixels.empty())
         {
             const int image = bottom - line > top ? bottom - line : top;
             int y = top + static_cast<int>(static_cast<long long>(image - top - bar) * split / 1000);
@@ -3321,7 +3487,7 @@ private:
         for (int t : order)
         {
             tabRects[t] = {};
-            if (t == TabDirectory && !tree) continue;
+            if ((t == TabDirectory && !tree) || hosted) continue;
             SelectObject(dc, t == tab && boldFont ? boldFont : uiFont);
             SIZE ext = {};
             GetTextExtentPoint32W(dc, labels[t], static_cast<int>(wcslen(labels[t])), &ext);
@@ -3340,7 +3506,7 @@ private:
         }
         HBRUSH line = CreateSolidBrush(Dim(25));
         RECT under = { 0, tabArea.bottom - Px(1), c.right, tabArea.bottom };
-        FillRect(dc, &under, line);
+        if (!hosted) FillRect(dc, &under, line);
         if (splitArea.bottom > splitArea.top)
         {
             const int y = (splitArea.top + splitArea.bottom) / 2;
@@ -3614,9 +3780,10 @@ private:
         view = std::move(next);
         slice = i;
         current = series[i];
-        stale = true;
-        SetTimer(wnd, TimerSettle, 300, nullptr);
+        stale = !hosted;                            // (hosted: no header here to write)
+        if (stale) SetTimer(wnd, TimerSettle, 300, nullptr);
         SetWindowTextW(wnd, view.summary.c_str());
+        if (hosted && moved) moved(i);
         // In a DICOMDIR: the file in the tree too, when its series is open there
         if (tree && group >= 0 && group < static_cast<int>(groups.size()) && i < static_cast<int>(groups[group].items.size()) &&
             !selecting)
@@ -4176,6 +4343,4520 @@ private:
         return hr;
     }
 };
+
+// ---------------------------------------------------------------------------------------------
+// DICOM explorer (rundll32 DicomShell.dll,Explore <folder>; "DICOM explorer" in the DICOM menu of a
+// folder): the DICOM files under a folder as the tree of DCMexplorer.m / DICOMgather.m (mTools) -
+// patient, study, series, orientation (the plane and size of the images), position (the place of the
+// slice) and image. Beside the tree: what the chosen node is (its counts and main values), its image
+// (the preview, its slider over the files under the node, with the cine) and its full info: the
+// attributes all its files share, level by level (those of the image, those every image of its position
+// shares, those of its orientation, of its series...), and those that vary in it.
+
+// The values of the attributes of all the files, each text once (the files of a series share most)
+class ValuePool
+{
+public:
+    Uint32 Id(const std::wstring& v)
+    {
+        AcquireSRWLockExclusive(&lock);
+        Uint32 id = 0;
+        auto it = ids.find(v);
+        if (it != ids.end()) id = it->second;
+        else
+        {
+            id = static_cast<Uint32>(texts.size());
+            texts.push_back(v);
+            ids.emplace(v, id);
+        }
+        ReleaseSRWLockExclusive(&lock);
+        return id;
+    }
+    // (once the gathering is over: nothing writes then)
+    const std::wstring& Text(Uint32 id) const { return texts[id]; }
+
+private:
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::unordered_map<std::wstring, Uint32> ids;
+    std::vector<std::wstring> texts;
+};
+
+using Attributes = std::vector<std::pair<Uint32, Uint32>>;      // (tag, its value in the pool), by tag
+
+// A DICOM file of the explorer: what places it in the tree, and all its attributes
+struct Gathered
+{
+    std::wstring path;
+    std::string charset, patient, patientName, birthDate, study, studyDate, studyTime, studyDescription;
+    std::string series, seriesNumber, seriesDate, seriesTime, seriesDescription, modality;
+    std::string instance, trigger, time, orientationText, positionText;
+    double orientation[6] = {}, position[3] = {}, z = 0;
+    bool oriented = false, placed = false, hasZ = false;
+    unsigned rows = 0, columns = 0;
+    long frames = 1;
+    long long bytes = 0;
+    Attributes attributes;
+};
+
+// Who the patient of a file is, beyond its PatientID: its birth date (its digits) and the words of its
+// name, in capitals, without accents and in alphabetical order ("Garcia^Juan", "JUAN GARCIA" and "garcia,
+// juan" are the same name, with an accent on the i too). Some exports put the same placeholder in the PatientID of everyone (9999), and files
+// without one all have the same empty one: these tell their people apart.
+struct Person
+{
+    std::string birth;
+    std::wstring name;                              // its words, in order, one space between them
+    std::vector<std::wstring> words;
+    bool Empty() const { return birth.empty() && name.empty(); }
+};
+
+static Person PersonOf(const std::string& name, const std::string& charset, const std::string& birth)
+{
+    Person p;
+    for (char c : birth) if (c >= '0' && c <= '9') p.birth += c;
+    const std::wstring w = Widen(name, charset);
+    // Decomposed, the accents are marks of their own (not letters), and go
+    std::wstring d = w;
+    const int n = NormalizeString(NormalizationD, w.c_str(), static_cast<int>(w.size()), nullptr, 0);
+    if (n > 0)
+    {
+        d.assign(static_cast<size_t>(n), L'\0');
+        const int k = NormalizeString(NormalizationD, w.c_str(), static_cast<int>(w.size()), &d[0], n);
+        d.resize(k > 0 ? static_cast<size_t>(k) : 0);
+    }
+    // Its words (what is not a letter separates them), in alphabetical order: "JUAN GARCIA" is "GARCIA^JUAN"
+    std::wstring word;
+    for (wchar_t c : d + L" ")
+    {
+        if (IsCharAlphaW(c)) { word += c; continue; }
+        if (word.empty()) continue;
+        CharUpperBuffW(&word[0], static_cast<DWORD>(word.size()));
+        p.words.push_back(word);
+        word.clear();
+    }
+    std::sort(p.words.begin(), p.words.end());
+    p.words.erase(std::unique(p.words.begin(), p.words.end()), p.words.end());
+    for (const auto& w2 : p.words) p.name += (p.name.empty() ? L"" : L" ") + w2;
+    return p;
+}
+
+// The same person, as far as they tell: what both have agrees. A missing birth date or name does not
+// tell them apart, nor a name with fewer words than the other one (a second name, or surname, left out),
+// nor an initial for a word ("R" for "RAVI"). With the same birth date in both, a word in common is enough
+// (a name written two ways); and with only the year of the birth date apart, a word in common too (a
+// mistake in the year, or an anonymizer that moves it)
+static bool SamePerson(const Person& a, const Person& b)
+{
+    auto common = [&]() {
+        for (const auto& w : a.words) if (std::binary_search(b.words.begin(), b.words.end(), w)) return true;
+        return false;
+    };
+    if (!a.birth.empty() && !b.birth.empty() && a.birth != b.birth)
+        return a.birth.size() == 8 && b.birth.size() == 8 && a.birth.compare(4, 4, b.birth, 4, 4) == 0 && common();
+    if (a.words.empty() || b.words.empty()) return true;
+    if (!a.birth.empty() && a.birth == b.birth)
+        for (const auto& w : a.words)
+            if (std::binary_search(b.words.begin(), b.words.end(), w)) return true;
+    const auto& few = a.words.size() <= b.words.size() ? a.words : b.words;
+    const auto& many = a.words.size() <= b.words.size() ? b.words : a.words;
+    std::vector<bool> used(many.size(), false);
+    for (const auto& w : few)
+    {
+        size_t k = 0;
+        for (; k < many.size(); k++)
+        {
+            if (used[k]) continue;
+            const auto& x = many[k];
+            if (x == w || (w.size() == 1 && x[0] == w[0]) || (x.size() == 1 && w[0] == x[0])) break;
+        }
+        if (k == many.size()) return false;
+        used[k] = true;
+    }
+    return true;
+}
+
+enum class Found { Other, Dicom, Directory };
+
+// A file, if it is DICOM (a DICOMDIR is not one of the files): its header up to the pixels, by DCMTK.
+// Values of more than 4 KB are not read: their size stands for them.
+static Found GatherFile(const std::wstring& path, long long bytes, Gathered& g, ValuePool& pool)
+{
+    {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return Found::Other;
+        unsigned char head[132];
+        DWORD n = 0;
+        const BOOL ok = ReadFile(h, head, sizeof(head), &n, nullptr);
+        CloseHandle(h);
+        if (!ok || !LooksDicom(head, n)) return Found::Other;
+    }
+    DcmFileFormat ff;
+    if (ff.loadFileUntilTag(OFFilename(path.c_str(), OFTrue), EXS_Unknown, EGL_noChange, 4096, ERM_autoDetect, DCM_PixelData).bad())
+        return Found::Other;
+    DcmDataset* ds = ff.getDataset();
+    auto get = [&](const DcmTagKey& key) {
+        OFString v;
+        ds->findAndGetOFStringArray(key, v);
+        return std::string(v.c_str(), v.length());
+    };
+    if (get(DCM_SOPClassUID) == DirectorySopClass || ds->tagExists(DCM_DirectoryRecordSequence)) return Found::Directory;
+    g.path = path;
+    g.bytes = bytes;
+    g.charset = get(DCM_SpecificCharacterSet);
+    g.patient = get(DCM_PatientID);
+    g.patientName = get(DCM_PatientName);           // (only to tell apart people that share a PatientID)
+    g.birthDate = get(DCM_PatientBirthDate);
+    g.study = get(DCM_StudyInstanceUID);
+    g.studyDate = get(DCM_StudyDate);
+    g.studyTime = get(DCM_StudyTime);
+    g.studyDescription = get(DCM_StudyDescription);
+    g.series = get(DCM_SeriesInstanceUID);
+    g.seriesNumber = get(DCM_SeriesNumber);
+    g.seriesDate = get(DCM_SeriesDate);
+    g.seriesTime = get(DCM_SeriesTime);
+    g.seriesDescription = get(DCM_SeriesDescription);
+    g.modality = get(DCM_Modality);
+    g.instance = get(DCM_InstanceNumber);
+    g.trigger = get(DCM_TriggerTime);
+    g.time = get(DCM_AcquisitionDateTime);
+    if (g.time.empty()) g.time = get(DCM_AcquisitionDate) + get(DCM_AcquisitionTime);
+    if (g.time.empty()) g.time = get(DCM_ContentDate) + get(DCM_ContentTime);
+    g.orientationText = get(DCM_ImageOrientationPatient);
+    g.positionText = get(DCM_ImagePositionPatient);
+    g.oriented = Numbers(g.orientationText, g.orientation, 6);
+    g.placed = Numbers(g.positionText, g.position, 3);
+    Header h;
+    h.imageOrientation = g.orientationText;
+    h.imagePosition = g.positionText;
+    g.hasZ = ZLevel(h, g.z);
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    g.rows = rows;
+    g.columns = columns;
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).good() && frames > 1) g.frames = frames;
+    // All the attributes: the meta information, then the dataset (in the order of their tags)
+    for (DcmItem* item : { static_cast<DcmItem*>(ff.getMetaInfo()), static_cast<DcmItem*>(ds) })
+        for (unsigned long i = 0; item && i < item->card(); i++)
+        {
+            DcmElement* e = item->getElement(i);
+            if (!e) continue;
+            const DcmTag& tag = e->getTag();
+            std::wstring v;
+            if (e->ident() == EVR_SQ)
+            {
+                const unsigned long k = static_cast<DcmSequenceOfItems*>(e)->card();
+                v = L"(" + std::to_wstring(k) + (k == 1 ? L" item)" : L" items)");
+            }
+            else
+            {
+                v = ValueOf(e, item == ds ? g.charset : std::string());
+                if (v.size() >= 2 && v.front() == L'[' && v.back() == L']') v = v.substr(1, v.size() - 2);
+            }
+            g.attributes.emplace_back((static_cast<Uint32>(tag.getGTag()) << 16) | tag.getETag(), pool.Id(v));
+        }
+    return Found::Dicom;
+}
+
+// The files under a folder, found and read in a thread of its own (and the reading in a few more)
+struct Gathering
+{
+    std::wstring root;
+    HWND window = nullptr;
+    UINT message = 0;
+    std::atomic<bool> cancel{ false }, listing{ true };
+    std::atomic<long> found{ 0 }, done{ 0 };
+    std::vector<Gathered> files;                    // the DICOM ones (written before the message)
+    ValuePool pool;
+    long others = 0, directories = 0, offline = 0;
+    double seconds = 0;
+    std::thread thread;
+};
+
+static void Gather(Gathering* g)
+{
+    const ULONGLONG start = GetTickCount64();
+    struct Item { std::wstring path; long long bytes; };
+    std::vector<Item> items;
+    // The folders depth first, in the order of their names (as Explorer shows them)
+    std::vector<std::wstring> folders{ g->root };
+    while (!folders.empty() && !g->cancel)
+    {
+        const std::wstring folder = std::move(folders.back());
+        folders.pop_back();
+        const std::wstring base = folder + (!folder.empty() && folder.back() == L'\\' ? L"" : L"\\");
+        WIN32_FIND_DATAW fd;
+        HANDLE find = FindFirstFileExW((base + L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                       FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) continue;
+        std::vector<std::wstring> inside;
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                // (not into links: they can loop)
+                if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..") && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                    inside.push_back(base + fd.cFileName);
+                continue;
+            }
+            // Not downloaded (cloud files): reading them would download them
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) { g->offline++; continue; }
+            items.push_back({ base + fd.cFileName, (static_cast<long long>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow });
+            g->found++;
+        } while (!g->cancel && FindNextFileW(find, &fd));
+        FindClose(find);
+        std::sort(inside.begin(), inside.end(), [](const std::wstring& a, const std::wstring& b) { return StrCmpLogicalW(a.c_str(), b.c_str()) > 0; });
+        folders.insert(folders.end(), inside.begin(), inside.end());
+    }
+    g->listing = false;
+
+    std::vector<Gathered> read(items.size());
+    std::vector<Found> kinds(items.size(), Found::Other);
+    std::atomic<size_t> next{ 0 };
+    auto work = [&]() {
+        for (;;)
+        {
+            const size_t i = next++;
+            if (i >= items.size() || g->cancel) break;
+            try { kinds[i] = GatherFile(items[i].path, items[i].bytes, read[i], g->pool); }
+            catch (...) { kinds[i] = Found::Other; }
+            g->done++;
+        }
+    };
+    unsigned n = std::thread::hardware_concurrency();
+    n = n < 2 ? 2 : n > 6 ? 6 : n;
+    std::vector<std::thread> workers;
+    for (unsigned k = 0; k < n; k++) workers.emplace_back(work);
+    for (auto& w : workers) w.join();
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        if (kinds[i] == Found::Dicom) g->files.push_back(std::move(read[i]));
+        else if (kinds[i] == Found::Directory) g->directories++;
+        else g->others++;
+    }
+    g->seconds = (GetTickCount64() - start) / 1000.0;
+    if (!g->cancel) PostMessageW(g->window, g->message, 0, 0);
+}
+
+enum class Level { All, Patient, Study, Series, Orientation, Position, Image };
+
+// A node of the tree: the files under it (in the order of the tree), its children, and those shown in
+// the tree (compact: orientations and positions that add nothing are skipped)
+struct GatherNode
+{
+    Level level = Level::All;
+    int parent = -1, shownParent = -1;
+    std::vector<int> children, shown, files;
+    std::wstring text;
+    HTREEITEM item = nullptr;
+    bool filled = false;                            // its shown children are in the tree
+    bool hasCommon = false;
+    Attributes common;                              // the attributes all its files share
+    std::vector<std::wstring> problems, flags;      // what the checks found in it: in full, and in a word or two
+    std::vector<std::wstring> notes;                // what they found that is not a problem by itself
+    std::wstring person;                            // a patient whose PatientID other people share: a hash of who it is
+    int sharing = 1;                                // a patient: how many people have its PatientID
+};
+
+// Values that say who the patient is (and the names of the staff): hidden unless asked for
+static bool IdentifyingTag(Uint32 tag)
+{
+    static const Uint32 tags[] = {
+        0x00100010, 0x00100030, 0x00100032, 0x00101000, 0x00101001, 0x00101002, 0x00101005, 0x00101040,
+        0x00101060, 0x00102154, 0x00102155, 0x001021B0, 0x00080090, 0x00080092, 0x00080094, 0x00080081,
+        0x00081048, 0x00081050, 0x00081060, 0x00081070, 0x00321032, 0x00400006, 0x00380400, 0x00404037 };
+    return std::find(std::begin(tags), std::end(tags), tag) != std::end(tags);
+}
+
+static std::wstring TagText(Uint32 tag)
+{
+    wchar_t s[16];
+    swprintf_s(s, L"(%04X,%04X)", tag >> 16, tag & 0xFFFF);
+    return s;
+}
+
+static std::wstring TagName(Uint32 tag)
+{
+    DcmTag t(static_cast<Uint16>(tag >> 16), static_cast<Uint16>(tag & 0xFFFF));
+    std::wstring name = Widen(t.getTagName());
+    if (name == Widen(DcmTag_ERROR_TagName)) name.clear();
+    if (name.empty() && ((tag >> 16) & 1)) name = L"(private)";
+    return name;
+}
+
+static std::string Narrow(const std::wstring& w)
+{
+    std::string s;
+    for (wchar_t c : w) s += c < 128 ? static_cast<char>(c) : '?';
+    return s;
+}
+
+static void CopyText(HWND owner, const std::wstring& text)
+{
+    if (text.empty() || !OpenClipboard(owner)) return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory)
+    {
+        memcpy(GlobalLock(memory), text.c_str(), bytes);
+        GlobalUnlock(memory);
+        if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+    }
+    CloseClipboard();
+}
+
+// Explorer windows of the folders of these files, with them selected (the first ten folders)
+static void ShowInExplorer(const std::vector<std::wstring>& paths)
+{
+    std::vector<std::pair<std::wstring, std::vector<std::wstring>>> folders;
+    for (const auto& p : paths)
+    {
+        const size_t slash = p.find_last_of(L'\\');
+        if (slash == std::wstring::npos) continue;
+        const std::wstring folder = p.substr(0, slash == 2 ? 3 : slash);
+        auto it = std::find_if(folders.begin(), folders.end(), [&](const auto& f) { return f.first == folder; });
+        if (it == folders.end())
+        {
+            if (folders.size() >= 10) continue;
+            folders.push_back({ folder, {} });
+            it = folders.end() - 1;
+        }
+        it->second.push_back(p);
+    }
+    for (const auto& f : folders)
+    {
+        PIDLIST_ABSOLUTE dir = ILCreateFromPathW(f.first.c_str());
+        if (!dir) continue;
+        std::vector<PIDLIST_ABSOLUTE> items;
+        std::vector<PCUITEMID_CHILD> children;
+        for (const auto& p : f.second)
+        {
+            if (items.size() >= 4000) break;
+            if (PIDLIST_ABSOLUTE item = ILCreateFromPathW(p.c_str()))
+            {
+                items.push_back(item);
+                children.push_back(ILFindLastID(item));
+            }
+        }
+        SHOpenFolderAndSelectItems(dir, static_cast<UINT>(children.size()), children.data(), 0);
+        for (auto item : items) ILFree(item);
+        ILFree(dir);
+    }
+}
+
+// ----- Pixels for the explorer: the floating thumbnails of its tree, its exports (PNG, animated GIF,
+// NIfTI) and the thumbnails of its report
+
+// One frame of a file: its values (monochrome: the modality values, or the stored ones) or its colors
+struct Slice
+{
+    int width = 0, height = 0;
+    bool mono = true, inverse = false;             // inverse: MONOCHROME1, the low values white
+    int bits = 0;                                  // monochrome: of the stored values (negative: signed)
+    std::vector<float> values;                     // monochrome
+    std::vector<DWORD> rgb;                        // color: 0xRRGGBB
+    double rowSpacing = 0, columnSpacing = 0;      // PixelSpacing (mm), 0 if not known
+    double slope = 1, intercept = 0;               // the rescale of the file
+    double center = 0, window = 0;                 // the first window of the header (width 0: none)
+    double frameTime = 0;                          // a multi-frame file: ms from frame to frame (0: not known)
+};
+
+// The first number of a value ("40\400": 40)
+static bool FirstNumber(const std::string& value, double& out)
+{
+    char* end = nullptr;
+    out = strtod(value.c_str(), &end);
+    return end != value.c_str() && std::isfinite(out);
+}
+
+// A frame of a file, decoded as the preview decodes it (JPEG 2000 by OpenJPEG). Stored: the values as
+// they are in the file, without its rescale. An empty string if it is decoded; if not, why.
+static std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice& s)
+{
+    s = Slice();
+    InitDcmtk();
+    DcmFileFormat ff;
+    if (ff.loadFile(OFFilename(path.c_str(), OFTrue)).bad()) return L"not readable as DICOM";
+    DcmDataset* ds = ff.getDataset();
+    const E_TransferSyntax xfer = ds->getOriginalXfer();
+    const std::wstring none = NoImage(ff);
+    if (!none.empty()) return none;
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+    if (frame < 0 || frame >= frames) frame = 0;
+    auto get = [&](const DcmTagKey& key) {
+        OFString v;
+        ds->findAndGetOFStringArray(key, v, true);      // (deep: in the functional groups of enhanced files)
+        return std::string(v.c_str(), v.length());
+    };
+    double two[2], v = 0;
+    if (Numbers(get(DCM_PixelSpacing), two, 2) && two[0] > 0 && two[1] > 0) { s.rowSpacing = two[0]; s.columnSpacing = two[1]; }
+    if (FirstNumber(get(DCM_RescaleSlope), v) && v != 0) s.slope = v;
+    if (FirstNumber(get(DCM_RescaleIntercept), v)) s.intercept = v;
+    if (FirstNumber(get(DCM_WindowCenter), s.center) && FirstNumber(get(DCM_WindowWidth), v) && v >= 1) s.window = v;
+    if (FirstNumber(get(DCM_FrameTime), v) && v > 0) s.frameTime = v;
+    else if (FirstNumber(get(DCM_RecommendedDisplayFrameRate), v) && v > 0) s.frameTime = 1000 / v;
+    else if (FirstNumber(get(DCM_CineRate), v) && v > 0) s.frameTime = 1000 / v;
+
+    std::unique_ptr<DcmDataset> decoded;
+    if (IsJpeg2000(xfer))
+    {
+        decoded.reset(DecodeJpeg2000(ds, frames > 1, frame));
+        if (!decoded) return L"its JPEG 2000 data could not be decoded";
+    }
+    else if (IsPmsct(ff))
+    {
+        decoded.reset(DecodePmsct(ds));
+        if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
+    }
+    const unsigned long flags = CIF_UsePartialAccessToPixelData | (stored ? CIF_IgnoreModalityTransformation : 0);
+    DicomImage image(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer, flags,
+                     decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    if (image.getStatus() != EIS_Normal)
+    {
+        DcmXfer x(xfer);
+        if (x.isEncapsulated() && xfer != EXS_RLELossless && xfer != EXS_JPEGLSLossless && xfer != EXS_JPEGLSLossy &&
+            x.getJPEGProcess8Bit() == 0 && !decoded)
+            return Compression(x.getXferID()) + L" is not supported";
+        return Widen(DicomImage::getString(image.getStatus()));
+    }
+    const int w = static_cast<int>(image.getWidth()), h = static_cast<int>(image.getHeight());
+    if (w <= 0 || h <= 0) return L"it has no pixels";
+    const size_t n = static_cast<size_t>(w) * h;
+    s.width = w;
+    s.height = h;
+    s.mono = image.isMonochrome() != 0;
+    if (!s.mono)
+    {
+        const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
+        if (!out) return L"its pixels could not be rendered";
+        s.rgb.resize(n);
+        for (size_t i = 0; i < n; i++) s.rgb[i] = (static_cast<DWORD>(out[3 * i]) << 16) | (out[3 * i + 1] << 8) | out[3 * i + 2];
+        return std::wstring();
+    }
+    s.inverse = image.getPhotometricInterpretation() == EPI_Monochrome1;
+    const DiPixel* inter = image.getInterData();
+    if (!inter || !inter->getData() || inter->getCount() < n) return L"its pixels could not be read";
+    s.values.resize(n);
+    auto copy = [&](auto* p) { for (size_t i = 0; i < n; i++) s.values[i] = static_cast<float>(p[i]); };
+    const void* d = inter->getData();
+    switch (inter->getRepresentation())
+    {
+    case EPR_Uint8: copy(static_cast<const Uint8*>(d)); break;
+    case EPR_Sint8: copy(static_cast<const Sint8*>(d)); break;
+    case EPR_Uint16: copy(static_cast<const Uint16*>(d)); break;
+    case EPR_Sint16: copy(static_cast<const Sint16*>(d)); break;
+    case EPR_Uint32: copy(static_cast<const Uint32*>(d)); break;
+    case EPR_Sint32: copy(static_cast<const Sint32*>(d)); break;
+    default: return L"its pixels could not be read";
+    }
+    // The type of the stored values, from the header: DCMTK gives each frame the smallest one its values
+    // fit in, and another frame of the same file can need a larger one
+    Uint16 allocated = 0, representation = 0;
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    ds->findAndGetUint16(DCM_PixelRepresentation, representation);
+    s.bits = allocated <= 8 ? 8 : allocated <= 16 ? 16 : 32;
+    if (representation == 1) s.bits = -s.bits;
+    return std::wstring();
+}
+
+// 8-bit pixels, 0xRRGGBB, top-down
+struct Picture
+{
+    int width = 0, height = 0;
+    std::vector<DWORD> px;
+};
+
+static bool IsGray(const Picture& p)
+{
+    for (DWORD c : p.px)
+        if (((c >> 16) & 0xFF) != (c & 0xFF) || ((c >> 8) & 0xFF) != (c & 0xFF)) return false;
+    return true;
+}
+
+// The box of some planes (the same size) where they are not background: the pixels farther than `radius`
+// from any background one (value <= background), one more around - crop( I , 1 , ~imdilate( I == 0 ,
+// ball(R) ) ) of DICOMstackCollect.m, by a chamfer distance (3 a step, 4 a diagonal). Inside `within`;
+// all of it if there is no such pixel.
+static RECT ContentBox(const std::vector<const float*>& planes, int w, const RECT& within, float background, double radius)
+{
+    const int bw = within.right - within.left, bh = within.bottom - within.top;
+    if (bw <= 0 || bh <= 0) return within;
+    std::vector<int> d(static_cast<size_t>(bw) * bh);
+    const int big = 1 << 28, limit = static_cast<int>(radius * 3);
+    int left = bw, top = bh, right = -1, bottom = -1;
+    for (const float* p : planes)
+    {
+        for (int y = 0; y < bh; y++)
+        {
+            const float* row = p + static_cast<size_t>(y + within.top) * w + within.left;
+            for (int x = 0; x < bw; x++) d[static_cast<size_t>(y) * bw + x] = row[x] <= background ? 0 : big;
+        }
+        for (int y = 0; y < bh; y++)
+            for (int x = 0; x < bw; x++)
+            {
+                int& v = d[static_cast<size_t>(y) * bw + x];
+                if (!v) continue;
+                if (x > 0) v = (std::min)(v, d[static_cast<size_t>(y) * bw + x - 1] + 3);
+                if (y > 0)
+                {
+                    const int* up = &d[static_cast<size_t>(y - 1) * bw];
+                    v = (std::min)(v, up[x] + 3);
+                    if (x > 0) v = (std::min)(v, up[x - 1] + 4);
+                    if (x + 1 < bw) v = (std::min)(v, up[x + 1] + 4);
+                }
+            }
+        for (int y = bh - 1; y >= 0; y--)
+            for (int x = bw - 1; x >= 0; x--)
+            {
+                int& v = d[static_cast<size_t>(y) * bw + x];
+                if (!v) continue;
+                if (x + 1 < bw) v = (std::min)(v, d[static_cast<size_t>(y) * bw + x + 1] + 3);
+                if (y + 1 < bh)
+                {
+                    const int* down = &d[static_cast<size_t>(y + 1) * bw];
+                    v = (std::min)(v, down[x] + 3);
+                    if (x > 0) v = (std::min)(v, down[x - 1] + 4);
+                    if (x + 1 < bw) v = (std::min)(v, down[x + 1] + 4);
+                }
+                if (v > limit)
+                {
+                    left = (std::min)(left, x);
+                    right = (std::max)(right, x);
+                    top = (std::min)(top, y);
+                    bottom = (std::max)(bottom, y);
+                }
+            }
+    }
+    if (right < 0) return within;
+    return { within.left + (std::max)(0, left - 1), within.top + (std::max)(0, top - 1),
+             within.left + (std::min)(bw, right + 2), within.top + (std::min)(bh, bottom + 2) };
+}
+
+// Two percentiles of the values of some planes inside a box (from a sample of 2 million at most)
+static void Percentiles(const std::vector<const float*>& planes, int w, const RECT& box, double p, double q, double& a, double& b)
+{
+    const size_t area = static_cast<size_t>(box.right - box.left) * (box.bottom - box.top);
+    const size_t total = area * planes.size(), step = total > 2000000 ? total / 2000000 + 1 : 1;
+    std::vector<float> v;
+    v.reserve(total / step + 1);
+    size_t k = 0;
+    for (const float* plane : planes)
+        for (int y = box.top; y < box.bottom; y++)
+            for (int x = box.left; x < box.right; x++, k++)
+                if (k % step == 0) v.push_back(plane[static_cast<size_t>(y) * w + x]);
+    if (v.empty()) { a = 0; b = 1; return; }
+    auto at = [&](double share) {
+        const size_t i = static_cast<size_t>(share * (v.size() - 1) + 0.5);
+        std::nth_element(v.begin(), v.begin() + i, v.end());
+        return static_cast<double>(v[i]);
+    };
+    a = at(p);
+    b = at(q);
+}
+
+// A box of a slice as a picture of tw x th, each pixel the mean of those it covers; monochrome, the
+// values from lo to hi as black to white
+static Picture Shrink(const Slice& s, const RECT& box, double lo, double hi, int tw, int th)
+{
+    Picture p;
+    p.width = tw;
+    p.height = th;
+    p.px.resize(static_cast<size_t>(tw) * th);
+    const int left = box.left, top = box.top, bw = box.right - box.left, bh = box.bottom - box.top;
+    const double scale = hi > lo ? 255.0 / (hi - lo) : 0;
+    for (int y = 0; y < th; y++)
+    {
+        const int y0 = top + static_cast<int>(static_cast<long long>(y) * bh / th);
+        const int y1 = (std::max)(y0 + 1, top + static_cast<int>(static_cast<long long>(y + 1) * bh / th));
+        for (int x = 0; x < tw; x++)
+        {
+            const int x0 = left + static_cast<int>(static_cast<long long>(x) * bw / tw);
+            const int x1 = (std::max)(x0 + 1, left + static_cast<int>(static_cast<long long>(x + 1) * bw / tw));
+            double r = 0, g = 0, b = 0;
+            int k = 0;
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++, k++)
+                {
+                    const size_t i = static_cast<size_t>(yy) * s.width + xx;
+                    if (s.mono)
+                    {
+                        double v = (s.values[i] - lo) * scale;
+                        v = v < 0 ? 0 : v > 255 ? 255 : v;
+                        r += s.inverse ? 255 - v : v;
+                    }
+                    else
+                    {
+                        const DWORD c = s.rgb[i];
+                        r += (c >> 16) & 0xFF;
+                        g += (c >> 8) & 0xFF;
+                        b += c & 0xFF;
+                    }
+                }
+            DWORD c;
+            if (s.mono)
+            {
+                const DWORD q = static_cast<DWORD>(r / k + 0.5);
+                c = (q << 16) | (q << 8) | q;
+            }
+            else
+                c = (static_cast<DWORD>(r / k + 0.5) << 16) | (static_cast<DWORD>(g / k + 0.5) << 8) | static_cast<DWORD>(b / k + 0.5);
+            p.px[static_cast<size_t>(y) * tw + x] = c;
+        }
+    }
+    return p;
+}
+
+// The size of a box at most `most` pixels on its longer side, its pixels made square
+static void FitSize(const Slice& s, const RECT& box, int most, int& tw, int& th)
+{
+    double w = box.right - box.left, h = box.bottom - box.top;
+    if (s.rowSpacing > 0 && s.columnSpacing > 0) h = h * s.rowSpacing / s.columnSpacing;
+    const double k = (std::max)(w, h) > most ? most / (std::max)(w, h) : 1;
+    tw = (std::max)(1, static_cast<int>(std::lround(w * k)));
+    th = (std::max)(1, static_cast<int>(std::lround(h * k)));
+}
+
+static void Blit(Picture& to, const Picture& from, int x0, int y0)
+{
+    for (int y = 0; y < from.height; y++)
+        for (int x = 0; x < from.width; x++)
+        {
+            const int tx = x0 + x, ty = y0 + y;
+            if (tx >= 0 && ty >= 0 && tx < to.width && ty < to.height)
+                to.px[static_cast<size_t>(ty) * to.width + tx] = from.px[static_cast<size_t>(y) * from.width + x];
+        }
+}
+
+// The rows and columns of a mosaic of n (DICOMstackCollect.m): 1 x 1 to 1 x 3, 2 x 2, then from 2 x 3 a
+// column more and a row more in turns
+static void GridOf(int n, int& rows, int& cols)
+{
+    if (n <= 3) { rows = 1; cols = (std::max)(1, n); return; }
+    if (n == 4) { rows = cols = 2; return; }
+    rows = 2;
+    cols = 3;
+    for (int i = 1; rows * cols < n; i++) (i % 2 ? cols : rows)++;
+}
+
+// Tiles in a mosaic of `slots` (black where there is none), centered in cells of the largest one
+static Picture Mosaic(const std::vector<Picture>& tiles, int slots)
+{
+    int rows = 1, cols = 1, cw = 1, ch = 1;
+    GridOf(slots, rows, cols);
+    for (const auto& t : tiles) { cw = (std::max)(cw, t.width); ch = (std::max)(ch, t.height); }
+    const int gap = 2;
+    Picture m;
+    m.width = cols * cw + (cols - 1) * gap;
+    m.height = rows * ch + (rows - 1) * gap;
+    m.px.assign(static_cast<size_t>(m.width) * m.height, 0x303030);
+    for (int k = 0; k < rows * cols; k++)
+    {
+        const int x = (k % cols) * (cw + gap), y = (k / cols) * (ch + gap);
+        for (int yy = 0; yy < ch; yy++)
+            std::fill_n(m.px.begin() + static_cast<size_t>(y + yy) * m.width + x, cw, 0);
+        if (k < static_cast<int>(tiles.size()))
+            Blit(m, tiles[k], x + (cw - tiles[k].width) / 2, y + (ch - tiles[k].height) / 2);
+    }
+    return m;
+}
+
+// The orientations of a series one over the other (DCMthumbnail.m): each one 58 % of the one before
+// further down and to the right, with a border of its own color
+static Picture Cascade(const std::vector<Picture>& tiles, DWORD background)
+{
+    std::vector<POINT> at;
+    int x = 0, y = 0, w = 1, h = 1;
+    for (const auto& t : tiles)
+    {
+        at.push_back({ x, y });
+        w = (std::max)(w, x + t.width);
+        h = (std::max)(h, y + t.height);
+        x += t.width * 58 / 100;
+        y += t.height * 58 / 100;
+    }
+    Picture c;
+    c.width = w;
+    c.height = h;
+    c.px.assign(static_cast<size_t>(w) * h, background);
+    for (size_t k = 0; k < tiles.size(); k++)
+    {
+        Picture t = tiles[k];
+        const DWORD color = Palette[k % PaletteSize];
+        for (int yy = 0; yy < t.height; yy++)
+            for (int xx = 0; xx < t.width; xx++)
+                if (xx < 2 || yy < 2 || xx >= t.width - 2 || yy >= t.height - 2) t.px[static_cast<size_t>(yy) * t.width + xx] = color;
+        Blit(c, t, at[k].x, at[k].y);
+    }
+    return c;
+}
+
+// What a thumbnail or an export shows: positions (in their order), each one its images in time order
+struct Stack
+{
+    std::vector<std::vector<std::wstring>> files;
+    int frames = 1;                                 // one multi-frame file: its frames are the times
+    double delay = 0;                               // ms from time to time (0: not known)
+};
+
+struct Thumb
+{
+    std::vector<Picture> frames;
+    int delay = 100;                                // ms from frame to frame
+    std::wstring caption, error;                    // what it shows of the stack; why there is nothing
+};
+
+// `count` of 0..n-1 from `first` to `last`, evenly (round(linspace), once each)
+static std::vector<int> Spread(int first, int last, int count)
+{
+    std::vector<int> v;
+    for (int i = 0; i < count; i++)
+    {
+        const int k = count == 1 ? (first + last) / 2 : static_cast<int>(std::lround(first + (last - first) * static_cast<double>(i) / (count - 1)));
+        if (v.empty() || v.back() != k) v.push_back(k);
+    }
+    return v;
+}
+
+// The thumbnail of a stack, by the recipe of DICOMstackCollect.m: the background cropped, the values from
+// their 2nd to their 98th percentile (DICOMstackCollect takes the 10th and the 90th, which burns the
+// bright parts white), cropped again; several positions as a mosaic (all of them up to 30, 20 beyond:
+// from 5 % to 95 % past 50), several times as frames (all up to 50, 45 up to 100, 60 beyond);
+// not more than 300 files read. One position: up to `single` pixels; a mosaic: tiles up to `tile`.
+// Middle: only the middle position at the middle time.
+static Thumb StackThumb(const Stack& st, int single, int tile, bool middle, const std::atomic<bool>* cancel)
+{
+    Thumb out;
+    const int Z = static_cast<int>(st.files.size());
+    if (Z == 0 || st.files[0].empty()) { out.error = L"no files"; return out; }
+    const bool multiframe = st.frames > 1 && Z == 1 && st.files[0].size() == 1;
+    int T = multiframe ? st.frames : 1;
+    if (!multiframe) for (const auto& p : st.files) T = (std::max)(T, static_cast<int>(p.size()));
+    std::vector<int> zs, ts;
+    if (middle) { zs = { (Z - 1) / 2 }; ts = { (T - 1) / 2 }; }
+    else
+    {
+        zs = Z > 50 ? Spread(static_cast<int>(Z * 0.05), static_cast<int>(Z * 0.95), 20) : Z > 30 ? Spread(0, Z - 1, 20) : Spread(0, Z - 1, Z);
+        ts = T > 100 ? Spread(0, T - 1, 60) : T > 50 ? Spread(0, T - 1, 45) : Spread(0, T - 1, T);
+        if (zs.size() * ts.size() > 300)
+            ts = Spread(0, T - 1, (std::max)(10, static_cast<int>(300 / zs.size())));
+        if (zs.size() * ts.size() > 300)
+            zs = Spread(0, Z - 1, (std::max)(1, static_cast<int>(300 / ts.size())));
+    }
+    auto read = [&](int z, int t, Slice& s) {
+        const auto& p = st.files[z];
+        if (multiframe) return DecodeSlice(p[0], t, false, s);
+        return DecodeSlice(p[(std::min)(t, static_cast<int>(p.size()) - 1)], 0, false, s);
+    };
+    // The box and the window from some of them: all the positions at the middle time, or a few times
+    std::map<std::pair<int, int>, Slice> kept;
+    std::wstring why;
+    if (zs.size() > 1) for (int z : zs) why = read(z, ts[ts.size() / 2], kept[{ z, ts[ts.size() / 2] }]);
+    else for (int t : Spread(0, static_cast<int>(ts.size()) - 1, 8)) why = read(zs[0], ts[t], kept[{ zs[0], ts[t] }]);
+    for (auto it = kept.begin(); it != kept.end();)
+        it = it->second.width > 0 ? std::next(it) : kept.erase(it);
+    if (kept.empty()) { out.error = why.empty() ? L"no image" : why; return out; }
+    if (cancel && *cancel) return out;
+    const Slice& first = kept.begin()->second;
+    const int w = first.width, h = first.height;
+    const bool mono = first.mono;
+    std::vector<const float*> planes;
+    for (const auto& k : kept) if (k.second.width == w && k.second.height == h && k.second.mono && mono) planes.push_back(k.second.values.data());
+    RECT box = { 0, 0, w, h };
+    double lo = 0, hi = 255;
+    if (mono && !planes.empty())
+    {
+        float least = planes[0][0];
+        for (const float* p : planes) for (size_t i = 0; i < static_cast<size_t>(w) * h; i++) least = (std::min)(least, p[i]);
+        box = ContentBox(planes, w, box, least, 3.2);
+        Percentiles(planes, w, box, 0.02, 0.98, lo, hi);
+        if (hi <= lo) hi = lo + 1;
+        box = ContentBox(planes, w, box, static_cast<float>(lo), 7.2);
+    }
+    int tw = 1, th = 1;
+    FitSize(first, box, zs.size() > 1 ? tile : single, tw, th);
+    for (int t : ts)
+    {
+        std::vector<Picture> tiles;
+        for (int z : zs)
+        {
+            if (cancel && *cancel) return Thumb();
+            Slice fresh;
+            auto it = kept.find({ z, t });
+            const Slice* s = it != kept.end() ? &it->second : nullptr;
+            if (!s && read(z, t, fresh).empty()) s = &fresh;
+            if (s && s->width == w && s->height == h && s->mono == mono) tiles.push_back(Shrink(*s, box, lo, hi, tw, th));
+            else
+            {
+                Picture black;
+                black.width = tw;
+                black.height = th;
+                black.px.assign(static_cast<size_t>(tw) * th, 0);
+                tiles.push_back(std::move(black));
+            }
+        }
+        out.frames.push_back(tiles.size() == 1 ? std::move(tiles[0]) : Mosaic(tiles, static_cast<int>(tiles.size())));
+    }
+    double delay = st.delay > 0 ? st.delay : first.frameTime > 0 ? first.frameTime : 100;
+    delay *= static_cast<double>(T) / ts.size();
+    out.delay = static_cast<int>((std::max)(20.0, (std::min)(500.0, delay)));
+    if (!middle)
+    {
+        if (Z > 1) out.caption = (static_cast<int>(zs.size()) < Z ? std::to_wstring(zs.size()) + L" of " : L"") + std::to_wstring(Z) + L" positions";
+        if (T > 1)
+            out.caption += (out.caption.empty() ? L"" : L", ") + (static_cast<int>(ts.size()) < T ? std::to_wstring(ts.size()) + L" of " : L"") +
+                           std::to_wstring(T) + (multiframe ? L" frames" : L" times");
+    }
+    return out;
+}
+
+// ----- writing: PNG and animated GIF (by WIC), NIfTI
+
+// Gray pictures as 8-bit gray, color ones as 24-bit BGR, rows of a multiple of 4 bytes
+static void Pack(const Picture& p, bool gray, std::vector<BYTE>& bytes, UINT& stride)
+{
+    stride = ((gray ? 1 : 3) * p.width + 3) & ~3;
+    bytes.assign(static_cast<size_t>(stride) * p.height, 0);
+    for (int y = 0; y < p.height; y++)
+        for (int x = 0; x < p.width; x++)
+        {
+            const DWORD c = p.px[static_cast<size_t>(y) * p.width + x];
+            BYTE* b = &bytes[static_cast<size_t>(y) * stride + (gray ? x : 3 * x)];
+            if (gray) b[0] = static_cast<BYTE>(c & 0xFF);
+            else { b[0] = static_cast<BYTE>(c & 0xFF); b[1] = static_cast<BYTE>((c >> 8) & 0xFF); b[2] = static_cast<BYTE>((c >> 16) & 0xFF); }
+        }
+}
+
+template <class T> static void Free(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+static HRESULT EncodePng(IWICImagingFactory* factory, IStream* out, const Picture& p)
+{
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    HRESULT hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+    if (SUCCEEDED(hr)) hr = encoder->Initialize(out, WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, &props);
+    if (SUCCEEDED(hr)) hr = frame->Initialize(props);
+    if (SUCCEEDED(hr)) hr = frame->SetSize(p.width, p.height);
+    const bool gray = IsGray(p);
+    WICPixelFormatGUID format = gray ? GUID_WICPixelFormat8bppGray : GUID_WICPixelFormat24bppBGR;
+    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
+    std::vector<BYTE> bytes;
+    UINT stride = 0;
+    Pack(p, gray, bytes, stride);
+    if (SUCCEEDED(hr)) hr = frame->WritePixels(p.height, stride, static_cast<UINT>(bytes.size()), bytes.data());
+    if (SUCCEEDED(hr)) hr = frame->Commit();
+    if (SUCCEEDED(hr)) hr = encoder->Commit();
+    Free(props);
+    Free(frame);
+    Free(encoder);
+    return hr;
+}
+
+static HRESULT SavePng(IWICImagingFactory* factory, const std::wstring& path, const Picture& p)
+{
+    IWICStream* stream = nullptr;
+    HRESULT hr = factory->CreateStream(&stream);
+    if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(hr)) hr = EncodePng(factory, stream, p);
+    Free(stream);
+    return hr;
+}
+
+// An animated GIF that loops for ever: gray frames with a palette of the 256 grays, color ones with a
+// palette of their own
+class GifWriter
+{
+public:
+    explicit GifWriter(IWICImagingFactory* f) : factory(f) {}
+    GifWriter(const GifWriter&) = delete;
+    GifWriter& operator=(const GifWriter&) = delete;
+    ~GifWriter() { Free(encoder); Free(stream); }
+
+    HRESULT Open(const std::wstring& path)
+    {
+        HRESULT hr = factory->CreateStream(&stream);
+        if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatGif, nullptr, &encoder);
+        if (SUCCEEDED(hr)) hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+        return hr;
+    }
+
+    HRESULT Add(const Picture& p, int delay)
+    {
+        if (first)
+        {
+            // The size of the animation, and its loop (the NETSCAPE2.0 extension: loop count 0)
+            first = false;
+            IWICMetadataQueryWriter* w = nullptr;
+            if (SUCCEEDED(encoder->GetMetadataQueryWriter(&w)))
+            {
+                PROPVARIANT v;
+                PropVariantInit(&v);
+                v.vt = VT_UI2;
+                v.uiVal = static_cast<USHORT>(p.width);
+                w->SetMetadataByName(L"/logscrdesc/Width", &v);
+                v.uiVal = static_cast<USHORT>(p.height);
+                w->SetMetadataByName(L"/logscrdesc/Height", &v);
+                static UCHAR application[] = { 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0' };
+                static UCHAR loop[] = { 3, 1, 0, 0, 0 };
+                v.vt = VT_UI1 | VT_VECTOR;
+                v.caub.cElems = sizeof(application);
+                v.caub.pElems = application;
+                w->SetMetadataByName(L"/appext/application", &v);
+                v.caub.cElems = sizeof(loop);
+                v.caub.pElems = loop;
+                w->SetMetadataByName(L"/appext/data", &v);
+                w->Release();
+            }
+        }
+        IWICBitmapFrameEncode* frame = nullptr;
+        IPropertyBag2* props = nullptr;
+        IWICPalette* palette = nullptr;
+        IWICBitmap* bitmap = nullptr;
+        IWICFormatConverter* converter = nullptr;
+        HRESULT hr = encoder->CreateNewFrame(&frame, &props);
+        if (SUCCEEDED(hr)) hr = frame->Initialize(props);
+        if (SUCCEEDED(hr))
+        {
+            IWICMetadataQueryWriter* w = nullptr;
+            if (SUCCEEDED(frame->GetMetadataQueryWriter(&w)))
+            {
+                PROPVARIANT v;
+                PropVariantInit(&v);
+                v.vt = VT_UI2;
+                v.uiVal = static_cast<USHORT>((std::max)(2, (delay + 5) / 10));     // (in hundredths)
+                w->SetMetadataByName(L"/grctlext/Delay", &v);
+                w->Release();
+            }
+        }
+        if (SUCCEEDED(hr)) hr = frame->SetSize(p.width, p.height);
+        if (SUCCEEDED(hr)) hr = factory->CreatePalette(&palette);
+        WICPixelFormatGUID format = GUID_WICPixelFormat8bppIndexed;
+        if (SUCCEEDED(hr) && IsGray(p))
+        {
+            hr = palette->InitializePredefined(WICBitmapPaletteTypeFixedGray256, FALSE);
+            if (SUCCEEDED(hr)) hr = frame->SetPalette(palette);
+            if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
+            std::vector<BYTE> bytes;
+            UINT stride = 0;
+            Pack(p, true, bytes, stride);
+            if (SUCCEEDED(hr)) hr = frame->WritePixels(p.height, stride, static_cast<UINT>(bytes.size()), bytes.data());
+        }
+        else if (SUCCEEDED(hr))
+        {
+            hr = factory->CreateBitmapFromMemory(p.width, p.height, GUID_WICPixelFormat32bppBGR, p.width * 4,
+                                                 static_cast<UINT>(p.px.size() * 4), reinterpret_cast<BYTE*>(const_cast<DWORD*>(p.px.data())), &bitmap);
+            if (SUCCEEDED(hr)) hr = palette->InitializeFromBitmap(bitmap, 256, FALSE);
+            if (SUCCEEDED(hr)) hr = factory->CreateFormatConverter(&converter);
+            if (SUCCEEDED(hr)) hr = converter->Initialize(bitmap, GUID_WICPixelFormat8bppIndexed, WICBitmapDitherTypeErrorDiffusion, palette, 0,
+                                                          WICBitmapPaletteTypeCustom);
+            if (SUCCEEDED(hr)) hr = frame->SetPalette(palette);
+            if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
+            if (SUCCEEDED(hr)) hr = frame->WriteSource(converter, nullptr);
+        }
+        if (SUCCEEDED(hr)) hr = frame->Commit();
+        Free(converter);
+        Free(bitmap);
+        Free(palette);
+        Free(props);
+        Free(frame);
+        return hr;
+    }
+
+    HRESULT Close()
+    {
+        HRESULT hr = encoder ? encoder->Commit() : E_UNEXPECTED;
+        Free(encoder);
+        Free(stream);
+        return hr;
+    }
+
+private:
+    IWICImagingFactory* factory;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    bool first = true;
+};
+
+// The NIfTI-1 header (348 bytes), the format of a single .nii file
+#pragma pack(push, 1)
+struct NiftiHeader
+{
+    int sizeof_hdr = 348;
+    char data_type[10] = {}, db_name[18] = {};
+    int extents = 0;
+    short session_error = 0;
+    char regular = 'r', dim_info = 0;
+    short dim[8] = {};
+    float intent_p1 = 0, intent_p2 = 0, intent_p3 = 0;
+    short intent_code = 0, datatype = 0, bitpix = 0, slice_start = 0;
+    float pixdim[8] = {};
+    float vox_offset = 352, scl_slope = 1, scl_inter = 0;
+    short slice_end = 0;
+    char slice_code = 0, xyzt_units = 0;
+    float cal_max = 0, cal_min = 0, slice_duration = 0, toffset = 0;
+    int glmax = 0, glmin = 0;
+    char descrip[80] = {}, aux_file[24] = {};
+    short qform_code = 0, sform_code = 0;
+    float quatern_b = 0, quatern_c = 0, quatern_d = 0, qoffset_x = 0, qoffset_y = 0, qoffset_z = 0;
+    float srow_x[4] = {}, srow_y[4] = {}, srow_z[4] = {};
+    char intent_name[16] = {}, magic[4] = { 'n', '+', '1', 0 };
+};
+#pragma pack(pop)
+static_assert(sizeof(NiftiHeader) == 348, "the NIfTI-1 header is 348 bytes");
+
+// The quaternion of a rotation (its columns: the directions of i, j and k), as nifti_mat44_to_quatern of
+// nifti1_io.c; qfac -1 when the columns make a left-handed system (the third one is turned)
+static void Quaternion(double R[3][3], double& qb, double& qc, double& qd, double& qfac)
+{
+    const double det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+                       R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+    qfac = 1;
+    if (det < 0)
+    {
+        qfac = -1;
+        for (int r = 0; r < 3; r++) R[r][2] = -R[r][2];
+    }
+    double a = R[0][0] + R[1][1] + R[2][2] + 1, b, c, d;
+    if (a > 0.5)
+    {
+        a = 0.5 * sqrt(a);
+        b = 0.25 * (R[2][1] - R[1][2]) / a;
+        c = 0.25 * (R[0][2] - R[2][0]) / a;
+        d = 0.25 * (R[1][0] - R[0][1]) / a;
+    }
+    else
+    {
+        const double xd = 1 + R[0][0] - (R[1][1] + R[2][2]), yd = 1 + R[1][1] - (R[0][0] + R[2][2]), zd = 1 + R[2][2] - (R[0][0] + R[1][1]);
+        if (xd > 1.0)
+        {
+            b = 0.5 * sqrt(xd);
+            c = 0.25 * (R[0][1] + R[1][0]) / b;
+            d = 0.25 * (R[0][2] + R[2][0]) / b;
+            a = 0.25 * (R[2][1] - R[1][2]) / b;
+        }
+        else if (yd > 1.0)
+        {
+            c = 0.5 * sqrt(yd);
+            b = 0.25 * (R[0][1] + R[1][0]) / c;
+            d = 0.25 * (R[1][2] + R[2][1]) / c;
+            a = 0.25 * (R[0][2] - R[2][0]) / c;
+        }
+        else
+        {
+            d = 0.5 * sqrt(zd);
+            b = 0.25 * (R[0][2] + R[2][0]) / d;
+            c = 0.25 * (R[1][2] + R[2][1]) / d;
+            a = 0.25 * (R[1][0] - R[0][1]) / d;
+        }
+        if (a < 0) { b = -b; c = -c; d = -d; }
+    }
+    qb = b;
+    qc = c;
+    qd = d;
+}
+
+// One file to write: a PNG, an animated GIF or a NIfTI volume
+struct ExportUnit
+{
+    enum Kind { Png, Gif, Nifti } kind = Png;
+    std::wstring out;
+    Stack stack;
+    bool overTime = false;                          // a GIF: through the times (a cine), or through the positions
+    // NIfTI: where the positions are (DICOM, mm), the plane, the spacings
+    bool placed = false, sameRescale = true;
+    double orientation[6] = {};
+    std::vector<std::array<double, 3>> positions;
+    double thickness = 0, timeStep = 0;
+    std::string description;
+};
+
+// The pictures of a unit: the window dragged in the preview, that of the header, or that of most of
+// the values (0.5 % to 99.5 %) of up to 8 of its images
+static std::wstring WritePictures(IWICImagingFactory* factory, const ExportUnit& u, bool dragged, double center, double width,
+                                  const std::atomic<bool>& cancel, std::atomic<long>& done, bool& wrote)
+{
+    const Stack& st = u.stack;
+    std::vector<std::pair<std::wstring, int>> order;         // (file, frame)
+    if (u.kind == ExportUnit::Png) order.push_back({ st.files[0][0], 0 });
+    else if (st.frames > 1 && st.files.size() == 1 && st.files[0].size() == 1)
+        for (int k = 0; k < st.frames; k++) order.push_back({ st.files[0][0], k });
+    else if (u.overTime) for (const auto& f : st.files[0]) order.push_back({ f, 0 });
+    else for (const auto& p : st.files) order.push_back({ p[0], 0 });
+    Slice first;
+    std::wstring why = DecodeSlice(order[0].first, order[0].second, false, first);
+    if (!why.empty()) return why;
+    double lo = 0, hi = 255;
+    if (first.mono)
+    {
+        if (dragged) { lo = center - width / 2; hi = center + width / 2; }
+        else if (first.window > 0) { lo = first.center - first.window / 2; hi = first.center + first.window / 2; }
+        else
+        {
+            std::vector<Slice> some(1, first);
+            for (int k : Spread(1, static_cast<int>(order.size()) - 1, (std::min)(7, static_cast<int>(order.size()) - 1)))
+            {
+                Slice s;
+                if (k > 0 && DecodeSlice(order[k].first, order[k].second, false, s).empty() && s.width == first.width && s.height == first.height && s.mono)
+                    some.push_back(std::move(s));
+            }
+            std::vector<const float*> planes;
+            for (const auto& s : some) planes.push_back(s.values.data());
+            Percentiles(planes, first.width, { 0, 0, first.width, first.height }, 0.005, 0.995, lo, hi);
+        }
+        if (hi <= lo) hi = lo + 1;
+    }
+    const RECT all = { 0, 0, first.width, first.height };
+    if (u.kind == ExportUnit::Png)
+    {
+        const HRESULT hr = SavePng(factory, u.out, Shrink(first, all, lo, hi, first.width, first.height));
+        done++;
+        wrote = SUCCEEDED(hr);
+        return wrote ? std::wstring() : L"it could not be written";
+    }
+    double delay = u.overTime ? (st.delay > 0 ? st.delay : first.frameTime > 0 ? first.frameTime : 100) : 80;
+    GifWriter gif(factory);
+    HRESULT hr = gif.Open(u.out);
+    long skipped = 0;
+    for (size_t k = 0; k < order.size() && SUCCEEDED(hr); k++)
+    {
+        if (cancel) return L"stopped";
+        Slice s;
+        const Slice* use = &first;
+        if (k > 0) use = DecodeSlice(order[k].first, order[k].second, false, s).empty() ? &s : nullptr;
+        if (use && use->width == first.width && use->height == first.height && use->mono == first.mono)
+            hr = gif.Add(Shrink(*use, all, lo, hi, first.width, first.height), static_cast<int>(delay));
+        else skipped++;
+        done++;
+    }
+    if (SUCCEEDED(hr)) hr = gif.Close();
+    if (FAILED(hr)) return L"it could not be written";
+    wrote = true;
+    return skipped ? std::to_wstring(skipped) + L" of its images could not be read (left out)" : std::wstring();
+}
+
+// A NIfTI-1 volume (.nii): columns, rows, positions and times, the values as stored with their rescale
+// in the header (or as 32-bit floats, rescaled, when the files do not share it); RGB as 24 bits. Its
+// place: the sform (and the qform) from ImagePositionPatient and ImageOrientationPatient, in RAS.
+static std::wstring WriteNifti(const ExportUnit& u, const std::atomic<bool>& cancel, std::atomic<long>& done, bool& wrote)
+{
+    const Stack& st = u.stack;
+    const int Z = static_cast<int>(st.files.size());
+    const bool multiframe = st.frames > 1 && Z == 1 && st.files[0].size() == 1;
+    const int T = multiframe ? st.frames : static_cast<int>(st.files[0].size());
+    auto path = [&](int z, int t) { return multiframe ? st.files[0][0] : st.files[z][t]; };
+    Slice first;
+    std::wstring why = DecodeSlice(path(0, 0), 0, true, first);
+    if (!why.empty()) return why;
+    NiftiHeader hd;
+    const bool asFloat = first.mono && !u.sameRescale;
+    if (!first.mono) { hd.datatype = 128; hd.bitpix = 24; }
+    else if (asFloat) { hd.datatype = 16; hd.bitpix = 32; }
+    else
+        switch (first.bits)
+        {
+        case 8: hd.datatype = 2; hd.bitpix = 8; break;
+        case -8: hd.datatype = 256; hd.bitpix = 8; break;
+        case 16: hd.datatype = 512; hd.bitpix = 16; break;
+        case -16: hd.datatype = 4; hd.bitpix = 16; break;
+        case 32: hd.datatype = 768; hd.bitpix = 32; break;
+        default: hd.datatype = 8; hd.bitpix = 32; break;
+        }
+    hd.dim[0] = T > 1 ? 4 : 3;
+    hd.dim[1] = static_cast<short>(first.width);
+    hd.dim[2] = static_cast<short>(first.height);
+    hd.dim[3] = static_cast<short>(Z);
+    hd.dim[4] = static_cast<short>(T);
+    for (int k = 5; k < 8; k++) hd.dim[k] = 1;
+    const double dc = first.columnSpacing > 0 ? first.columnSpacing : 1, dr = first.rowSpacing > 0 ? first.rowSpacing : 1;
+    hd.pixdim[0] = 1;
+    hd.pixdim[1] = static_cast<float>(dc);
+    hd.pixdim[2] = static_cast<float>(dr);
+    hd.pixdim[3] = static_cast<float>(u.thickness > 0 ? u.thickness : 1);
+    hd.pixdim[4] = static_cast<float>(T > 1 ? (u.timeStep > 0 ? u.timeStep : multiframe && first.frameTime > 0 ? first.frameTime : 1) : 0);
+    hd.xyzt_units = static_cast<char>(2 | (T > 1 ? 16 : 0));             // mm, ms
+    if (first.mono && !asFloat) { hd.scl_slope = static_cast<float>(first.slope); hd.scl_inter = static_cast<float>(first.intercept); }
+    if (first.mono && first.window > 0)
+    {
+        hd.cal_min = static_cast<float>(first.center - first.window / 2);
+        hd.cal_max = static_cast<float>(first.center + first.window / 2);
+    }
+    strncpy_s(hd.descrip, u.description.c_str(), _TRUNCATE);
+    if (u.placed && !u.positions.empty())
+    {
+        // i along the rows (the first 3 of the orientation), j down the columns, k from position to position;
+        // DICOM is LPS: x and y the other way round in RAS
+        const double* o = u.orientation;
+        double a[3], b[3], c[3], p[3];
+        for (int r = 0; r < 3; r++) { a[r] = o[r] * dc; b[r] = o[3 + r] * dr; p[r] = u.positions[0][r]; }
+        double n[3] = { o[1] * o[5] - o[2] * o[4], o[2] * o[3] - o[0] * o[5], o[0] * o[4] - o[1] * o[3] };
+        if (Z > 1) for (int r = 0; r < 3; r++) c[r] = (u.positions[Z - 1][r] - u.positions[0][r]) / (Z - 1);
+        else for (int r = 0; r < 3; r++) c[r] = n[r] * (u.thickness > 0 ? u.thickness : 1);
+        for (double* v : { a, b, c, p }) { v[0] = -v[0]; v[1] = -v[1]; }
+        n[0] = -n[0];
+        n[1] = -n[1];
+        const double step = sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+        if (Z > 1 && step > 0) hd.pixdim[3] = static_cast<float>(step);
+        for (int k = 0; k < 4; k++)
+        {
+            const double* col = k == 0 ? a : k == 1 ? b : k == 2 ? c : p;
+            hd.srow_x[k] = static_cast<float>(col[0]);
+            hd.srow_y[k] = static_cast<float>(col[1]);
+            hd.srow_z[k] = static_cast<float>(col[2]);
+        }
+        hd.sform_code = 1;                          // scanner
+        // The qform: the same, its third direction the normal of the plane (towards the positions)
+        const double na = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        double sign = c[0] * n[0] + c[1] * n[1] + c[2] * n[2] < 0 ? -1 : 1;
+        double R[3][3];
+        for (int r = 0; r < 3; r++)
+        {
+            R[r][0] = a[r] / dc;
+            R[r][1] = b[r] / dr;
+            R[r][2] = na > 0 ? sign * n[r] / na : 0;
+        }
+        double qb, qc, qd, qfac;
+        Quaternion(R, qb, qc, qd, qfac);
+        hd.quatern_b = static_cast<float>(qb);
+        hd.quatern_c = static_cast<float>(qc);
+        hd.quatern_d = static_cast<float>(qd);
+        hd.qoffset_x = static_cast<float>(p[0]);
+        hd.qoffset_y = static_cast<float>(p[1]);
+        hd.qoffset_z = static_cast<float>(p[2]);
+        hd.pixdim[0] = static_cast<float>(qfac);
+        hd.qform_code = 1;
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, u.out.c_str(), L"wb") || !f) return L"it could not be written";
+    const char extension[4] = {};
+    bool ok = fwrite(&hd, sizeof(hd), 1, f) == 1 && fwrite(extension, 4, 1, f) == 1;
+    const size_t n = static_cast<size_t>(first.width) * first.height;
+    std::vector<BYTE> bytes(n * hd.bitpix / 8);
+    long unread = 0;
+    for (int t = 0; t < T && ok; t++)
+        for (int z = 0; z < Z && ok; z++)
+        {
+            if (cancel) { fclose(f); return L"stopped"; }
+            Slice s;
+            const Slice* use = &first;
+            if (t > 0 || z > 0) use = DecodeSlice(path(z, t), multiframe ? t : 0, true, s).empty() ? &s : nullptr;
+            if (!use || use->width != first.width || use->height != first.height || use->mono != first.mono) { use = nullptr; unread++; }
+            std::fill(bytes.begin(), bytes.end(), static_cast<BYTE>(0));
+            for (size_t i = 0; use && i < n; i++)
+            {
+                if (!first.mono)
+                {
+                    const DWORD c = use->rgb[i];
+                    bytes[3 * i] = static_cast<BYTE>((c >> 16) & 0xFF);
+                    bytes[3 * i + 1] = static_cast<BYTE>((c >> 8) & 0xFF);
+                    bytes[3 * i + 2] = static_cast<BYTE>(c & 0xFF);
+                    continue;
+                }
+                const double v = use->values[i];
+                switch (hd.datatype)
+                {
+                case 16: { const float x = static_cast<float>(v * use->slope + use->intercept); memcpy(&bytes[4 * i], &x, 4); break; }
+                case 2: bytes[i] = static_cast<BYTE>((std::max)(0.0, (std::min)(255.0, v))); break;
+                case 256: { const Sint8 x = static_cast<Sint8>((std::max)(-128.0, (std::min)(127.0, v))); memcpy(&bytes[i], &x, 1); break; }
+                case 512: { const Uint16 x = static_cast<Uint16>((std::max)(0.0, (std::min)(65535.0, v))); memcpy(&bytes[2 * i], &x, 2); break; }
+                case 4: { const Sint16 x = static_cast<Sint16>((std::max)(-32768.0, (std::min)(32767.0, v))); memcpy(&bytes[2 * i], &x, 2); break; }
+                case 768: { const Uint32 x = static_cast<Uint32>((std::max)(0.0, (std::min)(4294967295.0, v))); memcpy(&bytes[4 * i], &x, 4); break; }
+                default: { const Sint32 x = static_cast<Sint32>((std::max)(-2147483648.0, (std::min)(2147483647.0, v))); memcpy(&bytes[4 * i], &x, 4); break; }
+                }
+            }
+            ok = fwrite(bytes.data(), bytes.size(), 1, f) == 1;
+            done++;
+        }
+    ok = fclose(f) == 0 && ok;
+    if (!ok) return L"it could not be written";
+    wrote = true;
+    return unread ? std::to_wstring(unread) + L" of its images could not be read (zeros there)" : std::wstring();
+}
+
+static std::string Base64(const std::vector<BYTE>& in)
+{
+    static const char digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < in.size(); i += 3)
+    {
+        const unsigned v = (in[i] << 16) | (i + 1 < in.size() ? in[i + 1] << 8 : 0) | (i + 2 < in.size() ? in[i + 2] : 0);
+        out += digits[(v >> 18) & 63];
+        out += digits[(v >> 12) & 63];
+        out += i + 1 < in.size() ? digits[(v >> 6) & 63] : '=';
+        out += i + 2 < in.size() ? digits[v & 63] : '=';
+    }
+    return out;
+}
+
+static std::string Utf8(const std::wstring& w)
+{
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// A picture as a PNG in a data: URL
+static std::string PngDataUrl(IWICImagingFactory* factory, const Picture& p)
+{
+    IStream* stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) return std::string();
+    std::string url;
+    if (SUCCEEDED(EncodePng(factory, stream, p)))
+    {
+        STATSTG stat = {};
+        HGLOBAL memory = nullptr;
+        if (SUCCEEDED(stream->Stat(&stat, STATFLAG_NONAME)) && SUCCEEDED(GetHGlobalFromStream(stream, &memory)))
+        {
+            const BYTE* b = static_cast<const BYTE*>(GlobalLock(memory));
+            if (b) url = "data:image/png;base64," + Base64(std::vector<BYTE>(b, b + stat.cbSize.QuadPart));
+            GlobalUnlock(memory);
+        }
+    }
+    stream->Release();
+    return url;
+}
+
+// A path that is not there yet: " (2)", " (3)"... before the extension when it is
+static std::wstring FreePath(const std::wstring& path)
+{
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return path;
+    const size_t dot = path.find_last_of(L'.'), slash = path.find_last_of(L'\\');
+    const bool hasDot = dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash);
+    const std::wstring stem = hasDot ? path.substr(0, dot) : path, ext = hasDot ? path.substr(dot) : L"";
+    for (int k = 2;; k++)
+    {
+        const std::wstring p = stem + L" (" + std::to_wstring(k) + L")" + ext;
+        if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) return p;
+    }
+}
+
+// The exports and the report, in a thread of their own; the window is told when they are over
+struct ExportJob
+{
+    std::vector<ExportUnit> units;
+    bool dragged = false;                           // the window dragged in the preview, for all of them
+    double center = 0, width = 0;
+    std::wstring report, reportPath;                // a report: its HTML, "{{thumb N}}" for the thumbnail of stacks[N]
+    std::vector<Stack> stacks;
+    HWND window = nullptr;
+    UINT message = 0;
+    std::atomic<bool> cancel{ false };
+    std::atomic<long> done{ 0 };
+    long total = 0;
+    std::vector<std::wstring> written, notes;       // (written before the message)
+    long withoutImage = 0;                          // orientations left out: no pixels in them
+    std::thread thread;
+};
+
+static void RunExport(ExportJob* j)
+{
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* factory = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) factory = nullptr;
+    if (!j->reportPath.empty())
+    {
+        // The thumbnails into the report, then the report into its file
+        std::vector<std::string> urls(j->stacks.size());
+        for (size_t i = 0; i < j->stacks.size() && !j->cancel; i++)
+        {
+            try
+            {
+                Thumb t = StackThumb(j->stacks[i], 128, 128, true, &j->cancel);
+                if (factory && !t.frames.empty()) urls[i] = PngDataUrl(factory, t.frames[0]);
+            }
+            catch (...) {}
+            j->done++;
+        }
+        if (!j->cancel)
+        {
+            std::string html;
+            const std::string page = Utf8(j->report);
+            size_t at = 0;
+            for (;;)
+            {
+                const size_t k = page.find("{{thumb ", at);
+                if (k == std::string::npos) { html += page.substr(at); break; }
+                html += page.substr(at, k - at);
+                const size_t end = page.find("}}", k);
+                const size_t i = static_cast<size_t>(atol(page.c_str() + k + 8));
+                html += i < urls.size() ? urls[i] : std::string();
+                at = end == std::string::npos ? page.size() : end + 2;
+            }
+            FILE* f = nullptr;
+            if (!_wfopen_s(&f, j->reportPath.c_str(), L"wb") && f)
+            {
+                const bool ok = fwrite(html.data(), html.size(), 1, f) == 1;
+                if (fclose(f) == 0 && ok) j->written.push_back(j->reportPath);
+                else j->notes.push_back(L"The report could not be written");
+            }
+            else j->notes.push_back(L"The report could not be written: " + j->reportPath);
+        }
+    }
+    for (auto& u : j->units)
+    {
+        if (j->cancel) break;
+        const size_t slash = u.out.find_last_of(L'\\');
+        if (slash != std::wstring::npos) SHCreateDirectoryExW(nullptr, u.out.substr(0, slash).c_str(), nullptr);
+        u.out = FreePath(u.out);
+        std::wstring why;
+        bool wrote = false;
+        try
+        {
+            if (u.kind == ExportUnit::Nifti) why = WriteNifti(u, j->cancel, j->done, wrote);
+            else if (factory) why = WritePictures(factory, u, j->dragged, j->center, j->width, j->cancel, j->done, wrote);
+            else why = L"WIC is not available";
+        }
+        catch (...) { why = L"it could not be written"; wrote = false; }
+        // (a file half written is not left behind)
+        if (wrote) j->written.push_back(u.out);
+        else if (GetFileAttributesW(u.out.c_str()) != INVALID_FILE_ATTRIBUTES) DeleteFileW(u.out.c_str());
+        if (j->cancel) break;
+        if (!why.empty()) j->notes.push_back(u.out.substr(slash == std::wstring::npos ? 0 : slash + 1) + L": " + why);
+    }
+    if (factory) factory->Release();
+    if (SUCCEEDED(com)) CoUninitialize();
+    PostMessageW(j->window, j->message, 0, 0);
+}
+
+// The thumbnails of the tree, one at a time in a thread of their own: only the last one asked for (one
+// asked before, still being made, is dropped)
+struct ThumbAsk
+{
+    int node = -1;
+    unsigned generation = 0;
+    enum Kind { Single, Cascade, Grid } kind = Single;
+    std::vector<Stack> stacks;                      // Single: one; Cascade: the orientations; Grid: the series
+    DWORD background = 0;
+};
+
+struct ThumbDone
+{
+    int node = -1;
+    unsigned generation = 0;
+    Thumb thumb;
+};
+
+class ThumbWorker
+{
+public:
+    ThumbWorker(HWND w, UINT m) : window(w), message(m) { thread = std::thread([this] { Run(); }); }
+    ThumbWorker(const ThumbWorker&) = delete;
+    ThumbWorker& operator=(const ThumbWorker&) = delete;
+    ~ThumbWorker()
+    {
+        {
+            std::lock_guard<std::mutex> hold(lock);
+            quit = true;
+            stale = true;
+        }
+        wake.notify_one();
+        thread.join();
+    }
+    void Ask(ThumbAsk a)
+    {
+        {
+            std::lock_guard<std::mutex> hold(lock);
+            pending = std::make_unique<ThumbAsk>(std::move(a));
+            stale = true;
+        }
+        wake.notify_one();
+    }
+
+private:
+    HWND window;
+    UINT message;
+    std::mutex lock;
+    std::condition_variable wake;
+    std::unique_ptr<ThumbAsk> pending;
+    std::atomic<bool> stale{ false };
+    bool quit = false;
+    std::thread thread;
+
+    void Run()
+    {
+        for (;;)
+        {
+            std::unique_ptr<ThumbAsk> a;
+            {
+                std::unique_lock<std::mutex> hold(lock);
+                wake.wait(hold, [&] { return quit || pending; });
+                if (quit) return;
+                a = std::move(pending);
+                stale = false;
+            }
+            auto done = std::make_unique<ThumbDone>();
+            done->node = a->node;
+            done->generation = a->generation;
+            try { done->thumb = Make(*a); }
+            catch (...) { done->thumb = Thumb(); done->thumb.error = L"it could not be made"; }
+            if (stale) continue;
+            if (PostMessageW(window, message, 0, reinterpret_cast<LPARAM>(done.get()))) done.release();
+        }
+    }
+
+    Thumb Make(const ThumbAsk& a)
+    {
+        if (a.kind == ThumbAsk::Single) return StackThumb(a.stacks[0], 256, 128, false, &stale);
+        Thumb out;
+        std::vector<Picture> tiles;
+        for (const Stack& s : a.stacks)
+        {
+            if (stale) return out;
+            Thumb t = StackThumb(s, a.kind == ThumbAsk::Grid ? 112 : 160, 128, true, &stale);
+            if (t.frames.empty())
+            {
+                Picture black;
+                black.width = black.height = 48;
+                black.px.assign(48 * 48, 0);
+                tiles.push_back(std::move(black));
+            }
+            else tiles.push_back(std::move(t.frames[0]));
+        }
+        if (tiles.empty()) { out.error = L"no image"; return out; }
+        out.frames.push_back(a.kind == ThumbAsk::Cascade ? Cascade(tiles, a.background) : Mosaic(tiles, static_cast<int>(tiles.size())));
+        return out;
+    }
+};
+
+class DicomExplorer
+{
+    friend struct ExplorerTest;                     // (a test of the gathering, the checks and the exports, without the window)
+public:
+    DicomExplorer() = default;
+    DicomExplorer(const DicomExplorer&) = delete;
+    DicomExplorer& operator=(const DicomExplorer&) = delete;
+    ~DicomExplorer()
+    {
+        Stop();
+        StopJob();
+        worker.reset();
+        if (preview) { preview->Unload(); preview->Release(); }
+        for (HFONT f : { font, boldFont }) if (f) DeleteObject(f);
+        if (icon) DestroyIcon(icon);
+        if (smallIcon) DestroyIcon(smallIcon);
+    }
+
+    bool Create(const std::wstring& folder, int show, bool report = false)
+    {
+        reportOnLoad = report;
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = WndProc;
+        wc.hInstance = g_module;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+        wc.lpszClassName = L"DicomStudyCountExplorer";
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+        WNDCLASSEXW pc = { sizeof(pc) };
+        pc.lpfnWndProc = PopupProc;
+        pc.hInstance = g_module;
+        pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        pc.lpszClassName = L"DicomStudyCountThumb";
+        pc.style = CS_DROPSHADOW;
+        if (!RegisterClassExW(&pc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+        compact = ReadSetting(L"Compact", 1) != 0;
+        hideIdentity = ReadSetting(L"HideIdentity", 1) != 0;
+        hoverPreview = ReadSetting(L"HoverPreview", 1) != 0;
+        treeWidth = static_cast<int>(ReadSetting(L"TreeWidth", 430));
+        infoWidth = static_cast<int>(ReadSetting(L"InfoWidth", 380));
+        topShare = static_cast<int>(ReadSetting(L"TopShare", 560));
+        wnd = CreateWindowExW(0, wc.lpszClassName, L"DICOM explorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                              CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, g_module, this);
+        if (!wnd) return false;
+        // Where it was last time (a size for this screen the first time)
+        WINDOWPLACEMENT wp = { sizeof(wp) };
+        GetWindowPlacement(wnd, &wp);
+        RECT work = {};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        const int w = (work.right - work.left) * 85 / 100, h = (work.bottom - work.top) * 85 / 100;
+        wp.rcNormalPosition = { static_cast<LONG>(ReadSetting(L"Left", work.left + (work.right - work.left - w) / 2)),
+                                static_cast<LONG>(ReadSetting(L"Top", work.top + (work.bottom - work.top - h) / 2)), 0, 0 };
+        wp.rcNormalPosition.right = wp.rcNormalPosition.left + static_cast<LONG>(ReadSetting(L"Width", w));
+        wp.rcNormalPosition.bottom = wp.rcNormalPosition.top + static_cast<LONG>(ReadSetting(L"Height", h));
+        wp.showCmd = ReadSetting(L"Maximized", 0) ? SW_SHOWMAXIMIZED : (show == SW_HIDE || show == SW_SHOWMINIMIZED || show == SW_MINIMIZE ? show : SW_SHOWNORMAL);
+        SetWindowPlacement(wnd, &wp);
+        UpdateWindow(wnd);
+        std::wstring start = folder;
+        if (start.empty()) start = ReadText(L"Folder");
+        if (start.empty() || !PathIsDirectoryW(start.c_str())) Browse();
+        else Load(start);
+        return true;
+    }
+
+    // Enter in the boxes of the folder and of the search, F3, Ctrl+C in the lists
+    bool PreTranslate(MSG& m)
+    {
+        if (m.message != WM_KEYDOWN) return false;
+        if (m.wParam == VK_ESCAPE && job && !job->cancel)
+        {
+            job->cancel = true;
+            SetStatus(L"Stopping...");
+            return true;
+        }
+        if (m.wParam == VK_RETURN && m.hwnd == pathBox)
+        {
+            Load(TextOf(pathBox));
+            return true;
+        }
+        if ((m.wParam == VK_RETURN && m.hwnd == findBox) || m.wParam == VK_F3)
+        {
+            FindNext((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+            return true;
+        }
+        if ((m.hwnd == info || m.hwnd == full) && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            if (m.wParam == 'C' || m.wParam == VK_INSERT) { CopyRows(m.hwnd, true); return true; }
+            if (m.wParam == 'A') { ListView_SetItemState(m.hwnd, -1, LVIS_SELECTED, LVIS_SELECTED); return true; }
+        }
+        if (m.hwnd == tree && (GetKeyState(VK_CONTROL) & 0x8000) && m.wParam == 'C' && selected > 0)
+        {
+            CopyPaths(selected);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static constexpr const wchar_t* Settings = L"Software\\DicomStudyCount\\Explorer";
+    static constexpr UINT WM_GATHERED = WM_APP + 20, WM_THUMB = WM_APP + 21, WM_EXPORTED = WM_APP + 22;
+    static constexpr UINT_PTR TimerProgress = 1, TimerFilter = 2, TimerFind = 3, TimerFollow = 4, TimerJob = 5;
+    static constexpr UINT_PTR TimerFrame = 1;      // (of the floating thumbnail)
+    enum { IdPath = 100, IdBrowse, IdReload, IdReport, IdFind, IdCompact, IdIdentity, IdHover, IdFilter };
+    enum class Split { None, Tree, Top, Info };
+    struct Row { Uint32 tag; std::wstring value; };     // of the full info
+    static constexpr COLORREF ProblemColor = RGB(196, 90, 0);
+
+    HWND wnd = nullptr, pathBox = nullptr, browse = nullptr, reload = nullptr, reportButton = nullptr, findLabel = nullptr, findBox = nullptr;
+    HWND compactBox = nullptr, identityBox = nullptr, hoverBox = nullptr, tree = nullptr, info = nullptr, filterLabel = nullptr, filterBox = nullptr;
+    HWND full = nullptr, status = nullptr;
+    int firstProblemRow = INT_MAX;                  // of the info: the rows of the problems, from this one
+    // The floating thumbnail of the node under the mouse in the tree
+    HWND popup = nullptr;
+    bool hoverPreview = true, hoverArmed = false;
+    HTREEITEM hoverItem = nullptr;
+    int popupNode = -1, popupFrame = 0;
+    std::unique_ptr<ThumbWorker> worker;
+    std::unordered_map<int, std::shared_ptr<Thumb>> thumbs;     // by node, for this gathering
+    unsigned generation = 0;
+    // An export or a report being written
+    std::unique_ptr<ExportJob> job;
+    bool reportOnLoad = false;                      // the report of the folder once it is read (rundll32 ...,Explore /report <folder>)
+    HFONT font = nullptr, boldFont = nullptr;
+    HICON icon = nullptr, smallIcon = nullptr;
+    PreviewHandler* preview = nullptr;
+    RECT imageRect = {}, treeSplit = {}, topSplit = {}, infoSplit = {};
+    Split split = Split::None;
+    int treeWidth = 430, infoWidth = 380, topShare = 560;  // (widths at 96 dpi; the share in thousandths)
+
+    std::wstring root, summary;                     // the folder, and what was found in it
+    std::unique_ptr<Gathering> data;
+    bool ready = false, compact = true, hideIdentity = true;
+    std::vector<GatherNode> nodes;
+    std::vector<int> fileNode;                      // the image node of each file
+    std::vector<int> rank;                          // the place of each file in the order of the images
+    int selected = -1;                              // the node chosen
+    int sliderNode = -1;                            // the node whose files the slider goes through
+    bool following = false;                         // the tree selection moves with the slider
+    std::wstring findText, filterText;
+    std::wregex findRegex, filterRegex;
+    bool findIsRegex = false, filterIsRegex = false;
+
+    // ----- settings
+
+    static DWORD ReadSetting(const wchar_t* name, DWORD fallback)
+    {
+        DWORD value = 0, size = sizeof(value);
+        return RegGetValueW(HKEY_CURRENT_USER, Settings, name, RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS ? value : fallback;
+    }
+    static void WriteSetting(const wchar_t* name, DWORD value)
+    {
+        RegSetKeyValueW(HKEY_CURRENT_USER, Settings, name, REG_DWORD, &value, sizeof(value));
+    }
+    static std::wstring ReadText(const wchar_t* name)
+    {
+        wchar_t buffer[2048] = {};
+        DWORD size = sizeof(buffer);
+        return RegGetValueW(HKEY_CURRENT_USER, Settings, name, RRF_RT_REG_SZ, nullptr, buffer, &size) == ERROR_SUCCESS ? buffer : L"";
+    }
+    void SaveSettings()
+    {
+        WINDOWPLACEMENT wp = { sizeof(wp) };
+        if (GetWindowPlacement(wnd, &wp))
+        {
+            WriteSetting(L"Left", static_cast<DWORD>(wp.rcNormalPosition.left));
+            WriteSetting(L"Top", static_cast<DWORD>(wp.rcNormalPosition.top));
+            WriteSetting(L"Width", static_cast<DWORD>(wp.rcNormalPosition.right - wp.rcNormalPosition.left));
+            WriteSetting(L"Height", static_cast<DWORD>(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top));
+            WriteSetting(L"Maximized", wp.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+        }
+        WriteSetting(L"TreeWidth", static_cast<DWORD>(treeWidth));
+        WriteSetting(L"InfoWidth", static_cast<DWORD>(infoWidth));
+        WriteSetting(L"TopShare", static_cast<DWORD>(topShare));
+    }
+
+    int Px(int n) const
+    {
+        const UINT dpi = wnd ? GetDpiForWindow(wnd) : 96;
+        return MulDiv(n, dpi ? dpi : 96, 96);
+    }
+
+    static std::wstring TextOf(HWND h)
+    {
+        std::wstring s(static_cast<size_t>(GetWindowTextLengthW(h)) + 1, L'\0');
+        s.resize(GetWindowTextW(h, &s[0], static_cast<int>(s.size())));
+        return s;
+    }
+
+    // ----- the window
+
+    void CreateControls()
+    {
+        auto make = [&](DWORD ex, const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
+            return CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, wnd,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_module, nullptr);
+        };
+        pathBox = make(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IdPath);
+        browse = make(0, L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, IdBrowse);
+        reload = make(0, L"BUTTON", L"Reload", WS_TABSTOP | BS_PUSHBUTTON, IdReload);
+        reportButton = make(0, L"BUTTON", L"Report", WS_TABSTOP | BS_PUSHBUTTON, IdReport);
+        findLabel = make(0, L"STATIC", L"Find:", SS_RIGHT | SS_CENTERIMAGE, 0);
+        findBox = make(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IdFind);
+        compactBox = make(0, L"BUTTON", L"Compact", WS_TABSTOP | BS_AUTOCHECKBOX, IdCompact);
+        hoverBox = make(0, L"BUTTON", L"Hover preview", WS_TABSTOP | BS_AUTOCHECKBOX, IdHover);
+        identityBox = make(0, L"BUTTON", L"Hide patient identity", WS_TABSTOP | BS_AUTOCHECKBOX, IdIdentity);
+        // (no tooltips of its own: the floating thumbnail writes the line of the node)
+        tree = make(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
+                    TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS, 0);
+        SetWindowSubclass(tree, TreeProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                L"DicomStudyCountThumb", L"", WS_POPUP | WS_BORDER, 0, 0, 10, 10, wnd, nullptr, g_module, this);
+        if (popup) SetLayeredWindowAttributes(popup, 0, 255, LWA_ALPHA);
+        worker = std::make_unique<ThumbWorker>(wnd, WM_THUMB);
+        info = make(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER, 0);
+        filterLabel = make(0, L"STATIC", L"Full info", SS_LEFT | SS_CENTERIMAGE, 0);
+        filterBox = make(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IdFilter);
+        full = make(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER, 0);
+        status = make(0, STATUSCLASSNAMEW, L"", SBARS_SIZEGRIP, 0);
+        SendMessageW(findBox, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"text or regex; Enter / F3: next"));
+        SendMessageW(filterBox, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Filter: tag, name or value (text or regex)"));
+        Button_SetCheck(compactBox, compact ? BST_CHECKED : BST_UNCHECKED);
+        Button_SetCheck(identityBox, hideIdentity ? BST_CHECKED : BST_UNCHECKED);
+        Button_SetCheck(hoverBox, hoverPreview ? BST_CHECKED : BST_UNCHECKED);
+        SetWindowTheme(tree, L"Explorer", nullptr);
+        TreeView_SetExtendedStyle(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        for (HWND list : { info, full })
+        {
+            SetWindowTheme(list, L"Explorer", nullptr);
+            ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        }
+        auto column = [&](HWND list, int at, const wchar_t* title, int width) {
+            LVCOLUMNW c = {};
+            c.mask = LVCF_TEXT | LVCF_WIDTH;
+            c.pszText = const_cast<wchar_t*>(title);
+            c.cx = Px(width);
+            ListView_InsertColumn(list, at, &c);
+        };
+        column(info, 0, L"Node", 130);
+        column(info, 1, L"", 400);
+        column(full, 0, L"Tag", 95);
+        column(full, 1, L"Attribute", 230);
+        column(full, 2, L"Value", 600);
+        ListView_EnableGroupView(full, TRUE);
+        Refont();
+        // The image: the preview, alone
+        preview = new (std::nothrow) PreviewHandler();
+        if (preview)
+        {
+            preview->moved = [this](int i) { Followed(i); };
+            preview->Host(wnd, imageRect);
+            preview->ShowFiles({}, -1);
+        }
+    }
+
+    void Refont()
+    {
+        for (HFONT* f : { &font, &boldFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
+        const int points9 = -MulDiv(9, GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96, 72);
+        font = CreateFontW(points9, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        boldFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        for (HWND h : { pathBox, browse, reload, reportButton, findLabel, findBox, compactBox, hoverBox, identityBox, tree, info, filterLabel,
+                        filterBox, full, status })
+            if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        if (filterLabel) SendMessageW(filterLabel, WM_SETFONT, reinterpret_cast<WPARAM>(boldFont), TRUE);
+    }
+
+    // The folder and the options at the top, the tree at the left; at the right the node and its image,
+    // and under them its full info; the status bar at the bottom. The bars between them move.
+    void Layout()
+    {
+        if (!status) return;
+        RECT c;
+        GetClientRect(wnd, &c);
+        SendMessageW(status, WM_SIZE, 0, 0);
+        RECT s = {};
+        GetWindowRect(status, &s);
+        const int m = Px(6), gap = Px(6), line = Px(25), w = c.right, bottom = c.bottom - (s.bottom - s.top) - m;
+        int x = m;
+        const int y = m;
+        int right = w - m;
+        auto put = [&](HWND h, int left, int width) { MoveWindow(h, left, y, width, line, TRUE); };
+        put(identityBox, right - Px(150), Px(150));
+        right -= Px(150) + gap;
+        put(hoverBox, right - Px(108), Px(108));
+        right -= Px(108) + gap;
+        put(compactBox, right - Px(80), Px(80));
+        right -= Px(80) + gap * 2;
+        put(findBox, right - Px(200), Px(200));
+        right -= Px(200) + Px(4);
+        put(findLabel, right - Px(34), Px(34));
+        right -= Px(34) + gap * 2;
+        put(reportButton, right - Px(76), Px(76));
+        right -= Px(76) + Px(4);
+        put(reload, right - Px(70), Px(70));
+        right -= Px(70) + Px(4);
+        put(browse, right - Px(80), Px(80));
+        right -= Px(80) + Px(4);
+        put(pathBox, x, (std::max)(Px(100), right - x));
+
+        const int top = y + line + m;
+        const int width = w - 2 * m;
+        int tw = (std::max)(Px(150), (std::min)(Px(treeWidth), width - Px(300)));
+        MoveWindow(tree, m, top, tw, bottom - top, TRUE);
+        treeSplit = { m + tw, top, m + tw + gap, bottom };
+        const int x0 = m + tw + gap, x1 = w - m, h = bottom - top;
+        int th = static_cast<int>(static_cast<long long>(h - gap - line) * topShare / 1000);
+        th = (std::max)(Px(80), (std::min)(th, h - gap - line - Px(60)));
+        int iw = (std::max)(Px(120), (std::min)(Px(infoWidth), x1 - x0 - gap - Px(150)));
+        MoveWindow(info, x0, top, iw, th, TRUE);
+        ListView_SetColumnWidth(info, 1, (std::max)(Px(100), iw - ListView_GetColumnWidth(info, 0) - GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(wnd)) - Px(4)));
+        infoSplit = { x0 + iw, top, x0 + iw + gap, top + th };
+        imageRect = { x0 + iw + gap, top, x1, top + th };
+        if (preview) preview->SetRect(&imageRect);
+        topSplit = { x0, top + th, x1, top + th + gap };
+        const int fy = top + th + gap;
+        MoveWindow(filterLabel, x0, fy, Px(70), line, TRUE);
+        MoveWindow(filterBox, x0 + Px(70), fy, (std::min)(Px(420), x1 - x0 - Px(70)), line, TRUE);
+        MoveWindow(full, x0, fy + line + Px(4), x1 - x0, bottom - fy - line - Px(4), TRUE);
+        InvalidateRect(wnd, nullptr, TRUE);
+    }
+
+    void SetStatus(const std::wstring& text) { if (status) SetWindowTextW(status, text.c_str()); }
+
+    // ----- loading
+
+    void Browse()
+    {
+        IFileOpenDialog* d = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
+        DWORD options = 0;
+        d->GetOptions(&options);
+        d->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        d->SetTitle(L"DICOM explorer: the folder to explore");
+        if (!root.empty())
+        {
+            IShellItem* at = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(root.c_str(), nullptr, IID_PPV_ARGS(&at)))) { d->SetFolder(at); at->Release(); }
+        }
+        if (SUCCEEDED(d->Show(wnd)))
+        {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(d->GetResult(&item)))
+            {
+                PWSTR p = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { Load(p); CoTaskMemFree(p); }
+                item->Release();
+            }
+        }
+        d->Release();
+    }
+
+    void Stop()
+    {
+        if (data && data->thread.joinable())
+        {
+            data->cancel = true;
+            data->thread.join();
+        }
+        if (wnd) KillTimer(wnd, TimerProgress);
+    }
+
+    void Load(std::wstring folder)
+    {
+        while (folder.size() > 3 && (folder.back() == L'\\' || folder.back() == L'/')) folder.pop_back();
+        if (!PathIsDirectoryW(folder.c_str()))
+        {
+            SetStatus(L"Not a folder: " + folder);
+            return;
+        }
+        Stop();
+        root = folder;
+        SetWindowTextW(pathBox, root.c_str());
+        SetWindowTextW(wnd, (L"DICOM explorer - " + root).c_str());
+        RegSetKeyValueW(HKEY_CURRENT_USER, Settings, L"Folder", REG_SZ, root.c_str(),
+                        static_cast<DWORD>((root.size() + 1) * sizeof(wchar_t)));
+        Clear();
+        InitDcmtk();
+        data = std::make_unique<Gathering>();
+        data->root = root;
+        data->window = wnd;
+        data->message = WM_GATHERED;
+        data->thread = std::thread(Gather, data.get());
+        SetTimer(wnd, TimerProgress, 200, nullptr);
+        Progress();
+    }
+
+    void Clear()
+    {
+        HidePopup();
+        thumbs.clear();
+        generation++;
+        hoverItem = nullptr;
+        ready = false;
+        selected = sliderNode = -1;
+        following = true;                           // (no selection events while the tree empties)
+        TreeView_DeleteAllItems(tree);
+        following = false;
+        nodes.clear();
+        fileNode.clear();
+        ListView_DeleteAllItems(info);
+        ListView_DeleteAllItems(full);
+        ListView_RemoveAllGroups(full);
+        if (preview) preview->ShowFiles({}, -1);
+    }
+
+    void Progress()
+    {
+        if (!data) return;
+        wchar_t text[160];
+        if (data->listing) swprintf_s(text, L"Looking for files: %ld so far...", data->found.load());
+        else swprintf_s(text, L"Reading the files: %ld of %ld...", data->done.load(), data->found.load());
+        SetStatus(text);
+    }
+
+    void Finished()
+    {
+        KillTimer(wnd, TimerProgress);
+        if (!data) return;
+        if (data->thread.joinable()) data->thread.join();
+        Build();
+        ready = true;
+        ComputeShown();
+        FillTree();
+        long series = 0, studies = 0, patients = static_cast<long>(nodes.empty() ? 0 : nodes[0].children.size()), troubled = 0;
+        for (const auto& n : nodes)
+        {
+            if (n.level == Level::Study) studies++;
+            if (n.level == Level::Series) { series++; if (!n.flags.empty()) troubled++; }
+        }
+        wchar_t text[400];
+        swprintf_s(text, L"%zu DICOM files: %ld patient%s, %ld stud%s, %ld series", data->files.size(), patients,
+                   patients == 1 ? L"" : L"s", studies, studies == 1 ? L"y" : L"ies", series);
+        std::wstring s = text;
+        if (data->others) s += L"   -   " + std::to_wstring(data->others) + L" other files";
+        if (data->directories) s += L"   -   " + std::to_wstring(data->directories) + L" DICOMDIR";
+        if (data->offline) s += L"   -   " + std::to_wstring(data->offline) + L" not downloaded (not read)";
+        if (troubled) s += L"   -   \u26A0 " + std::to_wstring(troubled) + L" series with problems";
+        swprintf_s(text, L"   -   %.1f s", data->seconds);
+        summary = s + text;
+        SetStatus(summary);
+        if (!nodes.empty() && !nodes[0].shown.empty()) TreeView_SelectItem(tree, nodes[nodes[0].shown[0]].item);
+        // (asked for from the menu of a folder: its report, at once)
+        if (reportOnLoad)
+        {
+            reportOnLoad = false;
+            Report(0);
+        }
+    }
+
+    // ----- the tree of DICOMgather.m
+
+    int Add(Level level, int parent, std::vector<int> files)
+    {
+        GatherNode n;
+        n.level = level;
+        n.parent = parent;
+        n.files = std::move(files);
+        nodes.push_back(std::move(n));
+        const int i = static_cast<int>(nodes.size()) - 1;
+        if (parent >= 0) nodes[parent].children.push_back(i);
+        return i;
+    }
+
+    // The files grouped by a key, in the order in which the groups appear
+    template <class K>
+    static std::vector<std::vector<int>> GroupBy(const std::vector<int>& in, K key)
+    {
+        std::vector<std::vector<int>> groups;
+        std::unordered_map<std::string, size_t> at;
+        for (int f : in)
+        {
+            auto r = at.emplace(key(f), groups.size());
+            if (r.second) groups.emplace_back();
+            groups[r.first->second].push_back(f);
+        }
+        return groups;
+    }
+
+    void Build()
+    {
+        nodes.clear();
+        const std::vector<Gathered>& files = data->files;
+        fileNode.assign(files.size(), -1);
+        // The images in their order first (instance number, trigger time, time, name): the groups below
+        // a series come in the order of their first image
+        std::vector<int> all(files.size());
+        std::iota(all.begin(), all.end(), 0);
+        std::sort(all.begin(), all.end(), [&](int a, int b) {
+            const Gathered &x = files[a], &y = files[b];
+            const long i = atol(x.instance.c_str()), j = atol(y.instance.c_str());
+            if (i != j) return i < j;
+            const double s = atof(x.trigger.c_str()), t = atof(y.trigger.c_str());
+            if (s != t) return s < t;
+            if (x.time != y.time) return x.time < y.time;
+            return StrCmpLogicalW(x.path.c_str(), y.path.c_str()) < 0;
+        });
+        rank.assign(files.size(), 0);
+        for (size_t i = 0; i < all.size(); i++) rank[all[i]] = static_cast<int>(i);
+        const int top = Add(Level::All, -1, all);
+        // The patients by their PatientID; the people that share one (9999, none), apart by who they are
+        struct Patient { std::vector<int> files; std::wstring person; int sharing = 1; };
+        std::vector<Patient> patients;
+        for (auto& pg : GroupBy(all, [&](int f) { return files[f].patient; }))
+        {
+            // Each file with the first person it can be (the most complete ones first: they make the people)
+            std::vector<Person> who(pg.size());
+            std::vector<size_t> order(pg.size());
+            std::unordered_map<std::string, size_t> seen;         // (name and birth date as read: their person once)
+            for (size_t i = 0; i < pg.size(); i++)
+            {
+                const Gathered& g = files[pg[i]];
+                const std::string raw = g.patientName + '\x01' + g.birthDate + '\x01' + g.charset;
+                auto it = seen.find(raw);
+                who[i] = it != seen.end() ? who[it->second] : PersonOf(g.patientName, g.charset, g.birthDate);
+                if (it == seen.end()) seen.emplace(raw, i);
+                order[i] = i;
+            }
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                return (!who[a].birth.empty()) + (!who[a].name.empty()) > (!who[b].birth.empty()) + (!who[b].name.empty());
+            });
+            std::vector<Person> people;
+            std::vector<std::vector<int>> theirs;
+            std::vector<int> nobody;                // neither a name nor a birth date: cannot be told
+            for (size_t i : order)
+            {
+                if (who[i].Empty()) { nobody.push_back(pg[i]); continue; }
+                size_t k = 0;
+                while (k < people.size() && !SamePerson(people[k], who[i])) k++;
+                if (k == people.size()) { people.push_back(who[i]); theirs.emplace_back(); }
+                theirs[k].push_back(pg[i]);
+            }
+            if (people.size() <= 1)
+            {
+                patients.push_back({ pg, L"", 1 });
+                continue;
+            }
+            if (!nobody.empty()) { people.push_back(Person()); theirs.push_back(nobody); }
+            for (size_t k = 0; k < theirs.size(); k++)
+            {
+                std::sort(theirs[k].begin(), theirs[k].end(), [&](int a, int b) { return rank[a] < rank[b]; });
+                std::string key = people[k].birth + "|";
+                for (wchar_t c : people[k].name) key += static_cast<char>(c < 128 ? c : '?');
+                patients.push_back({ theirs[k], people[k].Empty() ? L"no name or birth date" : Hash6(key), static_cast<int>(theirs.size()) });
+            }
+        }
+        std::sort(patients.begin(), patients.end(), [&](const Patient& a, const Patient& b) {
+            const std::string &x = files[a.files[0]].patient, &y = files[b.files[0]].patient;
+            return x != y ? x < y : a.person < b.person;
+        });
+        for (auto& pt : patients)
+        {
+            const std::vector<int>& pg = pt.files;
+            const int p = Add(Level::Patient, top, pg);
+            nodes[p].person = pt.person;
+            nodes[p].sharing = pt.sharing;
+            auto studies = GroupBy(pg, [&](int f) { return files[f].study; });
+            std::sort(studies.begin(), studies.end(), [&](const auto& a, const auto& b) {
+                const Gathered &x = files[a[0]], &y = files[b[0]];
+                if (x.studyDate + x.studyTime != y.studyDate + y.studyTime) return x.studyDate + x.studyTime < y.studyDate + y.studyTime;
+                return x.study < y.study;
+            });
+            for (auto& sg : studies)
+            {
+                const int s = Add(Level::Study, p, sg);
+                auto series = GroupBy(sg, [&](int f) { return files[f].series; });
+                std::sort(series.begin(), series.end(), [&](const auto& a, const auto& b) {
+                    const Gathered &x = files[a[0]], &y = files[b[0]];
+                    const long i = atol(x.seriesNumber.c_str()), j = atol(y.seriesNumber.c_str());
+                    if (i != j) return i < j;
+                    if (x.seriesDate + x.seriesTime != y.seriesDate + y.seriesTime) return x.seriesDate + x.seriesTime < y.seriesDate + y.seriesTime;
+                    return x.series < y.series;
+                });
+                for (auto& rg : series) AddSeries(s, rg);
+            }
+        }
+        // The files of every node in the order of the tree: those of its children, one after the other
+        for (int i = static_cast<int>(nodes.size()) - 1; i >= 0; i--)
+        {
+            if (nodes[i].children.empty()) continue;
+            std::vector<int> f;
+            for (int c : nodes[i].children) f.insert(f.end(), nodes[c].files.begin(), nodes[c].files.end());
+            nodes[i].files = std::move(f);
+        }
+        Check();
+        for (size_t i = 0; i < nodes.size(); i++) nodes[i].text = Label(static_cast<int>(i));
+    }
+
+    // ----- the checks: what may be wrong in the series
+
+    void Problem(int n, const std::wstring& flag, const std::wstring& text)
+    {
+        nodes[n].problems.push_back(text);
+        if (std::find(nodes[n].flags.begin(), nodes[n].flags.end(), flag) == nodes[n].flags.end()) nodes[n].flags.push_back(flag);
+    }
+
+    // The value of an attribute in a file, if it has it
+    const std::wstring* AttributeOf(int f, Uint32 tag) const
+    {
+        const auto* a = Find(data->files[f].attributes, tag);
+        return a ? &data->pool.Text(a->second) : nullptr;
+    }
+
+    // Each orientation: gaps in its positions, spacings that are not regular, positions off the line of the
+    // normal, positions with another number of images, images without position, pixel spacings that vary.
+    // Each series: instance numbers missing. Each file: the same SOP instance UID as another one, shorter
+    // than its pixels. The series show what was found under them, the studies and patients how many series.
+    void Check()
+    {
+        const std::vector<Gathered>& files = data->files;
+        wchar_t b[400];
+        auto mm = [](double v) { wchar_t s[40]; swprintf_s(s, L"%.4g", v); return std::wstring(s); };
+        auto fileName = [&](int f) { return files[f].path.substr(files[f].path.find_last_of(L'\\') + 1); };
+
+        // The same SOP instance UID in more than one file (copies)
+        std::unordered_map<Uint32, std::vector<int>> uids;
+        for (size_t f = 0; f < files.size(); f++)
+            if (const auto* a = Find(files[f].attributes, 0x00080018)) uids[a->second].push_back(static_cast<int>(f));
+        for (const auto& [uid, same] : uids)
+        {
+            if (same.size() < 2) continue;
+            for (int f : same)
+            {
+                std::wstring others;
+                for (int g : same) if (g != f && others.size() < 200) others += (others.empty() ? L"" : L", ") + files[g].path;
+                Problem(fileNode[f], L"duplicate", L"The same SOP instance UID as " + others);
+            }
+        }
+
+        for (size_t i = 0; i < nodes.size(); i++)
+        {
+            const int n = static_cast<int>(i);
+            const GatherNode& node = nodes[n];
+            if (node.level == Level::Image)
+            {
+                // Shorter than its pixels (uncompressed only: the size of compressed ones is not known)
+                const int f = node.files[0];
+                const std::wstring* ts = AttributeOf(f, 0x00020010);
+                std::wstring syntax = ts ? *ts : L"";
+                while (!syntax.empty() && (syntax.back() == L' ' || syntax.back() == 0)) syntax.pop_back();
+                if (syntax != L"1.2.840.10008.1.2" && syntax != L"1.2.840.10008.1.2.1" && syntax != L"1.2.840.10008.1.2.2") continue;
+                const std::wstring* bits = AttributeOf(f, 0x00280100);
+                const std::wstring* samples = AttributeOf(f, 0x00280002);
+                const long long need = static_cast<long long>(files[f].rows) * files[f].columns * files[f].frames *
+                                       (samples ? (std::max)(1, _wtoi(samples->c_str())) : 1) * (bits ? _wtoi(bits->c_str()) : 0) / 8;
+                if (need > 0 && files[f].bytes < need)
+                {
+                    swprintf_s(b, L"The file is shorter than its pixels: %lld bytes, and its pixels alone need %lld", files[f].bytes, need);
+                    Problem(n, L"truncated", b);
+                }
+                continue;
+            }
+            if (node.level == Level::Series)
+            {
+                // Instance numbers missing (when there are few of them, and none repeated): a note, not a
+                // problem. In a corpus of 700 000 files almost all of them were the numbering of the scanner
+                // (magnitude and phase interleaved, the same phases left out of every slice) or images the
+                // operator did not keep; images really missing leave a hole in the positions, checked apart.
+                std::vector<long> numbers;
+                for (int f : node.files)
+                {
+                    const std::string& s = files[f].instance;
+                    if (s.empty()) { numbers.clear(); break; }
+                    numbers.push_back(atol(s.c_str()));
+                }
+                std::sort(numbers.begin(), numbers.end());
+                if (numbers.size() >= 3 && std::adjacent_find(numbers.begin(), numbers.end()) == numbers.end())
+                {
+                    const long long missing = static_cast<long long>(numbers.back()) - numbers.front() + 1 - static_cast<long long>(numbers.size());
+                    if (missing > 0 && missing <= static_cast<long long>(numbers.size()))
+                    {
+                        std::wstring which;
+                        int listed = 0;
+                        for (size_t k = 1; k < numbers.size() && listed < 6; k++)
+                            for (long v = numbers[k - 1] + 1; v < numbers[k] && listed < 6; v++, listed++)
+                                which += (which.empty() ? L"" : L", ") + std::to_wstring(v);
+                        if (missing > listed) which += L"...";
+                        // Regular: most runs of the same length, most of them the same distance from the one
+                        // before (a few may be off: the same phase dropped from every slice but one)
+                        std::vector<std::pair<long, long>> runs;            // (first missing, how many)
+                        for (size_t k = 1; k < numbers.size(); k++)
+                            if (numbers[k] > numbers[k - 1] + 1) runs.push_back({ numbers[k - 1] + 1, numbers[k] - numbers[k - 1] - 1 });
+                        auto mostCommon = [](const std::vector<long>& v, size_t& times) {
+                            std::map<long, size_t> c;
+                            for (long x : v) c[x]++;
+                            long best = 0;
+                            times = 0;
+                            for (const auto& [x, k] : c) if (k > times) { times = k; best = x; }
+                            return best;
+                        };
+                        std::vector<long> lengths, steps;
+                        for (size_t k = 0; k < runs.size(); k++)
+                        {
+                            lengths.push_back(runs[k].second);
+                            if (k) steps.push_back(runs[k].first - runs[k - 1].first);
+                        }
+                        size_t sameLength = 0, sameStep = 0;
+                        const long length = mostCommon(lengths, sameLength), step = mostCommon(steps, sameStep);
+                        const bool regular = runs.size() >= 3 && sameLength * 3 >= runs.size() * 2 && sameStep * 3 >= steps.size() * 2;
+                        std::wstring why = L"few and scattered: images not kept by the operator, or lost - the positions say whether a slice is missing";
+                        if (regular)
+                        {
+                            wchar_t r[200];
+                            swprintf_s(r, L"%s, %ld of every %ld: the numbering of the scanner, or images left out on purpose",
+                                       sameStep == steps.size() && sameLength == runs.size() ? L"regular" : L"mostly regular", length, step);
+                            why = r;
+                        }
+                        else if (runs.size() == 1 && runs[0].second > 1) why = L"one block: images not kept, or lost - the positions say whether a slice is missing";
+                        else if (runs.size() == 2 && runs[0].second == runs[1].second && runs[0].second > 1)
+                            why = L"two blocks of " + std::to_wstring(runs[0].second) + L": images not kept, or lost - the positions say whether a slice is missing";
+                        swprintf_s(b, L"Instance numbers missing: %lld between %ld and %ld (%s). %s", missing, numbers.front(), numbers.back(),
+                                   which.c_str(), why.c_str());
+                        nodes[n].notes.push_back(b);
+                    }
+                }
+                continue;
+            }
+            if (node.level != Level::Orientation) continue;
+            const std::vector<int>& positions = node.children;
+            const Gathered& g0 = files[node.files[0]];
+            // Images without position, among others that have it
+            size_t placed = 0;
+            for (int f : node.files) if (files[f].placed) placed++;
+            if (placed > 0 && placed < node.files.size())
+                Problem(n, L"no position", std::to_wstring(node.files.size() - placed) + L" of its images have no position (ImagePositionPatient)");
+            // Pixel spacing
+            std::vector<std::wstring> spacings;
+            for (int f : node.files)
+            {
+                const std::wstring* s = AttributeOf(f, 0x00280030);
+                if (s && std::find(spacings.begin(), spacings.end(), *s) == spacings.end()) spacings.push_back(*s);
+            }
+            if (spacings.size() > 1)
+                Problem(n, L"pixel spacing varies", L"Pixel spacing varies: " + spacings[0] + L"  |  " + spacings[1] + (spacings.size() > 2 ? L"  |  ..." : L""));
+            if (positions.size() < 2) continue;
+            // Images per position
+            std::map<size_t, size_t> counts;
+            for (int p : positions) counts[nodes[p].files.size()]++;
+            if (counts.size() > 1)
+            {
+                size_t most = 0, usual = 0;
+                for (const auto& [k, c] : counts) if (c > most) { most = c; usual = k; }
+                std::wstring which;
+                size_t differ = 0;
+                for (int p : positions)
+                {
+                    const size_t k = nodes[p].files.size();
+                    if (k == usual) continue;
+                    differ++;
+                    if (differ <= 3)
+                    {
+                        const Gathered& g = files[nodes[p].files[0]];
+                        swprintf_s(b, L"%s%s has %zu", which.empty() ? L"" : L", ", g.hasZ ? (L"Z " + mm(g.z)).c_str() : L"one", k);
+                        which += b;
+                    }
+                    Problem(p, std::to_wstring(k) + L" images (most have " + std::to_wstring(usual) + L")",
+                            L"This position has " + std::to_wstring(k) + L" images; most positions of its orientation have " + std::to_wstring(usual));
+                }
+                swprintf_s(b, L"Images per position: most have %zu; %s%s (%zu positions differ)", usual, which.c_str(), differ > 3 ? L"..." : L"", differ);
+                Problem(n, L"images per position differ", b);
+            }
+            // The positions along the normal: gaps, irregular spacing; off its line
+            std::vector<const Gathered*> first;
+            for (int p : positions) first.push_back(&files[nodes[p].files[0]]);
+            if (std::all_of(first.begin(), first.end(), [](const Gathered* g) { return g->placed && g->oriented && g->hasZ; }))
+            {
+                const double* o = g0.orientation;
+                double shift = 0;
+                for (const Gathered* g : first)
+                {
+                    double d[3];
+                    for (int r = 0; r < 3; r++) d[r] = g->position[r] - first[0]->position[r];
+                    const double u = d[0] * o[0] + d[1] * o[1] + d[2] * o[2], v = d[0] * o[3] + d[1] * o[4] + d[2] * o[5];
+                    shift = (std::max)(shift, sqrt(u * u + v * v));
+                }
+                if (shift > 0.05)
+                    Problem(n, L"shifted", L"The positions are not on one line along the normal: up to " + mm(shift) +
+                                           L" mm off in the plane of the images (a gantry tilt, or stacks put together)");
+                if (positions.size() < 3) continue;
+                std::vector<double> steps;
+                for (size_t k = 1; k < first.size(); k++) steps.push_back(first[k]->z - first[k - 1]->z);
+                std::vector<double> sorted = steps;
+                std::sort(sorted.begin(), sorted.end());
+                const double usual = sorted[sorted.size() / 2];
+                if (!(usual > 1e-3)) continue;
+                int gaps = 0;
+                long long lost = 0;
+                double least = usual, largest = usual;
+                std::wstring where;
+                for (size_t k = 0; k < steps.size(); k++)
+                {
+                    if (steps[k] > 1.5 * usual)
+                    {
+                        if (gaps++ == 0) where = L"from Z " + mm(first[k]->z) + L" to " + mm(first[k + 1]->z) + L" mm";
+                        lost += std::llround(steps[k] / usual) - 1;
+                    }
+                    else { least = (std::min)(least, steps[k]); largest = (std::max)(largest, steps[k]); }
+                }
+                if (gaps)
+                {
+                    swprintf_s(b, L"Gap: about %lld position%s missing %s (the usual spacing is %s mm)%s", lost, lost == 1 ? L"" : L"s",
+                               where.c_str(), mm(usual).c_str(), gaps > 1 ? (L", and " + std::to_wstring(gaps - 1) + L" more gaps").c_str() : L"");
+                    Problem(n, L"gap", b);
+                }
+                if (largest - least > 0.1 * usual)
+                    Problem(n, L"irregular spacing", L"The spacing of its positions is not regular: from " + mm(least) + L" to " + mm(largest) +
+                                                     L" mm (usually " + mm(usual) + L" mm)");
+            }
+        }
+
+        // Up the tree: a series, what was found under it; a study and a patient, how many series
+        for (int i = static_cast<int>(nodes.size()) - 1; i > 0; i--)
+        {
+            GatherNode& node = nodes[i];
+            if (node.level == Level::Series)
+            {
+                std::map<std::wstring, size_t> images;
+                std::function<void(int)> walk = [&](int k) {
+                    for (int c : nodes[k].children)
+                    {
+                        if (nodes[c].level == Level::Orientation)
+                            for (const auto& f : nodes[c].flags)
+                                if (std::find(node.flags.begin(), node.flags.end(), f) == node.flags.end()) node.flags.push_back(f);
+                        if (nodes[c].level == Level::Image) for (const auto& f : nodes[c].flags) images[f]++;
+                        walk(c);
+                    }
+                };
+                walk(i);
+                for (const auto& [flag, k] : images)
+                {
+                    node.flags.push_back(std::to_wstring(k) + L" " + flag + (flag == L"duplicate" && k != 1 ? L"s" : L""));
+                    node.problems.push_back(std::to_wstring(k) + (k == 1 ? L" file " : L" files ") +
+                                            (flag == L"duplicate" ? (k == 1 ? L"has the same SOP instance UID as another file (a copy)"
+                                                                            : L"have the same SOP instance UID as other files (copies)")
+                                                                  : (k == 1 ? L"is shorter than its pixels" : L"are shorter than their pixels")));
+                }
+            }
+            else if ((node.level == Level::Study || node.level == Level::Patient))
+            {
+                size_t k = 0;
+                std::function<void(int)> walk = [&](int c) {
+                    if (nodes[c].level == Level::Series) { if (!nodes[c].flags.empty()) k++; return; }
+                    for (int d : nodes[c].children) walk(d);
+                };
+                walk(i);
+                // (first who it is: the problems of its series after)
+                if (node.level == Level::Patient && node.sharing > 1)
+                    Problem(i, L"the same ID, " + std::to_wstring(node.sharing) + L" people",
+                            L"Its PatientID is that of " + std::to_wstring(node.sharing) + L" people (other names or birth dates in the files): shown apart. " +
+                            L"An export that puts the same placeholder in every PatientID (9999), or files without one");
+                if (k) node.flags.push_back(std::to_wstring(k) + L" series with problems");
+            }
+        }
+    }
+
+    // The problems of a node and of those under it, those under it with the line of their node (`most` at
+    // most); not those of each position and image (a series counts those of its images)
+    std::vector<std::wstring> ProblemsUnder(int n, size_t most) const
+    {
+        std::vector<std::wstring> out;
+        size_t more = 0;
+        std::function<void(int)> walk = [&](int k) {
+            std::wstring where;
+            const bool alone = nodes[k].level == Level::Orientation && nodes[nodes[k].parent].children.size() == 1;
+            if (k != n && !alone)
+            {
+                where = nodes[k].text;
+                const size_t mark = where.find(L"   \u26A0");
+                if (mark != std::wstring::npos) where.resize(mark);
+                where += L":   ";
+            }
+            for (const auto& p : nodes[k].problems)
+            {
+                if (out.size() < most) out.push_back(where + p);
+                else more++;
+            }
+            for (int c : nodes[k].children)
+                if (nodes[c].level != Level::Position && nodes[c].level != Level::Image) walk(c);
+        };
+        walk(n);
+        if (more) out.push_back(L"... and " + std::to_wstring(more) + L" more");
+        return out;
+    }
+
+    // A series: its orientations (the same ImageOrientationPatient, rows and columns), their positions
+    // (the same ImagePositionPatient, in the order of their Z level) and their images
+    void AddSeries(int study, const std::vector<int>& rg)
+    {
+        const std::vector<Gathered>& files = data->files;
+        const int r = Add(Level::Series, study, rg);
+        std::vector<std::vector<int>> orientations;
+        for (int f : rg)
+        {
+            const Gathered& g = files[f];
+            auto same = [&](const std::vector<int>& o) {
+                const Gathered& h = files[o[0]];
+                if (g.oriented != h.oriented || g.rows != h.rows || g.columns != h.columns) return false;
+                for (int k = 0; k < 6 && g.oriented; k++) if (std::fabs(g.orientation[k] - h.orientation[k]) > 1e-4) return false;
+                return true;
+            };
+            auto it = std::find_if(orientations.begin(), orientations.end(), same);
+            if (it == orientations.end()) orientations.push_back({ f });
+            else it->push_back(f);
+        }
+        for (auto& og : orientations)
+        {
+            const int o = Add(Level::Orientation, r, og);
+            // Placed ones by their Z level (the position along the normal), those without a position last
+            std::vector<int> sorted = og;
+            std::stable_sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+                const Gathered &x = files[a], &y = files[b];
+                if (x.placed != y.placed) return x.placed;
+                if (x.hasZ && y.hasZ && x.z != y.z) return x.z < y.z;
+                return false;
+            });
+            std::vector<std::vector<int>> positions;
+            auto same = [&](const Gathered& g, const Gathered& h) {
+                if (g.placed != h.placed) return false;
+                for (int k = 0; k < 3 && g.placed; k++) if (std::fabs(g.position[k] - h.position[k]) >= 1e-3) return false;
+                return true;
+            };
+            for (int f : sorted)
+            {
+                const Gathered& g = files[f];
+                bool joined = false;
+                if (!positions.empty() && same(g, files[positions.back()[0]]))
+                {
+                    positions.back().push_back(f);
+                    joined = true;
+                }
+                // (a position seen before, not the last one: without Z levels they are not sorted)
+                for (size_t k = 0; !joined && g.placed && k < positions.size(); k++)
+                    if (same(g, files[positions[k][0]])) { positions[k].push_back(f); joined = true; }
+                if (!joined) positions.push_back({ f });
+            }
+            for (auto& pg : positions)
+            {
+                // The images of a position in their order (instance number, trigger time...)
+                std::sort(pg.begin(), pg.end(), [&](int a, int b) { return rank[a] < rank[b]; });
+                const int z = Add(Level::Position, o, pg);
+                for (int f : pg) fileNode[f] = Add(Level::Image, z, { f });
+            }
+        }
+    }
+
+    // The line of a node in the tree, and what the checks found in it
+    std::wstring Label(int i) const
+    {
+        std::wstring s = Plain(i);
+        const auto& flags = nodes[i].flags;
+        for (size_t k = 0; k < flags.size(); k++) s += (k ? L", " : L"   \u26A0 ") + flags[k];
+        return s;
+    }
+
+    std::wstring Plain(int i) const
+    {
+        const GatherNode& n = nodes[i];
+        if (n.files.empty()) return L"";
+        const Gathered& g = data->files[n.files[0]];
+        const size_t count = n.files.size();
+        auto files = [&](size_t k) { return std::to_wstring(k) + (k == 1 ? L" file" : L" files"); };
+        wchar_t buffer[200];
+        std::wstring s;
+        auto add = [&](const std::wstring& part) { if (!part.empty()) s += (s.empty() ? L"" : L"   ") + part; };
+        switch (n.level)
+        {
+        case Level::All:
+            return L"All";
+        case Level::Patient:
+            add((g.patient.empty() ? L"Patient (no ID)" : L"Patient " + Widen(g.patient, g.charset)) +
+                (n.person.empty() ? L"" : L" \x00B7 [" + n.person + L"]"));
+            add(L"(" + std::to_wstring(n.children.size()) + (n.children.size() == 1 ? L" study, " : L" studies, ") + files(count) + L")");
+            return s;
+        case Level::Study:
+            add(DateTimeText(g.studyDate, g.studyTime));
+            add(Widen(g.studyDescription, g.charset));
+            if (!g.study.empty()) add(L"[" + Hash6(g.study) + L"]");
+            if (s.empty()) s = L"Study";
+            add(L"(" + std::to_wstring(n.children.size()) + L" series, " + files(count) + L")");
+            return s;
+        case Level::Series:
+        {
+            add(Widen(g.modality));
+            add(g.seriesNumber.empty() ? L"Series" : L"Series " + Widen(g.seriesNumber));
+            add(Widen(g.seriesDescription, g.charset));
+            // One orientation: its plane and size here
+            if (n.children.size() == 1) add(Size(n.children[0]));
+            else add(L"(" + std::to_wstring(n.children.size()) + L" orientations)");
+            add(L"(" + files(count) + L")");
+            return s;
+        }
+        case Level::Orientation:
+            add(Size(i));
+            add(L"(" + files(count) + L")");
+            return s;
+        case Level::Position:
+            if (g.hasZ) { swprintf_s(buffer, L"Z %.2f mm", g.z); add(buffer); }
+            else if (g.placed) add(L"Position " + Widen(g.positionText));
+            else add(L"No position");
+            if (count > 1) add(L"(" + std::to_wstring(count) + L" images)");
+            return s;
+        case Level::Image:
+        {
+            add(g.instance.empty() ? L"Image" : L"Image " + Widen(g.instance));
+            if (!g.trigger.empty()) { swprintf_s(buffer, L"t %.1f ms", atof(g.trigger.c_str())); add(buffer); }
+            const GatherNode& position = nodes[n.parent];
+            if (g.hasZ && (compact || position.files.size() == 1)) { swprintf_s(buffer, L"Z %.2f", g.z); add(buffer); }
+            if (g.frames > 1) add(std::to_wstring(g.frames) + L" frames");
+            add(g.path.substr(g.path.find_last_of(L'\\') + 1));     // (its folder: in the info of the node)
+            return s;
+        }
+        }
+        return s;
+    }
+
+    // An orientation: its plane, rows x columns x positions (x images in each, when they are as many)
+    std::wstring Size(int o) const
+    {
+        const GatherNode& n = nodes[o];
+        const Gathered& g = data->files[n.files[0]];
+        Header h;
+        h.imageOrientation = g.orientationText;
+        std::wstring plane = PlaneName(h);
+        wchar_t buffer[120];
+        swprintf_s(buffer, L"%u x %u x %zu", g.columns, g.rows, n.children.size());
+        std::wstring s = (plane.empty() ? L"" : plane + L"  ") + buffer;
+        const size_t per = nodes[n.children[0]].files.size();
+        if (std::all_of(n.children.begin(), n.children.end(), [&](int c) { return nodes[c].files.size() == per; }) && per > 1)
+            s += L" x " + std::to_wstring(per);
+        return s;
+    }
+
+    // Compact: an orientation alone in its series, and positions that hold one image each (or that are
+    // alone in their orientation), are not in the tree: what is under them is
+    bool Skipped(int c) const
+    {
+        const GatherNode& n = nodes[c];
+        if (n.parent < 0) return false;
+        const GatherNode& p = nodes[n.parent];
+        if (n.level == Level::Orientation) return p.children.size() == 1;
+        if (n.level == Level::Position)
+            return p.children.size() == 1 ||
+                   std::all_of(p.children.begin(), p.children.end(), [&](int k) { return nodes[k].files.size() == 1; });
+        return false;
+    }
+
+    void ComputeShown()
+    {
+        for (auto& n : nodes) { n.shown.clear(); n.shownParent = -1; n.item = nullptr; n.filled = false; }
+        std::function<void(int, std::vector<int>&)> collect = [&](int c, std::vector<int>& out) {
+            if (compact && Skipped(c)) for (int k : nodes[c].children) collect(k, out);
+            else out.push_back(c);
+        };
+        for (size_t i = 0; i < nodes.size(); i++)
+        {
+            if (compact && Skipped(static_cast<int>(i))) continue;
+            std::vector<int> shown;
+            for (int c : nodes[i].children) collect(c, shown);
+            for (int c : shown) nodes[c].shownParent = static_cast<int>(i);
+            nodes[i].shown = std::move(shown);
+        }
+        for (size_t i = 0; i < nodes.size(); i++)
+            if (nodes[i].level == Level::Image) nodes[i].text = Label(static_cast<int>(i));     // (Z or not)
+    }
+
+    // The shown children of a node into the tree (when it is opened: a series can have thousands)
+    void Insert(int n)
+    {
+        if (n < 0 || nodes[n].filled) return;
+        nodes[n].filled = true;
+        HTREEITEM under = n == 0 ? TVI_ROOT : nodes[n].item;
+        if (!under) return;
+        SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
+        for (int c : nodes[n].shown)
+        {
+            TVINSERTSTRUCTW is = {};
+            is.hParent = under;
+            is.hInsertAfter = TVI_LAST;
+            is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+            is.item.pszText = const_cast<wchar_t*>(nodes[c].text.c_str());
+            is.item.lParam = c;
+            is.item.cChildren = nodes[c].shown.empty() ? 0 : 1;
+            nodes[c].item = TreeView_InsertItem(tree, &is);
+        }
+        SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
+    }
+
+    // The tree item of a node, its parents opened if they were not
+    HTREEITEM ItemOf(int n)
+    {
+        if (n <= 0 || n >= static_cast<int>(nodes.size())) return nullptr;
+        if (nodes[n].item) return nodes[n].item;
+        const int p = nodes[n].shownParent;
+        if (p < 0) return nullptr;
+        if (p > 0 && !ItemOf(p)) return nullptr;
+        Insert(p);
+        return nodes[n].item;
+    }
+
+    // Patients and studies open (the series of a few studies in sight)
+    void FillTree()
+    {
+        following = true;
+        TreeView_DeleteAllItems(tree);
+        following = false;
+        if (nodes.empty()) return;
+        Insert(0);
+        size_t studies = 0;
+        for (int p : nodes[0].shown) studies += nodes[p].shown.size();
+        for (int p : nodes[0].shown)
+        {
+            TreeView_Expand(tree, nodes[p].item, TVE_EXPAND);
+            if (studies <= 12) for (int s : nodes[p].shown) TreeView_Expand(tree, nodes[s].item, TVE_EXPAND);
+        }
+    }
+
+    // Compact or not: the tree again, with the same node chosen (or the one shown that holds it)
+    void Recompact()
+    {
+        if (!ready) return;
+        int keep = selected;
+        ComputeShown();
+        FillTree();
+        while (keep > 0 && nodes[keep].shownParent < 0) keep = nodes[keep].parent;
+        if (HTREEITEM item = ItemOf(keep)) { TreeView_SelectItem(tree, item); TreeView_EnsureVisible(tree, item); }
+    }
+
+    // ----- a node chosen
+
+    void Choose(int n)
+    {
+        if (n <= 0 || n >= static_cast<int>(nodes.size())) return;
+        selected = n;
+        FillInfo(n);
+        FillFull(n);
+        if (!preview) return;
+        // An image: the slider goes through those of the node above it in the tree; another node: its own
+        int under = n, index = 0;
+        if (nodes[n].level == Level::Image && nodes[n].shownParent > 0)
+        {
+            under = nodes[n].shownParent;
+            const auto& f = nodes[under].files;
+            index = static_cast<int>(std::find(f.begin(), f.end(), nodes[n].files[0]) - f.begin());
+        }
+        if (under == sliderNode && nodes[n].level == Level::Image)
+        {
+            preview->ShowIndex(index);
+            return;
+        }
+        sliderNode = under;
+        std::vector<std::wstring> paths;
+        for (int f : nodes[under].files) paths.push_back(data->files[f].path);
+        preview->ShowFiles(paths, index);
+    }
+
+    // The slider (or the cine) moved: an image chosen in the tree follows it
+    void Followed(int i)
+    {
+        if (sliderNode < 0 || selected < 0 || i < 0 || i >= static_cast<int>(nodes[sliderNode].files.size())) return;
+        if (nodes[selected].level != Level::Image || nodes[selected].shownParent != sliderNode) return;
+        const int image = fileNode[nodes[sliderNode].files[i]];
+        if (image == selected || image < 0 || !nodes[image].item) return;
+        following = true;
+        TreeView_SelectItem(tree, nodes[image].item);
+        following = false;
+        selected = image;
+        SetTimer(wnd, TimerFollow, 250, nullptr);   // its info when it stops for a moment
+    }
+
+    // What the node is: a few values of it, and how many of what are under it
+    void FillInfo(int n)
+    {
+        const GatherNode& node = nodes[n];
+        const std::vector<Gathered>& files = data->files;
+        const Gathered& g = files[node.files[0]];
+        std::vector<std::pair<std::wstring, std::wstring>> rows;
+        auto row = [&](const std::wstring& name, const std::wstring& value) { if (!value.empty()) rows.push_back({ name, value }); };
+        auto value = [&](Uint32 tag) { return Value(n, tag); };
+        auto count = [&](Level level) {
+            size_t k = 0;
+            std::function<void(int)> walk = [&](int i) { if (nodes[i].level == level) { k++; return; } for (int c : nodes[i].children) walk(c); };
+            walk(n);
+            return k;
+        };
+        static const wchar_t* const levels[] = { L"All", L"Patient", L"Study", L"Series", L"Orientation", L"Position", L"Image" };
+        row(levels[static_cast<int>(node.level)], node.text);
+        long long bytes = 0;
+        long frames = 0;
+        std::unordered_set<std::wstring> folders;
+        for (int f : node.files)
+        {
+            bytes += files[f].bytes;
+            frames += files[f].frames;
+            folders.insert(files[f].path.substr(0, files[f].path.find_last_of(L'\\')));
+        }
+        wchar_t buffer[160];
+        switch (node.level)
+        {
+        case Level::Patient:
+            row(L"Patient ID", Widen(g.patient, g.charset));
+            if (!node.person.empty())
+                row(L"Person", L"[" + node.person + L"]  (" + std::to_wstring(node.sharing) + L" people have this Patient ID; this hash is of the name and birth date)");
+            row(L"Studies", std::to_wstring(count(Level::Study)));
+            row(L"Series", std::to_wstring(count(Level::Series)));
+            break;
+        case Level::Study:
+            row(L"Date", DateTimeText(g.studyDate, g.studyTime));
+            row(L"Description", value(0x00081030));
+            row(L"Accession number", value(0x00080050));
+            row(L"Study ID", value(0x00200010));
+            row(L"Study instance UID", value(0x0020000D));
+            row(L"Series", std::to_wstring(count(Level::Series)));
+            {
+                std::wstring modalities;
+                for (int c : node.children)
+                {
+                    const std::wstring m = Widen(files[nodes[c].files[0]].modality);
+                    if (!m.empty() && (L" " + modalities + L" ").find(L" " + m + L" ") == std::wstring::npos)
+                        modalities += (modalities.empty() ? L"" : L" ") + m;
+                }
+                row(L"Modalities", modalities);
+            }
+            break;
+        case Level::Series:
+            row(L"Modality", Widen(g.modality));
+            row(L"Series number", Widen(g.seriesNumber));
+            row(L"Description", Widen(g.seriesDescription, g.charset));
+            row(L"Date", DateTimeText(g.seriesDate, g.seriesTime));
+            row(L"Protocol", value(0x00181030));
+            row(L"Body part", value(0x00180015));
+            {
+                std::wstring device = value(0x00080070);
+                const std::wstring model = value(0x00081090);
+                if (!model.empty()) device += (device.empty() ? L"" : L" ") + model;
+                row(L"Device", device);
+            }
+            row(L"Series instance UID", Widen(g.series));
+            row(L"Orientations", std::to_wstring(count(Level::Orientation)));
+            row(L"Positions", std::to_wstring(count(Level::Position)));
+            break;
+        case Level::Orientation:
+        {
+            Header h;
+            h.imageOrientation = g.orientationText;
+            row(L"Plane", PlaneName(h));
+            row(L"Image orientation", Widen(g.orientationText));
+            swprintf_s(buffer, L"%u x %u", g.columns, g.rows);
+            row(L"Columns x rows", buffer);
+            row(L"Pixel spacing", value(0x00280030));
+            row(L"Slice thickness", value(0x00180050));
+            row(L"Positions", std::to_wstring(node.children.size()));
+            size_t least = SIZE_MAX, most = 0;
+            for (int c : node.children) { least = (std::min)(least, nodes[c].files.size()); most = (std::max)(most, nodes[c].files.size()); }
+            row(L"Images per position", least == most ? std::to_wstring(least) : std::to_wstring(least) + L" to " + std::to_wstring(most));
+            std::vector<double> zs;
+            for (int c : node.children) if (files[nodes[c].files[0]].hasZ) zs.push_back(files[nodes[c].files[0]].z);
+            if (zs.size() == node.children.size() && !zs.empty())
+            {
+                swprintf_s(buffer, L"%.2f to %.2f mm", zs.front(), zs.back());
+                row(L"Z", buffer);
+                if (zs.size() > 1)
+                {
+                    std::vector<double> steps;
+                    for (size_t k = 1; k < zs.size(); k++) steps.push_back(zs[k] - zs[k - 1]);
+                    std::sort(steps.begin(), steps.end());
+                    swprintf_s(buffer, L"%.3g mm (%.3g to %.3g)", steps[steps.size() / 2], steps.front(), steps.back());
+                    row(L"Spacing of positions", buffer);
+                }
+            }
+            break;
+        }
+        case Level::Position:
+        {
+            row(L"Image position", Widen(g.positionText));
+            if (g.hasZ) { swprintf_s(buffer, L"%.3f mm", g.z); row(L"Z", buffer); }
+            std::vector<double> t;
+            for (int f : node.files) if (!files[f].trigger.empty()) t.push_back(atof(files[f].trigger.c_str()));
+            if (!t.empty())
+            {
+                std::sort(t.begin(), t.end());
+                swprintf_s(buffer, L"%.0f to %.0f ms", t.front(), t.back());
+                row(L"Trigger times", buffer);
+            }
+            break;
+        }
+        case Level::Image:
+            row(L"File", g.path);
+            row(L"Instance number", Widen(g.instance));
+            row(L"SOP instance UID", value(0x00080018));
+            row(L"Object", ObjectType(Narrow(value(0x00080016))));
+            row(L"Compression", Compression(Narrow(value(0x00020010))));
+            swprintf_s(buffer, L"%u x %u", g.columns, g.rows);
+            row(L"Columns x rows", buffer);
+            if (g.frames > 1) row(L"Frames", std::to_wstring(g.frames));
+            row(L"Trigger time", g.trigger.empty() ? L"" : Widen(g.trigger) + L" ms");
+            row(L"Z", g.hasZ ? std::to_wstring(g.z) + L" mm" : L"");
+            row(L"Acquired", g.time.size() >= 8 ? DateTimeText(g.time.substr(0, 8), g.time.substr(8)) : L"");
+            break;
+        default:
+            break;
+        }
+        if (node.level != Level::Image)
+        {
+            row(L"Files", std::to_wstring(node.files.size()) + (frames > static_cast<long>(node.files.size()) ? L"  (" + std::to_wstring(frames) + L" frames)" : L""));
+            std::wstring where = *folders.begin();
+            if (where.size() > root.size() && _wcsnicmp(where.c_str(), root.c_str(), root.size()) == 0) where = L"." + where.substr(root.size());
+            else if (where.size() == root.size()) where = L".";
+            row(L"Folders", folders.size() == 1 ? where : std::to_wstring(folders.size()));
+        }
+        swprintf_s(buffer, L"%.1f MB", bytes / 1048576.0);
+        row(L"Size", buffer);
+        // The notes of its series (not problems: in the color of the rest)
+        if (node.level >= Level::Series)
+        {
+            const auto& notes = nodes[SeriesOf(n)].notes;
+            for (size_t k = 0; k < notes.size(); k++) row(k ? L"" : L"Notes", notes[k]);
+        }
+        firstProblemRow = static_cast<int>(rows.size());
+        const std::vector<std::wstring> problems = ProblemsUnder(n, 40);
+        for (size_t k = 0; k < problems.size(); k++) row(k ? L"" : L"\u26A0 Problems", problems[k]);
+
+        SendMessageW(info, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(info);
+        for (size_t i = 0; i < rows.size(); i++)
+        {
+            LVITEMW it = {};
+            it.mask = LVIF_TEXT;
+            it.iItem = static_cast<int>(i);
+            it.pszText = const_cast<wchar_t*>(rows[i].first.c_str());
+            const int at = ListView_InsertItem(info, &it);
+            ListView_SetItemText(info, at, 1, const_cast<wchar_t*>(rows[i].second.c_str()));
+        }
+        SendMessageW(info, WM_SETREDRAW, TRUE, 0);
+    }
+
+    // The attributes all the files of a node share: those its children share (an image: its own)
+    const Attributes& Common(int n)
+    {
+        GatherNode& node = nodes[n];
+        if (node.hasCommon) return node.common;
+        if (node.level == Level::Image) node.common = data->files[node.files[0]].attributes;
+        else
+        {
+            for (size_t k = 0; k < node.children.size(); k++)
+            {
+                const Attributes& c = Common(node.children[k]);
+                if (k == 0) { nodes[n].common = c; continue; }
+                Attributes both;
+                const Attributes& a = nodes[n].common;
+                size_t i = 0, j = 0;
+                while (i < a.size() && j < c.size())
+                {
+                    if (a[i].first < c[j].first) i++;
+                    else if (c[j].first < a[i].first) j++;
+                    else
+                    {
+                        if (a[i].second == c[j].second) both.push_back(a[i]);
+                        i++;
+                        j++;
+                    }
+                }
+                nodes[n].common = std::move(both);
+            }
+        }
+        nodes[n].hasCommon = true;
+        return nodes[n].common;
+    }
+
+    static const std::pair<Uint32, Uint32>* Find(const Attributes& a, Uint32 tag)
+    {
+        auto it = std::lower_bound(a.begin(), a.end(), tag, [](const std::pair<Uint32, Uint32>& x, Uint32 t) { return x.first < t; });
+        return it != a.end() && it->first == tag ? &*it : nullptr;
+    }
+
+    // The value of an attribute in a node: the one of all its files, "(varies)", or nothing
+    std::wstring Value(int n, Uint32 tag)
+    {
+        if (const auto* v = Find(Common(n), tag)) return Shown(tag, data->pool.Text(v->second));
+        for (int f : nodes[n].files) if (Find(data->files[f].attributes, tag)) return L"(varies)";
+        return L"";
+    }
+
+    std::wstring Shown(Uint32 tag, const std::wstring& value) const
+    {
+        return hideIdentity && IdentifyingTag(tag) && !value.empty() ? L"(hidden)" : value;
+    }
+
+    // ----- the full info
+
+    static bool Matches(const std::wstring& text, const std::wstring& what, const std::wregex& re, bool isRegex)
+    {
+        if (what.empty()) return true;
+        if (isRegex)
+        {
+            try { return std::regex_search(text, re); }
+            catch (...) { return false; }
+        }
+        return StrStrIW(text.c_str(), what.c_str()) != nullptr;
+    }
+
+    // Text, or a regular expression when it is one (it has its characters and compiles)
+    static void Compile(const std::wstring& text, std::wregex& re, bool& isRegex)
+    {
+        isRegex = false;
+        if (text.find_first_of(L"^$[]()|*+?\\{}.") == std::wstring::npos) return;
+        try
+        {
+            re = std::wregex(text, std::regex_constants::icase | std::regex_constants::ECMAScript);
+            isRegex = true;
+        }
+        catch (...) {}
+    }
+
+    // The attributes of the node and of the nodes above it, level by level: at each one those its files
+    // share that the files of the one above do not all share; then those that vary in the node
+    void FillFull(int n)
+    {
+        SendMessageW(full, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(full);
+        ListView_RemoveAllGroups(full);
+        static const wchar_t* const levels[] = { L"All the files", L"Patient", L"Study", L"Series", L"Orientation", L"Position", L"Image" };
+        int groupId = 0, row = 0;
+        auto put =[&](const std::wstring& header, int kind, const std::vector<Row>& rows) {
+            std::vector<const Row*> keep;
+            for (const Row& r : rows)
+            {
+                const std::wstring text = TagText(r.tag) + L" " + TagName(r.tag) + L" " + r.value;
+                if (Matches(text, filterText, filterRegex, filterIsRegex)) keep.push_back(&r);
+            }
+            if (keep.empty()) return;
+            const std::wstring title = header + L"   (" + std::to_wstring(keep.size()) + L")";
+            LVGROUP g = {};
+            g.cbSize = sizeof(g);
+            g.mask = LVGF_HEADER | LVGF_GROUPID | LVGF_STATE;
+            g.pszHeader = const_cast<wchar_t*>(title.c_str());
+            g.iGroupId = ++groupId;
+            g.stateMask = LVGS_COLLAPSIBLE;
+            g.state = LVGS_COLLAPSIBLE;
+            ListView_InsertGroup(full, -1, &g);
+            for (const Row* r : keep)
+            {
+                const std::wstring tag = TagText(r->tag), name = TagName(r->tag);
+                LVITEMW it = {};
+                it.mask = LVIF_TEXT | LVIF_PARAM | LVIF_GROUPID;
+                it.iItem = row++;
+                it.iGroupId = groupId;
+                it.lParam = kind;
+                it.pszText = const_cast<wchar_t*>(tag.c_str());
+                const int at = ListView_InsertItem(full, &it);
+                ListView_SetItemText(full, at, 1, const_cast<wchar_t*>(name.c_str()));
+                ListView_SetItemText(full, at, 2, const_cast<wchar_t*>(r->value.c_str()));
+            }
+        };
+        // The node and those above it (not the whole set when it is one patient)
+        std::vector<int> chain;
+        for (int k = n; k >= 0; k = nodes[k].parent)
+            if (k > 0 || nodes[0].children.size() > 1) chain.push_back(k);
+        const auto& pool = data->pool;
+        for (size_t c = 0; c < chain.size(); c++)
+        {
+            const int k = chain[c];
+            const Attributes& mine = Common(k);
+            const Attributes* above = c + 1 < chain.size() ? &Common(chain[c + 1]) : nullptr;
+            std::vector<Row> rows;
+            for (const auto& a : mine)
+            {
+                const auto* b = above ? Find(*above, a.first) : nullptr;
+                if (b && b->second == a.second) continue;
+                rows.push_back({ a.first, Shown(a.first, pool.Text(a.second)) });
+            }
+            const GatherNode& node = nodes[k];
+            std::wstring header = levels[static_cast<int>(node.level)];
+            if (node.level == Level::All) header = L"Common to all the " + std::to_wstring(node.files.size()) + L" files";
+            else if (node.level == Level::Image) header += L":   " + node.text;
+            else header += L":   " + node.text + L"   -   common to its " + std::to_wstring(node.files.size()) + L" files";
+            put(header, static_cast<int>(node.level), rows);
+            if (c == 0 && node.files.size() > 1) put(L"Varies in the " + std::wstring(levels[static_cast<int>(node.level)]) +
+                                                     L" (number of values: the first ones)", 100, Varying(k));
+        }
+        SendMessageW(full, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(full, nullptr, TRUE);
+    }
+
+    // Those that are not the same in all the files of a node: how many values, the first ones
+    std::vector<Row> Varying(int n)
+    {
+        struct Spread { size_t files = 0; std::vector<Uint32> first; std::unordered_set<Uint32> ids; };
+        std::map<Uint32, Spread> spread;
+        const Attributes& mine = Common(n);
+        for (int f : nodes[n].files)
+            for (const auto& a : data->files[f].attributes)
+            {
+                if (Find(mine, a.first)) continue;
+                Spread& s = spread[a.first];
+                s.files++;
+                if (s.ids.insert(a.second).second && s.first.size() < 3) s.first.push_back(a.second);
+            }
+        std::vector<Row> rows;
+        const size_t total = nodes[n].files.size();
+        for (const auto& [tag, s] : spread)
+        {
+            std::wstring v = std::to_wstring(s.ids.size()) + (s.ids.size() == 1 ? L" value: " : L" values: ");
+            if (hideIdentity && IdentifyingTag(tag)) v += L"(hidden)";
+            else
+                for (size_t i = 0; i < s.first.size(); i++)
+                {
+                    std::wstring one = data->pool.Text(s.first[i]);
+                    if (one.size() > 60) one = one.substr(0, 60) + L"...";
+                    v += (i ? L"  |  " : L"") + one;
+                }
+            if (s.ids.size() > s.first.size()) v += L"  |  ...";
+            if (s.files < total) v += L"   (not in " + std::to_wstring(total - s.files) + L" files)";
+            rows.push_back({ tag, v });
+        }
+        return rows;
+    }
+
+    // ----- find in the tree
+
+    std::vector<int> Order() const
+    {
+        std::vector<int> order;
+        std::function<void(int)> walk = [&](int i) { for (int c : nodes[i].shown) { order.push_back(c); walk(c); } };
+        if (!nodes.empty()) walk(0);
+        return order;
+    }
+
+    bool Hit(int n) const { return !findText.empty() && Matches(nodes[n].text, findText, findRegex, findIsRegex); }
+
+    void FindChanged()
+    {
+        findText = TextOf(findBox);
+        Compile(findText, findRegex, findIsRegex);
+        InvalidateRect(tree, nullptr, TRUE);
+        if (!ready) return;
+        if (findText.empty())
+        {
+            SetStatus(summary);
+            return;
+        }
+        size_t hits = 0;
+        for (int n : Order()) if (Hit(n)) hits++;
+        SetStatus(std::to_wstring(hits) + (hits == 1 ? L" node matches \"" : L" nodes match \"") + findText + L"\"   (Enter / F3: next, Shift+F3: previous)");
+    }
+
+    void FindNext(bool back)
+    {
+        if (!ready) return;
+        if (TextOf(findBox) != findText) FindChanged();
+        if (findText.empty()) return;
+        const std::vector<int> order = Order();
+        if (order.empty()) return;
+        const int n = static_cast<int>(order.size());
+        int at = static_cast<int>(std::find(order.begin(), order.end(), selected) - order.begin());
+        if (at >= n) at = back ? n : -1;
+        for (int k = 1; k <= n; k++)
+        {
+            const int i = ((at + (back ? -k : k)) % n + n) % n;
+            if (!Hit(order[i])) continue;
+            if (HTREEITEM item = ItemOf(order[i]))
+            {
+                TreeView_SelectItem(tree, item);
+                TreeView_EnsureVisible(tree, item);
+            }
+            return;
+        }
+        SetStatus(L"No node matches \"" + findText + L"\"");
+    }
+
+    // ----- context menu, copying
+
+    std::vector<std::wstring> PathsOf(int n) const
+    {
+        std::vector<std::wstring> paths;
+        for (int f : nodes[n].files) paths.push_back(data->files[f].path);
+        return paths;
+    }
+
+    void CopyPaths(int n)
+    {
+        std::wstring text;
+        for (const auto& p : PathsOf(n)) text += p + L"\r\n";
+        CopyText(wnd, text);
+    }
+
+    // The rows of a list (the selected ones, or all), a tab between the columns; the groups as titles
+    void CopyRows(HWND list, bool selection)
+    {
+        const int columns = Header_GetItemCount(ListView_GetHeader(list));
+        std::wstring text;
+        int group = -1;
+        wchar_t buffer[4096];
+        for (int i = 0; i < ListView_GetItemCount(list); i++)
+        {
+            if (selection && !(ListView_GetItemState(list, i, LVIS_SELECTED) & LVIS_SELECTED)) continue;
+            LVITEMW it = {};
+            it.mask = LVIF_GROUPID;
+            it.iItem = i;
+            ListView_GetItem(list, &it);
+            if (list == full && it.iGroupId != group)
+            {
+                group = it.iGroupId;
+                LVGROUP g = {};
+                g.cbSize = sizeof(g);
+                g.mask = LVGF_HEADER;
+                g.pszHeader = buffer;
+                g.cchHeader = ARRAYSIZE(buffer);
+                if (ListView_GetGroupInfo(list, group, &g)) text += (text.empty() ? L"# " : L"\r\n# ") + std::wstring(buffer) + L"\r\n";
+            }
+            for (int c = 0; c < columns; c++)
+            {
+                ListView_GetItemText(list, i, c, buffer, ARRAYSIZE(buffer));
+                text += (c ? L"\t" : L"") + std::wstring(buffer);
+            }
+            text += L"\r\n";
+        }
+        CopyText(wnd, text);
+    }
+
+    void TreeMenu(LPARAM lp)
+    {
+        if (!ready) return;
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        HTREEITEM item = nullptr;
+        if (pt.x == -1 && pt.y == -1)
+        {
+            item = TreeView_GetSelection(tree);
+            RECT r = {};
+            if (item && TreeView_GetItemRect(tree, item, &r, TRUE)) { pt = { r.left, r.bottom }; ClientToScreen(tree, &pt); }
+        }
+        else
+        {
+            TVHITTESTINFO hit = {};
+            hit.pt = pt;
+            ScreenToClient(tree, &hit.pt);
+            item = TreeView_HitTest(tree, &hit);
+            if (item) TreeView_SelectItem(tree, item);
+        }
+        if (!item) return;
+        TVITEMW tv = { TVIF_PARAM };
+        tv.hItem = item;
+        if (!TreeView_GetItem(tree, &tv)) return;
+        const int n = static_cast<int>(tv.lParam);
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, 1, nodes[n].files.size() == 1 ? L"Show in Explorer" : L"Show the files in Explorer");
+        AppendMenuW(menu, MF_STRING, 2, nodes[n].files.size() == 1 ? L"Copy the path" : L"Copy the paths of the files");
+        AppendMenuW(menu, MF_STRING, 3, L"Copy the full info");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | (nodes[n].shown.empty() ? MF_GRAYED : 0), 4, L"Expand all under it");
+        AppendMenuW(menu, MF_STRING | (nodes[n].shown.empty() ? MF_GRAYED : 0), 5, L"Collapse all under it");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        const UINT busy = job ? MF_GRAYED : 0;
+        AppendMenuW(menu, MF_STRING | busy, 6, L"E&xport the images (PNG, animated GIF)...");
+        AppendMenuW(menu, MF_STRING | busy, 7, L"Export to &NIfTI...");
+        AppendMenuW(menu, MF_STRING | busy, 8, L"&Report (HTML)");
+        HidePopup();
+        const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, wnd, nullptr);
+        DestroyMenu(menu);
+        switch (cmd)
+        {
+        case 1: ShowInExplorer(PathsOf(n)); break;
+        case 2: CopyPaths(n); break;
+        case 3: CopyRows(full, false); break;
+        case 4: ExpandAll(n, true); break;
+        case 5: ExpandAll(n, false); break;
+        case 6: Export(n, false); break;
+        case 7: Export(n, true); break;
+        case 8: Report(n); break;
+        }
+    }
+
+    // ----- the floating thumbnail of the node under the mouse
+
+    static LRESULT CALLBACK TreeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref)
+    {
+        auto self = reinterpret_cast<DicomExplorer*>(ref);
+        switch (msg)
+        {
+        case WM_MOUSEMOVE: self->HoverMove({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); break;
+        case WM_MOUSEHOVER:
+            // (it is ours: the tree, without its tooltips, falls over its own handling of it)
+            self->hoverArmed = false;
+            self->HoverShow({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            return 0;
+        case WM_MOUSELEAVE: self->hoverArmed = false; self->hoverItem = nullptr; self->HidePopup(); break;
+        case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MOUSEWHEEL: case WM_VSCROLL: case WM_HSCROLL: case WM_KEYDOWN: case WM_KILLFOCUS:
+            self->HidePopup();
+            break;
+        case WM_NCDESTROY: RemoveWindowSubclass(h, TreeProc, 1); break;
+        }
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+
+    int NodeAt(POINT pt, HTREEITEM* where = nullptr) const
+    {
+        TVHITTESTINFO hit = {};
+        hit.pt = pt;
+        HTREEITEM item = TreeView_HitTest(tree, &hit);
+        if (!item || !(hit.flags & TVHT_ONITEM)) return -1;
+        if (where) *where = item;
+        TVITEMW tv = { TVIF_PARAM };
+        tv.hItem = item;
+        return TreeView_GetItem(tree, &tv) ? static_cast<int>(tv.lParam) : -1;
+    }
+
+    // The mouse on another node: the thumbnail goes, and comes back if it stays still there for a moment
+    void HoverMove(POINT pt)
+    {
+        if (!ready || !hoverPreview) return;
+        HTREEITEM item = nullptr;
+        NodeAt(pt, &item);
+        if (item != hoverItem)
+        {
+            hoverItem = item;
+            HidePopup();
+            hoverArmed = false;
+        }
+        if (!hoverArmed && item && (!popup || !IsWindowVisible(popup)))
+        {
+            TRACKMOUSEEVENT t = { sizeof(t), TME_HOVER | TME_LEAVE, tree, 450 };
+            hoverArmed = TrackMouseEvent(&t) != FALSE;
+        }
+    }
+
+    void HoverShow(POINT pt)
+    {
+        if (!ready || !hoverPreview || !popup) return;
+        HTREEITEM item = nullptr;
+        const int n = NodeAt(pt, &item);
+        if (n <= 0 || n >= static_cast<int>(nodes.size())) return;
+        popupNode = n;
+        popupFrame = 0;
+        hoverItem = item;
+        if (!thumbs.count(n)) AskThumb(n);
+        PlacePopup();
+    }
+
+    void HidePopup()
+    {
+        if (!popup) return;
+        KillTimer(popup, TimerFrame);
+        if (IsWindowVisible(popup)) ShowWindow(popup, SW_HIDE);
+        popupNode = -1;
+    }
+
+    // What the thumbnail of a node shows (DCMthumbnail.m): an image, its frames; a position, its images
+    // (the cine); an orientation, its positions as a mosaic (each one moving, a cine of several slices); a
+    // series of several orientations, one over the other; a study or a patient, a mosaic of its series
+    Stack StackOf(int n) const
+    {
+        const GatherNode& node = nodes[n];
+        const std::vector<Gathered>& files = data->files;
+        Stack s;
+        if (node.level == Level::Image)
+        {
+            s.files = { { files[node.files[0]].path } };
+            s.frames = files[node.files[0]].frames;
+            return s;
+        }
+        std::vector<int> positions;
+        if (node.level == Level::Position) positions = { n };
+        else
+        {
+            int o = n;
+            while (nodes[o].level != Level::Orientation && !nodes[o].children.empty()) o = nodes[o].children[0];
+            positions = nodes[o].children;
+        }
+        for (int p : positions)
+        {
+            std::vector<std::wstring> paths;
+            for (int f : nodes[p].files) paths.push_back(files[f].path);
+            s.files.push_back(std::move(paths));
+        }
+        if (s.files.size() == 1 && s.files[0].size() == 1) s.frames = files[nodes[positions[0]].files[0]].frames;
+        // The time from image to image: the median step of the trigger times of the first position
+        std::vector<double> t;
+        for (int f : nodes[positions[0]].files) if (!files[f].trigger.empty()) t.push_back(atof(files[f].trigger.c_str()));
+        if (t.size() > 1)
+        {
+            std::vector<double> steps;
+            for (size_t k = 1; k < t.size(); k++) steps.push_back(std::fabs(t[k] - t[k - 1]));
+            std::sort(steps.begin(), steps.end());
+            s.delay = steps[steps.size() / 2];
+        }
+        return s;
+    }
+
+    // The orientation with most positions of a series (the one that shows it best)
+    int MainOrientation(int series) const
+    {
+        int best = nodes[series].children[0];
+        for (int o : nodes[series].children) if (nodes[o].children.size() > nodes[best].children.size()) best = o;
+        return best;
+    }
+
+    void AskThumb(int n)
+    {
+        ThumbAsk a;
+        a.node = n;
+        a.generation = generation;
+        const COLORREF bg = GetSysColor(COLOR_INFOBK);
+        a.background = (static_cast<DWORD>(GetRValue(bg)) << 16) | (GetGValue(bg) << 8) | GetBValue(bg);
+        const GatherNode& node = nodes[n];
+        if (node.level == Level::Series && node.children.size() > 1)
+        {
+            a.kind = ThumbAsk::Cascade;
+            for (int o : node.children) a.stacks.push_back(StackOf(o));
+        }
+        else if (node.level == Level::Study || node.level == Level::Patient)
+        {
+            a.kind = ThumbAsk::Grid;
+            std::function<void(int)> walk = [&](int k) {
+                if (a.stacks.size() >= 20) return;
+                if (nodes[k].level == Level::Series) { a.stacks.push_back(StackOf(MainOrientation(k))); return; }
+                for (int c : nodes[k].children) walk(c);
+            };
+            walk(n);
+        }
+        else a.stacks.push_back(StackOf(n));
+        if (worker) worker->Ask(std::move(a));
+    }
+
+    void Thumbnailed(ThumbDone* d)
+    {
+        std::unique_ptr<ThumbDone> done(d);
+        if (d->generation != generation || d->node <= 0 || d->node >= static_cast<int>(nodes.size())) return;
+        thumbs[d->node] = std::make_shared<Thumb>(std::move(d->thumb));
+        if (popupNode == d->node) { popupFrame = 0; PlacePopup(); }
+    }
+
+    // The line of the node (and what the thumbnail shows of it) under the image
+    std::wstring PopupText() const
+    {
+        if (popupNode <= 0) return std::wstring();
+        std::wstring s = nodes[popupNode].text;
+        auto it = thumbs.find(popupNode);
+        if (it == thumbs.end()) s += L"\nReading...";
+        else if (!it->second->error.empty()) s += L"\nNo image: " + it->second->error;
+        else
+        {
+            if (!it->second->caption.empty()) s += L"\n" + it->second->caption;
+            const GatherNode& node = nodes[popupNode];
+            if (node.level == Level::Series && node.children.size() > 1) s += L"\n" + std::to_wstring(node.children.size()) + L" orientations, their middle images";
+            if (node.level == Level::Study || node.level == Level::Patient)
+            {
+                size_t k = 0;
+                std::function<void(int)> walk = [&](int c) { if (nodes[c].level == Level::Series) { k++; return; } for (int d : nodes[c].children) walk(d); };
+                walk(popupNode);
+                s += L"\n" + std::wstring(k > 20 ? L"20 of " : L"") + std::to_wstring(k) + L" series, their middle images";
+            }
+        }
+        return s;
+    }
+
+    int PopupScale() const { return (std::max)(1, static_cast<int>((GetDpiForWindow(wnd) + 48) / 96)); }
+
+    // The popup beside the node, its size that of the image and the text, inside the screen
+    void PlacePopup()
+    {
+        if (!popup || popupNode <= 0 || !hoverItem) return;
+        auto it = thumbs.find(popupNode);
+        const Thumb* t = it != thumbs.end() && !it->second->frames.empty() ? it->second.get() : nullptr;
+        const int k = PopupScale(), m = Px(6);
+        const int iw = t ? t->frames[0].width * k : 0, ih = t ? t->frames[0].height * k : 0;
+        HDC dc = GetDC(popup);
+        HGDIOBJ old = SelectObject(dc, font);
+        RECT text = { 0, 0, (std::max)(iw, Px(260)), 0 };
+        const std::wstring s = PopupText();
+        DrawTextW(dc, s.c_str(), -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(popup, dc);
+        const int w = (std::max)(iw, static_cast<int>(text.right)) + 2 * m + 2, h = ih + (ih ? m : 0) + text.bottom + 2 * m + 2;
+        RECT r = {};
+        TreeView_GetItemRect(tree, hoverItem, &r, TRUE);
+        POINT at = { r.right + Px(16), r.top };
+        ClientToScreen(tree, &at);
+        POINT cursor;
+        GetCursorPos(&cursor);
+        at.x = (std::max)(at.x, cursor.x + Px(24));
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mi);
+        const RECT& work = mi.rcWork;
+        if (at.x + w > work.right) at.x = (std::max)(static_cast<LONG>(work.left), cursor.x - Px(24) - w);
+        if (at.y + h > work.bottom) at.y = (std::max)(work.top, work.bottom - h);
+        SetWindowPos(popup, HWND_TOPMOST, at.x, at.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(popup, nullptr, TRUE);
+        KillTimer(popup, TimerFrame);
+        if (t && t->frames.size() > 1) SetTimer(popup, TimerFrame, static_cast<UINT>(t->delay), nullptr);
+    }
+
+    void PaintPopup(HDC dc)
+    {
+        RECT c;
+        GetClientRect(popup, &c);
+        FillRect(dc, &c, GetSysColorBrush(COLOR_INFOBK));
+        if (popupNode <= 0) return;
+        const int k = PopupScale(), m = Px(6);
+        int y = m;
+        auto it = thumbs.find(popupNode);
+        if (it != thumbs.end() && !it->second->frames.empty())
+        {
+            const Picture& p = it->second->frames[popupFrame % it->second->frames.size()];
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth = p.width;
+            bi.bmiHeader.biHeight = -p.height;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            SetStretchBltMode(dc, COLORONCOLOR);
+            StretchDIBits(dc, m, y, p.width * k, p.height * k, 0, 0, p.width, p.height, p.px.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+            y += p.height * k + m;
+        }
+        RECT text = { m, y, c.right - m, c.bottom - m };
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, GetSysColor(COLOR_INFOTEXT));
+        HGDIOBJ old = SelectObject(dc, font);
+        const std::wstring s = PopupText();
+        DrawTextW(dc, s.c_str(), -1, &text, DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+    }
+
+    static LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+    {
+        auto self = reinterpret_cast<DicomExplorer*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        switch (msg)
+        {
+        case WM_NCCREATE:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+            break;
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (self)
+            {
+                // (drawn aside first: no flicker while it moves)
+                RECT c;
+                GetClientRect(hwnd, &c);
+                HDC mem = CreateCompatibleDC(dc);
+                HBITMAP bmp = CreateCompatibleBitmap(dc, c.right, c.bottom);
+                HGDIOBJ old = SelectObject(mem, bmp);
+                self->PaintPopup(mem);
+                BitBlt(dc, 0, 0, c.right, c.bottom, mem, 0, 0, SRCCOPY);
+                SelectObject(mem, old);
+                DeleteObject(bmp);
+                DeleteDC(mem);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            if (self && wp == TimerFrame)
+            {
+                self->popupFrame++;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    // ----- exports and the report
+
+    // A name for a file or a folder: what Windows does not take, out; not too long
+    static std::wstring Clean(std::wstring s)
+    {
+        for (auto& c : s) if (c < 32 || wcschr(L"<>:\"/\\|?*", c)) c = L'_';
+        std::wstring out;
+        for (wchar_t c : s) if (!(c == L' ' && (out.empty() || out.back() == L' '))) out += c;
+        if (out.size() > 90) out.resize(90);
+        while (!out.empty() && (out.back() == L' ' || out.back() == L'.')) out.pop_back();
+        return out.empty() ? L"_" : out;
+    }
+
+    // "S005 MR cine_sa": the number, modality and description of a series
+    std::wstring SeriesName(int r) const
+    {
+        const Gathered& g = data->files[nodes[r].files[0]];
+        wchar_t number[32] = L"S";
+        if (!g.seriesNumber.empty()) swprintf_s(number, L"S%03ld", atol(g.seriesNumber.c_str()));
+        std::wstring s = number;
+        if (!g.modality.empty()) s += L" " + Widen(g.modality);
+        if (!g.seriesDescription.empty()) s += L" " + Widen(g.seriesDescription, g.charset);
+        return Clean(s);
+    }
+
+    int SeriesOf(int n) const
+    {
+        while (n > 0 && nodes[n].level != Level::Series) n = nodes[n].parent;
+        return n;
+    }
+
+    // The folder of a patient, a study (or all): their line, without the counts
+    std::wstring FolderName(int n) const
+    {
+        if (nodes[n].level == Level::All) return Clean(root.substr(root.find_last_of(L'\\') + 1));
+        std::wstring s = Plain(n);
+        const size_t open = s.rfind(L"   (");
+        if (open != std::wstring::npos) s.resize(open);
+        return Clean(s);
+    }
+
+    // The name of an orientation in its series: the series, and its plane when there are more
+    std::wstring OrientationName(int o) const
+    {
+        const int r = nodes[o].parent;
+        std::wstring s = SeriesName(r);
+        if (nodes[r].children.size() > 1)
+        {
+            Header h;
+            h.imageOrientation = data->files[nodes[o].files[0]].orientationText;
+            std::wstring plane = PlaneName(h);
+            const auto& c = nodes[r].children;
+            s += L" - " + (plane.empty() ? L"orientation" : plane) + L" " + std::to_wstring(std::find(c.begin(), c.end(), o) - c.begin() + 1);
+        }
+        return s;
+    }
+
+    std::wstring PositionName(int p) const
+    {
+        const Gathered& g = data->files[nodes[p].files[0]];
+        wchar_t z[40] = L"";
+        if (g.hasZ) swprintf_s(z, L" Z%.2f", g.z);
+        else swprintf_s(z, L" P%zu", static_cast<size_t>(std::find(nodes[nodes[p].parent].children.begin(), nodes[nodes[p].parent].children.end(), p) -
+                                                            nodes[nodes[p].parent].children.begin()) + 1);
+        return OrientationName(nodes[p].parent) + z;
+    }
+
+    std::wstring ImageName(int i) const
+    {
+        const Gathered& g = data->files[nodes[i].files[0]];
+        std::wstring s = PositionName(nodes[i].parent);
+        if (!g.instance.empty()) s += L" I" + Widen(g.instance);
+        else s += L" " + Clean(g.path.substr(g.path.find_last_of(L'\\') + 1));
+        return s;
+    }
+
+    // The NIfTI of an orientation, a position (a cine of one slice) or an image: where its positions are
+    void NiftiUnit(ExportUnit& u, const std::vector<int>& positions) const
+    {
+        const std::vector<Gathered>& files = data->files;
+        const Gathered& g = files[nodes[positions[0]].files[0]];
+        u.kind = ExportUnit::Nifti;
+        u.placed = g.oriented;
+        memcpy(u.orientation, g.orientation, sizeof(u.orientation));
+        for (int p : positions)
+        {
+            const Gathered& h = files[nodes[p].files[0]];
+            u.placed = u.placed && h.placed;
+            u.positions.push_back({ h.position[0], h.position[1], h.position[2] });
+        }
+        double v = 0;
+        const std::wstring* t = AttributeOf(nodes[positions[0]].files[0], 0x00180088);       // SpacingBetweenSlices
+        if (!t || !FirstNumber(Narrow(*t), v) || v <= 0) t = AttributeOf(nodes[positions[0]].files[0], 0x00180050);
+        if (t && FirstNumber(Narrow(*t), v) && v > 0) u.thickness = v;
+        u.timeStep = u.stack.delay;
+        // The rescale of all of them the same: the stored values, and it in the header
+        for (Uint32 tag : { 0x00281053u, 0x00281052u })
+        {
+            const std::wstring* first = AttributeOf(nodes[positions[0]].files[0], tag);
+            for (int p : positions)
+                for (int f : nodes[p].files)
+                {
+                    const std::wstring* other = AttributeOf(f, tag);
+                    if ((first == nullptr) != (other == nullptr) || (first && *first != *other)) u.sameRescale = false;
+                }
+        }
+    }
+
+    // The files of a node to write, into a folder: a study (a patient, all) as folders of its own, its
+    // series as files there. Images: an image as a PNG (its frames, a GIF); several images of a position
+    // (a cine) as a GIF; an orientation of one image a position as a GIF through them, of more each of its
+    // positions as their own GIF. NIfTI: an orientation (a position, an image) as a volume.
+    void Plan(int n, bool nifti, const std::wstring& folder, ExportJob& j)
+    {
+        const GatherNode& node = nodes[n];
+        const std::wstring at = folder + L"\\";
+        switch (node.level)
+        {
+        case Level::All:
+        case Level::Patient:
+        case Level::Study:
+            for (int c : node.children) Plan(c, nifti, nodes[c].level == Level::Series ? folder : at + FolderName(c), j);
+            return;
+        case Level::Series:
+            for (int o : node.children) PlanOrientation(o, nifti, at + OrientationName(o), j);
+            return;
+        case Level::Orientation:
+            PlanOrientation(n, nifti, at + OrientationName(n), j);
+            return;
+        case Level::Position:
+            PlanPosition(n, nifti, at + PositionName(n), j);
+            return;
+        case Level::Image:
+            PlanImage(n, nifti, at + ImageName(n), j);
+            return;
+        }
+    }
+
+    void PlanOrientation(int o, bool nifti, const std::wstring& base, ExportJob& j)
+    {
+        // (a report, a PDF, a presentation state: nothing to show)
+        if (data->files[nodes[o].files[0]].rows == 0) { j.withoutImage++; return; }
+        const auto& positions = nodes[o].children;
+        if (positions.size() == 1) { PlanPosition(positions[0], nifti, base, j); return; }
+        ExportUnit u;
+        u.stack = StackOf(o);
+        const size_t times = nodes[positions[0]].files.size();
+        const bool even = std::all_of(positions.begin(), positions.end(), [&](int p) { return nodes[p].files.size() == times; });
+        if (nifti)
+        {
+            if (!even)
+            {
+                j.notes.push_back(base.substr(base.find_last_of(L'\\') + 1) + L": not written, its positions have different numbers of images");
+                return;
+            }
+            NiftiUnit(u, positions);
+            u.out = base + L".nii";
+            u.description = Narrow(base.substr(base.find_last_of(L'\\') + 1));
+            j.total += static_cast<long>(nodes[o].files.size());
+            j.units.push_back(std::move(u));
+            return;
+        }
+        if (times == 1 && even)
+        {
+            u.kind = ExportUnit::Gif;
+            u.out = base + L".gif";
+            j.total += static_cast<long>(positions.size());
+            j.units.push_back(std::move(u));
+            return;
+        }
+        for (int p : positions) PlanPosition(p, false, base + PositionName(p).substr(OrientationName(o).size()), j);
+    }
+
+    void PlanPosition(int p, bool nifti, const std::wstring& base, ExportJob& j)
+    {
+        if (nodes[p].files.size() == 1) { PlanImage(nodes[p].children[0], nifti, base, j); return; }
+        ExportUnit u;
+        u.stack = StackOf(p);
+        if (nifti)
+        {
+            NiftiUnit(u, { p });
+            u.out = base + L".nii";
+            u.description = Narrow(base.substr(base.find_last_of(L'\\') + 1));
+        }
+        else
+        {
+            u.kind = ExportUnit::Gif;
+            u.overTime = true;
+            u.out = base + L".gif";
+        }
+        j.total += static_cast<long>(nodes[p].files.size());
+        j.units.push_back(std::move(u));
+    }
+
+    void PlanImage(int i, bool nifti, const std::wstring& base, ExportJob& j)
+    {
+        ExportUnit u;
+        u.stack = StackOf(i);
+        const int frames = u.stack.frames;
+        if (nifti)
+        {
+            NiftiUnit(u, { nodes[i].parent });
+            u.out = base + L".nii";
+            u.description = Narrow(base.substr(base.find_last_of(L'\\') + 1));
+        }
+        else
+        {
+            u.kind = frames > 1 ? ExportUnit::Gif : ExportUnit::Png;
+            u.overTime = true;
+            u.out = base + (frames > 1 ? L".gif" : L".png");
+        }
+        j.total += frames;
+        j.units.push_back(std::move(u));
+    }
+
+    // A folder to write into (the last one used, the first time Pictures)
+    std::wstring PickFolder(const wchar_t* title, const wchar_t* setting)
+    {
+        IFileOpenDialog* d = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return std::wstring();
+        DWORD options = 0;
+        d->GetOptions(&options);
+        d->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        d->SetTitle(title);
+        std::wstring start = ReadText(setting);
+        if (start.empty() || !PathIsDirectoryW(start.c_str()))
+        {
+            PWSTR pictures = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pictures))) start = pictures;
+            CoTaskMemFree(pictures);
+        }
+        IShellItem* at = nullptr;
+        if (!start.empty() && SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&at)))) { d->SetFolder(at); at->Release(); }
+        std::wstring out;
+        if (SUCCEEDED(d->Show(wnd)))
+        {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(d->GetResult(&item)))
+            {
+                PWSTR p = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { out = p; CoTaskMemFree(p); }
+                item->Release();
+            }
+        }
+        d->Release();
+        if (!out.empty())
+            RegSetKeyValueW(HKEY_CURRENT_USER, Settings, setting, REG_SZ, out.c_str(), static_cast<DWORD>((out.size() + 1) * sizeof(wchar_t)));
+        return out;
+    }
+
+    void Export(int n, bool nifti)
+    {
+        if (!ready || job || n <= 0) return;
+        std::wstring folder = PickFolder(nifti ? L"Export to NIfTI: the folder to write into" : L"Export the images: the folder to write into",
+                                         L"ExportFolder");
+        if (folder.empty()) return;
+        while (folder.size() > 3 && folder.back() == L'\\') folder.pop_back();
+        auto j = std::make_unique<ExportJob>();
+        // A study, a patient: a folder of its own
+        const Level level = nodes[n].level;
+        Plan(n, nifti, level == Level::Patient || level == Level::Study ? folder + L"\\" + FolderName(n) : folder, *j);
+        if (j->units.empty())
+        {
+            SetStatus(L"Nothing to export" + (j->notes.empty() ? std::wstring() : L": " + j->notes[0]));
+            return;
+        }
+        // The window dragged in the preview, when it shows a file of the node
+        std::wstring file;
+        if (!nifti && preview && preview->DraggedWindow(file, j->center, j->width))
+            for (int f : nodes[n].files) if (data->files[f].path == file) { j->dragged = true; break; }
+        StartJob(std::move(j));
+    }
+
+    void StartJob(std::unique_ptr<ExportJob> j)
+    {
+        job = std::move(j);
+        job->window = wnd;
+        job->message = WM_EXPORTED;
+        job->thread = std::thread(RunExport, job.get());
+        SetTimer(wnd, TimerJob, 250, nullptr);
+        JobProgress();
+    }
+
+    void JobProgress()
+    {
+        if (!job) return;
+        wchar_t text[200];
+        swprintf_s(text, job->reportPath.empty() ? L"Exporting: %ld of %ld images...   (Esc: stop)" : L"The report: %ld of %ld thumbnails...   (Esc: stop)",
+                   job->done.load(), job->total);
+        SetStatus(text);
+    }
+
+    void StopJob()
+    {
+        if (!job) return;
+        job->cancel = true;
+        if (job->thread.joinable()) job->thread.join();
+        job.reset();
+    }
+
+    // Over: what was written, shown in Explorer (the report: opened)
+    void JobDone()
+    {
+        KillTimer(wnd, TimerJob);
+        if (!job) return;
+        if (job->thread.joinable()) job->thread.join();
+        std::unique_ptr<ExportJob> j = std::move(job);
+        std::wstring s;
+        if (!j->reportPath.empty())
+        {
+            s = j->written.empty() ? L"The report was not written" : L"Report written: " + j->reportPath;
+            if (!j->written.empty()) ShellExecuteW(wnd, L"open", j->reportPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        else
+        {
+            s = std::to_wstring(j->written.size()) + (j->written.size() == 1 ? L" file written" : L" files written");
+            if (!j->written.empty())
+            {
+                const std::wstring& w = j->written[0];
+                s += L" in " + w.substr(0, w.find_last_of(L'\\'));
+                ShowInExplorer({ w });
+            }
+        }
+        if (j->withoutImage) s += L"   -   " + std::to_wstring(j->withoutImage) + L" without image (reports, PDFs...) left out";
+        if (j->cancel) s += L"   -   stopped";
+        if (!j->notes.empty())
+        {
+            s += L"   -   " + std::to_wstring(j->notes.size()) + (j->notes.size() == 1 ? L" note: " : L" notes, the first: ") + j->notes[0];
+            std::wstring all;
+            for (const auto& note : j->notes) all += note + L"\r\n";
+            if (j->notes.size() > 1) CopyText(wnd, all);
+        }
+        SetStatus(s);
+    }
+
+    // ----- the report
+
+    static std::wstring Html(const std::wstring& s)
+    {
+        std::wstring out;
+        for (wchar_t c : s)
+        {
+            switch (c)
+            {
+            case L'&': out += L"&amp;"; break;
+            case L'<': out += L"&lt;"; break;
+            case L'>': out += L"&gt;"; break;
+            case L'"': out += L"&quot;"; break;
+            default: out += c;
+            }
+        }
+        return out;
+    }
+
+    // Where a report goes: a temporary folder of its own (%TEMP%\DicomStudyCount\reports), a name not used
+    // yet; the browser saves it where it is wanted (Save as). The reports there of more than 7 days go.
+    std::wstring ReportPath(int n) const
+    {
+        wchar_t temp[MAX_PATH + 1] = {};
+        if (!GetTempPathW(MAX_PATH + 1, temp)) return std::wstring();
+        const std::wstring folder = std::wstring(temp) + L"DicomStudyCount\\reports";
+        SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
+        WIN32_FIND_DATAW fd;
+        HANDLE find = FindFirstFileW((folder + L"\\*.html").c_str(), &fd);
+        if (find != INVALID_HANDLE_VALUE)
+        {
+            FILETIME now;
+            GetSystemTimeAsFileTime(&now);
+            const ULONGLONG week = 7ULL * 24 * 3600 * 10000000, t = (static_cast<ULONGLONG>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+            do
+            {
+                const ULONGLONG w = (static_cast<ULONGLONG>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && t > w + week) DeleteFileW((folder + L"\\" + fd.cFileName).c_str());
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+        return FreePath(folder + L"\\DICOM report - " + (nodes[n].level == Level::Series ? SeriesName(n) : FolderName(n)) + L".html");
+    }
+
+    // A web page of what there is under a node (a lower one: its series): the patients, their studies and
+    // a table of their series - a thumbnail, the planes and sizes, the spacings, the Z range, the files,
+    // what the checks found. Never who the patient is, unless it is not hidden here.
+    void Report(int n, std::wstring path = std::wstring())
+    {
+        if (!ready || job) return;
+        if (n < 0) n = 0;
+        if (nodes[n].level > Level::Series) n = SeriesOf(n);
+        if (path.empty()) path = ReportPath(n);
+        if (path.empty()) return;
+        auto j = std::make_unique<ExportJob>();
+        j->reportPath = path;
+        const std::vector<Gathered>& files = data->files;
+        auto first = [&](int k, Uint32 tag) {
+            const std::wstring* v = AttributeOf(nodes[k].files[0], tag);
+            return v ? *v : std::wstring();
+        };
+        auto mb = [&](int k) {
+            long long b = 0;
+            for (int f : nodes[k].files) b += files[f].bytes;
+            wchar_t s[40];
+            swprintf_s(s, L"%.1f", b / 1048576.0);
+            return std::wstring(s);
+        };
+        // Where the files of a node are, from the folder of the report (".\..."): its folder; two or three,
+        // each one; more, the folder that holds them all and how many
+        auto relative = [&](const std::wstring& dir) {
+            if (dir.size() >= root.size() && _wcsnicmp(dir.c_str(), root.c_str(), root.size()) == 0 &&
+                (dir.size() == root.size() || dir[root.size()] == L'\\'))
+                return L"." + dir.substr(root.size());
+            return dir;
+        };
+        auto where = [&](int k) {
+            std::vector<std::wstring> dirs;
+            std::unordered_set<std::wstring> seen;
+            for (int f : nodes[k].files)
+            {
+                const std::wstring& p = files[f].path;
+                std::wstring d = p.substr(0, p.find_last_of(L'\\'));
+                if (seen.insert(d).second) dirs.push_back(std::move(d));
+            }
+            if (dirs.empty()) return std::wstring();
+            if (dirs.size() <= 3)
+            {
+                std::wstring s;
+                for (const auto& d : dirs) s += (s.empty() ? L"" : L"   \u00B7   ") + relative(d);
+                return s;
+            }
+            // (the longest start they share, cut at a backslash)
+            std::wstring common = dirs[0];
+            for (const auto& d : dirs)
+            {
+                size_t i = 0;
+                while (i < common.size() && i < d.size() && towlower(common[i]) == towlower(d[i])) i++;
+                common.resize(i);
+            }
+            const bool whole = std::all_of(dirs.begin(), dirs.end(), [&](const std::wstring& d) { return d.size() == common.size() || d[common.size()] == L'\\'; });
+            if (!whole) common.resize(common.find_last_of(L'\\') == std::wstring::npos ? 0 : common.find_last_of(L'\\'));
+            return (common.empty() ? std::wstring() : relative(common) + L"  ") + L"(" + std::to_wstring(dirs.size()) + L" folders)";
+        };
+        // The patients, studies and series under the node (or above it, for a series)
+        std::vector<int> series;
+        std::function<void(int)> walk = [&](int k) {
+            if (nodes[k].level == Level::Series) { series.push_back(k); return; }
+            for (int c : nodes[k].children) walk(c);
+        };
+        walk(n);
+        size_t troubled = 0, studies = 0, images = 0;
+        std::vector<int> patients, studyList;
+        for (int r : series)
+        {
+            const int s = nodes[r].parent, p = nodes[s].parent;
+            if (std::find(studyList.begin(), studyList.end(), s) == studyList.end()) studyList.push_back(s);
+            if (std::find(patients.begin(), patients.end(), p) == patients.end()) patients.push_back(p);
+            if (!nodes[r].flags.empty()) troubled++;
+            images += nodes[r].files.size();
+        }
+        studies = studyList.size();
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        wchar_t when[64];
+        swprintf_s(when, L"%04d-%02d-%02d %02d:%02d", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute);
+        const std::wstring scope = n == 0 ? root : root + L"   \u203A   " + nodes[n].text;
+
+        std::wstring h;
+        h += L"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+             L"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>DICOM report</title>\n<style>\n"
+             L":root{--bg:#ffffff;--fg:#1c1c1e;--muted:#6b6b72;--line:#e2e2e7;--card:#f6f6f8;--warn:#a84f00;--warnbg:#fff4e6;--link:#0a58ca;"
+             L"--patient:#c00000;--study:#007a00;--series:#0046dc}\n"
+             L"@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececf0;--muted:#a1a1aa;--line:#2c2c31;--card:#1d1d21;"
+             L"--warn:#f5a524;--warnbg:#2b2112;--link:#7ab0ff;--patient:#ff7b7b;--study:#6ad46a;--series:#7aa7ff}}\n"
+             L"*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 \"Segoe UI\",system-ui,sans-serif}\n"
+             L"main{max-width:1320px;margin:0 auto;padding:28px 16px 56px}h1{font-size:24px;margin:0 0 4px}\n"
+             L".meta{color:var(--muted);overflow-wrap:anywhere}.totals{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0 8px}\n"
+             L".totals div{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:110px}\n"
+             L".totals b{display:block;font-size:22px;font-variant-numeric:tabular-nums}\n"
+             L"h2{font-size:19px;margin:34px 0 4px;color:var(--patient)}h3{font-size:16px;margin:24px 0 2px;color:var(--study)}\n"
+             L".wrap{overflow-x:auto;margin-top:8px;border:1px solid var(--line);border-radius:10px}\n"
+             L".study{border-left:6px solid var(--c);padding:2px 0 6px 14px;margin-top:24px}.study h3{margin-top:0}"
+             L".study .wrap{border:5px solid var(--c);outline:1px solid var(--line)}\n"
+             L".sw{display:inline-block;width:14px;height:14px;border-radius:3px;background:var(--c);outline:1px solid var(--line);"
+             L"vertical-align:-2px;margin-right:8px}\n"
+             L".dot{display:inline-block;width:10px;height:10px;border-radius:50%;outline:1px solid var(--line);margin-right:6px}\n"
+             L".where{font-family:Consolas,\"Cascadia Mono\",monospace;font-size:12px;color:var(--muted);overflow-wrap:anywhere}"
+             L"details.patient>summary .where{margin:2px 0 0 18px}\n"
+             L"summary{cursor:pointer}summary h2,summary h3{display:inline;margin:0}details.patient{margin-top:30px}"
+             L"details.study>summary .meta{margin:2px 0 0 18px}details.study>summary .sub{margin:6px 0 0 18px}details.study:not([open]){padding-bottom:2px}\n"
+             L".tools{margin-top:20px}.tools button{font:inherit;padding:4px 12px;margin-right:6px;border:1px solid var(--line);"
+             L"border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}\n"
+             L"table{border-collapse:collapse;width:100%;min-width:980px}th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}\n"
+             L"tr:last-child td{border-bottom:0}th{color:var(--muted);font-weight:600;font-size:12px;background:var(--card)}\n"
+             L"td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}td.series{color:var(--series);font-weight:600}\n"
+             L"img.t{display:block;width:auto;height:auto;max-width:128px;max-height:128px;border-radius:4px;background:#000}\n"
+             L"tr.warn td{background:var(--warnbg)}.warn{color:var(--warn)}ul{margin:6px 0 0;padding-left:20px}li{margin:2px 0}\n"
+             L"a{color:var(--link)}li.note{color:var(--muted)}.problems{background:var(--warnbg);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin-top:18px}\n"
+             L".problems h2{margin:0;color:var(--warn);font-size:17px}small{color:var(--muted)}.notes{border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin-top:12px;color:var(--muted)}.notes summary{cursor:pointer;font-weight:600}\n"
+             L"footer{margin-top:40px;color:var(--muted);font-size:12px}\n</style>\n</head>\n<body>\n<main>\n";
+        h += L"<h1>DICOM report</h1>\n<div class=\"meta\">" + Html(scope) + L"<br>" + when + L"</div>\n";
+        auto total = [&](size_t v, const wchar_t* one, const wchar_t* many) {
+            h += L"<div><b>" + std::to_wstring(v) + L"</b>" + (v == 1 ? one : many) + L"</div>";
+        };
+        h += L"<div class=\"totals\">";
+        total(images, L"DICOM file", L"DICOM files");
+        total(patients.size(), L"patient", L"patients");
+        total(studies, L"study", L"studies");
+        total(series.size(), L"series", L"series");
+        if (troubled) h += L"<div class=\"warn\"><b>" + std::to_wstring(troubled) + L"</b>series with problems</div>";
+        h += L"</div>\n";
+        if (n == 0)
+        {
+            std::wstring also;
+            if (data->others) also += std::to_wstring(data->others) + L" other files. ";
+            if (data->directories) also += std::to_wstring(data->directories) + L" DICOMDIR. ";
+            if (data->offline) also += std::to_wstring(data->offline) + L" files not downloaded (not read). ";
+            if (!also.empty()) h += L"<div class=\"meta\">" + Html(also) + L"</div>\n";
+        }
+        // The color of a study, the one of its folders and icons: never under text, only as marks
+        auto color = [&](int study) {
+            const std::string& uid = files[nodes[study].files[0]].study;
+            wchar_t c[16];
+            swprintf_s(c, L"#%06X", Palette[uid.empty() ? NoStudyColor : ColorIndex(uid)]);
+            return std::wstring(c);
+        };
+        auto dot = [&](int r) { return L"<span class=\"dot\" style=\"background:" + color(nodes[r].parent) + L"\"></span>"; };
+        // (a PatientID of several people, too)
+        std::vector<int> shared;
+        for (int p : patients) if (nodes[p].sharing > 1) shared.push_back(p);
+        if (troubled || !shared.empty())
+        {
+            h += L"<section class=\"problems\"><h2>\u26A0 Problems</h2><ul>\n";
+            for (int p : shared)
+                h += L"<li>" + Html(Plain(p)) + L": the same Patient ID, " + std::to_wstring(nodes[p].sharing) +
+                     L" people (other names or birth dates): shown apart</li>\n";
+            for (int r : series)
+            {
+                if (nodes[r].flags.empty()) continue;
+                std::wstring f;
+                for (size_t k = 0; k < nodes[r].flags.size(); k++) f += (k ? L", " : L"") + nodes[r].flags[k];
+                h += L"<li>" + dot(r) + L"<a href=\"#s" + std::to_wstring(r) + L"\">" + Html(Plain(r)) + L"</a>: " + Html(f) + L"</li>\n";
+            }
+            h += L"</ul></section>\n";
+        }
+        // The notes (instance numbers missing, and how): folded, under the problems
+        size_t noted = 0;
+        for (int r : series) if (!nodes[r].notes.empty()) noted++;
+        if (noted)
+        {
+            h += L"<details class=\"notes\"><summary>Notes: " + std::to_wstring(noted) + L" series" +
+                 L" with instance numbers missing (not a problem by itself: the positions say whether a slice is missing)</summary><ul>\n";
+            for (int r : series)
+                for (const auto& note : nodes[r].notes)
+                    h += L"<li>" + dot(r) + L"<a href=\"#s" + std::to_wstring(r) + L"\">" + Html(Plain(r)) + L"</a>: " + Html(note) + L"</li>\n";
+            h += L"</ul></details>\n";
+        }
+        h += L"<div class=\"tools\"><button type=\"button\" onclick=\"fold(true)\">Expand all</button>"
+             L"<button type=\"button\" onclick=\"fold(false)\">Collapse all</button></div>\n";
+        for (int p : patients)
+        {
+            const Gathered& g = files[nodes[p].files[0]];
+            std::wstring who = g.patient.empty() ? L"Patient (no ID)" : L"Patient " + Widen(g.patient, g.charset);
+            if (!nodes[p].person.empty()) who += L" \x00B7 [" + nodes[p].person + L"]";
+            if (!hideIdentity)
+            {
+                for (Uint32 tag : { 0x00100010u, 0x00100040u, 0x00100030u })
+                {
+                    std::wstring v = first(p, tag);
+                    if (!v.empty()) who += L"   \u00B7   " + v;
+                }
+            }
+            // A patient of one study folds as one: the patient and the study in the same title
+            const bool alone = std::count_if(studyList.begin(), studyList.end(), [&](int s) { return nodes[s].parent == p; }) == 1;
+            if (!alone)
+                h += L"<details class=\"patient\" open><summary><h2>" + Html(who) + L"</h2><div class=\"meta where\">" + Html(where(p)) +
+                     L"</div></summary>\n";
+            for (int s : studyList)
+            {
+                if (nodes[s].parent != p) continue;
+                const Gathered& sg = files[nodes[s].files[0]];
+                std::wstring title = DateTimeText(sg.studyDate, sg.studyTime);
+                const std::wstring description = Widen(sg.studyDescription, sg.charset);
+                if (!description.empty()) title += (title.empty() ? L"" : L"   \u00B7   ") + description;
+                if (title.empty()) title = L"Study";
+                // (folded: its title, its color and its counts)
+                h += std::wstring(alone ? L"<details class=\"patient study\"" : L"<details class=\"study\"") + L" style=\"--c:" + color(s) + L"\"" +
+                     (studies > 3 ? L"" : L" open") + L"><summary>" + (alone ? L"<h2>" + Html(who) + L"</h2><div class=\"sub\">" : L"") +
+                     L"<h3><span class=\"sw\"></span>" + Html(title) + L"</h3>" + (alone ? L"</div>" : L"") + L"\n<div class=\"meta\">";
+                std::wstring line;
+                auto add = [&](const std::wstring& name, const std::wstring& v) { if (!v.empty()) line += (line.empty() ? L"" : L"   \u00B7   ") + name + v; };
+                if (!sg.study.empty()) add(L"", L"[" + Hash6(sg.study) + L"]");
+                add(L"Accession ", first(s, 0x00080050));
+                add(L"Study ID ", first(s, 0x00200010));
+                add(L"", std::to_wstring(nodes[s].children.size()) + L" series");
+                add(L"", std::to_wstring(nodes[s].files.size()) + L" files");
+                add(L"", mb(s) + L" MB");
+                line = Html(line) + L"<br><span class=\"where\">" + Html(where(s)) + L"</span>";
+                h += line + L"</div></summary>\n<div class=\"wrap\"><table>\n<thead><tr><th></th><th>Series</th><th>Modality</th><th>Description</th>"
+                     L"<th>Plane, columns x rows x positions (x times)</th><th>Pixel, thickness (mm)</th><th>Z (mm)</th><th class=\"n\">Files</th>"
+                     L"<th class=\"n\">MB</th><th>Problems, notes</th></tr></thead>\n<tbody>\n";
+                for (int r : series)
+                {
+                    if (nodes[r].parent != s) continue;
+                    const Gathered& rg = files[nodes[r].files[0]];
+                    const size_t thumb = j->stacks.size();
+                    j->stacks.push_back(StackOf(MainOrientation(r)));
+                    std::wstring planes, spacing, zs;
+                    for (int o : nodes[r].children)
+                    {
+                        const std::wstring br = planes.empty() ? L"" : L"<br>";
+                        planes += br + Html(Size(o));
+                        std::wstring sp = first(o, 0x00280030);
+                        for (auto& c : sp) if (c == L'\\') c = L'x';
+                        const std::wstring th = first(o, 0x00180050);
+                        spacing += br + Html(sp + (th.empty() ? L"" : L",  " + th));
+                        std::vector<double> z;
+                        for (int c : nodes[o].children) if (files[nodes[c].files[0]].hasZ) z.push_back(files[nodes[c].files[0]].z);
+                        wchar_t b[120] = L"";
+                        if (z.size() == nodes[o].children.size() && z.size() > 1)
+                        {
+                            std::vector<double> steps;
+                            for (size_t k = 1; k < z.size(); k++) steps.push_back(z[k] - z[k - 1]);
+                            std::sort(steps.begin(), steps.end());
+                            swprintf_s(b, L"%.1f to %.1f, step %.3g", z.front(), z.back(), steps[steps.size() / 2]);
+                        }
+                        else if (z.size() == 1) swprintf_s(b, L"%.1f", z[0]);
+                        zs += br + b;
+                    }
+                    std::wstring problems;
+                    for (const auto& pr : ProblemsUnder(r, 12)) problems += L"<li>" + Html(pr) + L"</li>";
+                    for (const auto& note : nodes[r].notes) problems += L"<li class=\"note\">" + Html(note) + L"</li>";
+                    h += L"<tr id=\"s" + std::to_wstring(r) + L"\"" + (nodes[r].flags.empty() ? L"" : L" class=\"warn\"") + L">";
+                    h += L"<td><img class=\"t\" alt=\"\" src=\"{{thumb " + std::to_wstring(thumb) + L"}}\"></td>";
+                    h += L"<td class=\"series\">" + Html(Widen(rg.seriesNumber)) + L"</td><td>" + Html(Widen(rg.modality)) + L"</td><td>" +
+                         Html(Widen(rg.seriesDescription, rg.charset)) + L"<br><small>" + Html(DateTimeText(rg.seriesDate, rg.seriesTime)) + L"</small><br><small class=\"where\">" + Html(where(r)) + L"</small></td>";
+                    h += L"<td>" + planes + L"</td><td>" + spacing + L"</td><td>" + zs + L"</td>";
+                    h += L"<td class=\"n\">" + std::to_wstring(nodes[r].files.size()) + L"</td><td class=\"n\">" + mb(r) + L"</td>";
+                    h += L"<td class=\"warn\">" + (problems.empty() ? L"" : L"<ul>" + problems + L"</ul>") + L"</td></tr>\n";
+                }
+                h += L"</tbody></table></div></details>\n";
+            }
+            if (!alone) h += L"</details>\n";
+        }
+        // A link to a series opens what it is folded in
+        h += L"<script>\nfunction reveal(id){var e=document.getElementById(id);for(var p=e;p;p=p.parentElement)if(p.tagName==='DETAILS')p.open=true;"
+             L"if(e)e.scrollIntoView();}\ndocument.addEventListener('click',function(ev){var a=ev.target.closest('a[href^=\"#s\"]');"
+             L"if(a){ev.preventDefault();reveal(a.getAttribute('href').slice(1));history.replaceState(null,'',a.getAttribute('href'));}});\n"
+             L"if(location.hash)reveal(location.hash.slice(1));\n"
+             L"function fold(open){document.querySelectorAll('details.patient,details.study').forEach(function(d){d.open=open;});}\n</script>\n";
+        h += L"<footer>Written by the DICOM explorer of DicomStudyCount. The files were only read.</footer>\n</main>\n</body>\n</html>\n";
+        j->report = std::move(h);
+        j->total = static_cast<long>(j->stacks.size());
+        StartJob(std::move(j));
+    }
+
+    // (not into the images: a series can have thousands)
+    void ExpandAll(int n, bool open)
+    {
+        SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
+        std::function<void(int)> walk = [&](int i) {
+            if (nodes[i].shown.empty() || !nodes[i].item) return;
+            if (open && std::all_of(nodes[i].shown.begin(), nodes[i].shown.end(), [&](int c) { return nodes[c].level == Level::Image; }) && i != n)
+                return;
+            TreeView_Expand(tree, nodes[i].item, open ? TVE_EXPAND : TVE_COLLAPSE);
+            for (int c : nodes[i].shown) walk(c);
+        };
+        walk(n);
+        SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
+        if (nodes[n].item) TreeView_EnsureVisible(tree, nodes[n].item);
+    }
+
+    // ----- drawing
+
+    static COLORREF LevelColor(int level)
+    {
+        switch (static_cast<Level>(level))
+        {
+        case Level::Patient: return RGB(192, 0, 0);
+        case Level::Study: return RGB(0, 128, 0);
+        case Level::Series: return RGB(0, 70, 220);
+        case Level::Orientation: return RGB(165, 42, 42);
+        case Level::Position: return RGB(170, 0, 170);
+        default: return GetSysColor(COLOR_WINDOWTEXT);
+        }
+    }
+
+    LRESULT Notify(NMHDR* h)
+    {
+        if (h->hwndFrom == tree)
+        {
+            switch (h->code)
+            {
+            case TVN_ITEMEXPANDINGW:
+            {
+                auto tv = reinterpret_cast<NMTREEVIEWW*>(h);
+                if (tv->action & TVE_EXPAND) Insert(static_cast<int>(tv->itemNew.lParam));
+                return FALSE;
+            }
+            case TVN_SELCHANGEDW:
+                if (!following && ready) Choose(static_cast<int>(reinterpret_cast<NMTREEVIEWW*>(h)->itemNew.lParam));
+                return 0;
+            case NM_DBLCLK:
+            case NM_RETURN:
+                if (selected > 0 && nodes[selected].level == Level::Image)
+                {
+                    ShowInExplorer(PathsOf(selected));
+                    return TRUE;
+                }
+                return 0;
+            case NM_CUSTOMDRAW:
+            {
+                auto cd = reinterpret_cast<NMTVCUSTOMDRAW*>(h);
+                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT && ready)
+                {
+                    const int n = static_cast<int>(cd->nmcd.lItemlParam);
+                    if (n <= 0 || n >= static_cast<int>(nodes.size())) return CDRF_DODEFAULT;
+                    if (!(cd->nmcd.uItemState & CDIS_SELECTED))
+                    {
+                        cd->clrText = LevelColor(static_cast<int>(nodes[n].level));
+                        if (Hit(n)) cd->clrTextBk = RGB(255, 236, 110);
+                    }
+                    if (nodes[n].level == Level::Series || nodes[n].level == Level::Patient)
+                    {
+                        SelectObject(cd->nmcd.hdc, boldFont);
+                        return CDRF_NEWFONT;
+                    }
+                }
+                return CDRF_DODEFAULT;
+            }
+            }
+        }
+        if (h->hwndFrom == info && h->code == NM_CUSTOMDRAW)
+        {
+            auto cd = reinterpret_cast<NMLVCUSTOMDRAW*>(h);
+            if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT && static_cast<int>(cd->nmcd.dwItemSpec) >= firstProblemRow)
+                cd->clrText = ProblemColor;
+            return CDRF_DODEFAULT;
+        }
+        if (h->hwndFrom == full && h->code == NM_CUSTOMDRAW)
+        {
+            auto cd = reinterpret_cast<NMLVCUSTOMDRAW*>(h);
+            if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
+            {
+                const int kind = static_cast<int>(cd->nmcd.lItemlParam);
+                cd->clrText = kind == 100 ? RGB(110, 110, 110) : LevelColor(kind);
+                return CDRF_DODEFAULT;
+            }
+        }
+        return 0;
+    }
+
+    Split SplitAt(POINT pt) const
+    {
+        if (PtInRect(&treeSplit, pt)) return Split::Tree;
+        if (PtInRect(&infoSplit, pt)) return Split::Info;
+        if (PtInRect(&topSplit, pt)) return Split::Top;
+        return Split::None;
+    }
+
+    void DragTo(POINT pt)
+    {
+        const UINT dpi = GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96;
+        RECT treeRect = {};
+        GetWindowRect(tree, &treeRect);
+        MapWindowPoints(nullptr, wnd, reinterpret_cast<POINT*>(&treeRect), 2);
+        if (split == Split::Tree) treeWidth = MulDiv(pt.x - treeRect.left, 96, dpi);
+        else if (split == Split::Info) infoWidth = MulDiv(pt.x - treeSplit.right, 96, dpi);
+        else if (split == Split::Top)
+        {
+            const int h = treeRect.bottom - treeRect.top - Px(6) - Px(25);
+            if (h > 0) topShare = (std::max)(50, (std::min)(950, static_cast<int>(static_cast<long long>(pt.y - treeRect.top) * 1000 / h)));
+        }
+        Layout();
+    }
+
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+    {
+        auto self = reinterpret_cast<DicomExplorer*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        switch (msg)
+        {
+        case WM_NCCREATE:
+            self = static_cast<DicomExplorer*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            self->wnd = hwnd;
+            break;
+        case WM_CREATE:
+            self->icon = DrawIcon(GetSystemMetrics(SM_CXICON), 16, L"D");
+            self->smallIcon = DrawIcon(GetSystemMetrics(SM_CXSMICON), 16, L"D");
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(self->icon));
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(self->smallIcon));
+            self->CreateControls();
+            return 0;
+        case WM_SIZE:
+            if (self) self->Layout();
+            return 0;
+        case WM_DPICHANGED:
+        {
+            auto r = reinterpret_cast<RECT*>(lp);
+            SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            if (self) { self->Refont(); self->Layout(); }
+            return 0;
+        }
+        case WM_GETMINMAXINFO:
+            reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = { 800, 500 };
+            return 0;
+        case WM_GATHERED:
+            if (self) self->Finished();
+            return 0;
+        case WM_THUMB:
+            if (self) self->Thumbnailed(reinterpret_cast<ThumbDone*>(lp));
+            else delete reinterpret_cast<ThumbDone*>(lp);
+            return 0;
+        case WM_EXPORTED:
+            if (self) self->JobDone();
+            return 0;
+        case WM_ACTIVATEAPP:
+            if (self && !wp) self->HidePopup();
+            break;
+        case WM_TIMER:
+            if (!self) return 0;
+            if (wp == TimerJob) { self->JobProgress(); return 0; }
+            if (wp != TimerProgress) KillTimer(hwnd, wp);
+            if (wp == TimerProgress) self->Progress();
+            else if (wp == TimerFind) self->FindChanged();
+            else if (wp == TimerFilter)
+            {
+                self->filterText = TextOf(self->filterBox);
+                Compile(self->filterText, self->filterRegex, self->filterIsRegex);
+                if (self->selected > 0) self->FillFull(self->selected);
+            }
+            else if (wp == TimerFollow && self->selected > 0)
+            {
+                self->FillInfo(self->selected);
+                self->FillFull(self->selected);
+            }
+            return 0;
+        case WM_COMMAND:
+            if (!self) break;
+            switch (LOWORD(wp))
+            {
+            case IdBrowse: self->Browse(); return 0;
+            case IdReload: if (!self->root.empty()) self->Load(self->root); return 0;
+            case IdReport: self->Report(0); return 0;
+            case IdHover:
+                self->hoverPreview = Button_GetCheck(self->hoverBox) == BST_CHECKED;
+                WriteSetting(L"HoverPreview", self->hoverPreview ? 1 : 0);
+                if (!self->hoverPreview) self->HidePopup();
+                return 0;
+            case IdCompact:
+                self->compact = Button_GetCheck(self->compactBox) == BST_CHECKED;
+                WriteSetting(L"Compact", self->compact ? 1 : 0);
+                self->Recompact();
+                return 0;
+            case IdIdentity:
+                self->hideIdentity = Button_GetCheck(self->identityBox) == BST_CHECKED;
+                WriteSetting(L"HideIdentity", self->hideIdentity ? 1 : 0);
+                if (self->selected > 0) { self->FillInfo(self->selected); self->FillFull(self->selected); }
+                return 0;
+            case IdFind:
+                if (HIWORD(wp) == EN_CHANGE) SetTimer(hwnd, TimerFind, 250, nullptr);
+                return 0;
+            case IdFilter:
+                if (HIWORD(wp) == EN_CHANGE) SetTimer(hwnd, TimerFilter, 250, nullptr);
+                return 0;
+            }
+            break;
+        case WM_NOTIFY:
+            if (self) return self->Notify(reinterpret_cast<NMHDR*>(lp));
+            break;
+        case WM_CONTEXTMENU:
+            if (self && reinterpret_cast<HWND>(wp) == self->tree) { self->TreeMenu(lp); return 0; }
+            break;
+        case WM_CTLCOLORSTATIC:
+            SetBkColor(reinterpret_cast<HDC>(wp), GetSysColor(COLOR_WINDOW));
+            return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+        case WM_SETCURSOR:
+            if (self && LOWORD(lp) == HTCLIENT)
+            {
+                POINT pt;
+                GetCursorPos(&pt);
+                ScreenToClient(hwnd, &pt);
+                const Split s = self->SplitAt(pt);
+                if (s != Split::None) { SetCursor(LoadCursor(nullptr, s == Split::Top ? IDC_SIZENS : IDC_SIZEWE)); return TRUE; }
+            }
+            break;
+        case WM_LBUTTONDOWN:
+            if (self)
+            {
+                self->split = self->SplitAt({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+                if (self->split != Split::None) SetCapture(hwnd);
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (self && self->split != Split::None) self->DragTo({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            return 0;
+        case WM_LBUTTONUP:
+            if (self && self->split != Split::None) { self->split = Split::None; ReleaseCapture(); }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (self) self->split = Split::None;
+            return 0;
+        case WM_CLOSE:
+            if (self) self->SaveSettings();
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (self)
+            {
+                self->Stop();
+                self->StopJob();
+                self->worker.reset();
+            }
+            PostQuitMessage(0);
+            return 0;
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+};
+
+// rundll32 "...\DicomShell.dll",Explore "<folder>": the explorer, until its window is closed. Without a
+// folder: the last one, or one to choose.
+extern "C" void CALLBACK ExploreW(HWND, HINSTANCE, LPWSTR line, int show)
+{
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    // The themed controls (common controls 6): rundll32 has no manifest asking for them
+    ULONG_PTR cookie = 0;
+    HANDLE context = ThemedControls();
+    const bool active = context != INVALID_HANDLE_VALUE && ActivateActCtx(context, &cookie);
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
+    std::wstring folder = line ? line : L"";
+    // "/report <folder>": its report too
+    const bool report = _wcsnicmp(folder.c_str(), L"/report", 7) == 0;
+    if (report) folder.erase(0, 7);
+    while (!folder.empty() && (folder.back() == L' ' || folder.back() == L'"')) folder.pop_back();
+    while (!folder.empty() && (folder.front() == L' ' || folder.front() == L'"')) folder.erase(0, 1);
+    // A file (a DICOMDIR...): its folder
+    if (!folder.empty() && !PathIsDirectoryW(folder.c_str()) && PathFileExistsW(folder.c_str()))
+        folder = folder.substr(0, folder.find_last_of(L'\\'));
+    {
+        DicomExplorer explorer;
+        if (explorer.Create(folder, show, report))
+        {
+            MSG m;
+            while (GetMessageW(&m, nullptr, 0, 0) > 0)
+            {
+                if (explorer.PreTranslate(m)) continue;
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+        }
+    }
+    if (active) DeactivateActCtx(0, cookie);
+    if (SUCCEEDED(com)) CoUninitialize();
+}
 
 // One factory per class: the icons, the properties, the preview and the thumbnails
 template <class T>

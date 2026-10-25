@@ -105,7 +105,9 @@ tree** opens the whole folder tree with one color per study.
   DICOMDIR is only read (DCMTK's DICOMDIR class is not used: it writes the file back when it finds
   something to correct).
   Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
-  JPEG 2000 pixel data (not deflated files). It uses DCMTK and OpenJPEG, inside the same DLL.
+  JPEG 2000 pixel data, and the private PMSCT_RLE1 of Elscint / Philips CT (not deflated files, nor
+  floating point pixels). It uses DCMTK and OpenJPEG, inside the same DLL. Files without pixels (reports,
+  PDFs, presentation states) say so.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
   usual low one: the low one cannot reach the Explorer window, and the *Columns* tab needs it.
 - **Hovering a DICOM file** shows its modality, series number and description, instance number,
@@ -113,6 +115,100 @@ tree** opens the whole folder tree with one color per study.
   and in *Properties > Details*.
 - **Show DICOM duplicates** (right-click a DICOM file): opens the folders of its copies found by the
   counts, with the copies selected.
+- **DICOM explorer** (right-click a folder: *DICOM > DICOM explorer*): a window with the DICOM files of
+  the folder and its subfolders as the tree of `DCMexplorer` / `DICOMgather` (mTools), whatever folders
+  they are in: **patient** (by ID, never by name) > **study** > **series** > **orientation** (the
+  same ImageOrientationPatient, rows and columns: its plane and its size, columns x rows x positions
+  x images per position) > **position** (the same ImagePositionPatient, in the order of their Z level)
+  > **image** (InstanceNumber, trigger time, Z, file name). Every level in its color, with how many
+  of what are under it.
+  - **People that share a PatientID** are told apart: some exports put the same placeholder in the
+    PatientID of everyone (`9999`), and files without one all share the empty one. Within a PatientID,
+    files whose birth date or name disagree are other people. The name is taken as its words, in
+    capitals, without accents and in any order (`Garcia^Juan` and `JUAN GARCIA` are one), and these do
+    not tell people apart: a missing birth date or name, a name with fewer words than the other (a second
+    name left out), an initial (`R` for `RAVI`), a word written another way when the birth date is the
+    same, or a birth date apart only in its year when a word of the name agrees. Only then the patient
+    splits, each one with a short hash of who it is, never the name: `Patient 9999 · [7a7e54]` and
+    `⚠ the same ID, 2 people`; otherwise the tree is as before. Over 610,000 files, 10 PatientIDs split
+    so: the empty one (13 people), placeholders (`9999`, `1`, `Anonimo`, `VISIT 1`, `SSSSSS`), truncated
+    research IDs, and two real IDs whose files carry the same name with unrelated birth dates (left
+    apart: nothing tells which is right). `tools\Test-DicomExplorer.ps1` lists the PatientIDs it splits
+    and what tells their people apart (never the names or dates).
+  - *Compact* (on by default, remembered): an orientation alone in its series, and positions of one
+    image each (or alone in their orientation), are left out of the tree: a stack shows its images
+    under the series, a cine of several slices its positions.
+  - Beside the tree, what the chosen node is (date, description, UIDs, plane, Z range and spacing of
+    the positions, trigger times, files, folders, size...), and its **image**: the preview's image,
+    with its slider and cine over the files under the node (an image: over those of its node), the
+    window, the zoom and the overlay. When an image is chosen, the tree follows the slider and the cine.
+  - Under them, its **full info**: the attributes of its files level by level, as `DCMgroup` gathers
+    them. First those of the node itself, then *Varies in the node* (how many values, the first
+    ones, and in how many files it is missing), then those the files of each node above share that
+    the next one up does not (the position, the orientation, the series, the study, the patient,
+    all the files), in the color of their level. Its box filters them by tag, name or value (text, or
+    a regular expression: `window|slice`). The names of the patient and of the staff, birth date,
+    address and phone are hidden (*Hide patient identity*, on by default).
+  - *Find*: text or a regular expression over the lines of the tree; the nodes found are marked, Enter
+    or F3 goes to the next one (Shift+F3 the previous one).
+  - Right-click a node: its files in Explorer (selected), the paths of its files or its full info to
+    the clipboard, expand or collapse everything under it, and its exports and report (below; the
+    letters X, N and R choose them). Double click on an image: its folder in Explorer. Ctrl+C copies
+    the selected rows of the lists (Ctrl+A selects them all).
+  - **Floating thumbnail** (*Hover preview*, on by default): the mouse still over a node shows it, by
+    the recipe of `DICOMstackCollect` / `DCMthumbnail` (mTools): the background cropped, the values from
+    their 2nd to their 98th percentile. An image (its frames, moving); a position of several images,
+    its cine; an orientation, its positions as a mosaic (up to 30, 20 of them beyond, each one moving
+    in a cine of several slices); a series of several orientations, their middle images one over the
+    other; a study or a patient, a mosaic of its series (up to 20).
+  - **Checks**: what may be wrong is marked in the tree (`⚠` and a word or two, which *Find* finds) and
+    told in full in the info of the node, in orange: in an orientation, gaps in its positions (and about
+    how many are missing), a spacing that is not regular, positions off the line of the normal (a
+    gantry tilt, stacks put together), positions with another number of images than the others,
+    images without position, pixel spacings that vary; files with the same SOP instance UID as
+    another one (copies), uncompressed files shorter than their pixels. A study and a patient say how
+    many of their series have problems.
+  - Instance numbers missing in a series are a **note**, not a problem: whether they are regular ("2 of
+    every 22"), one block, or few and scattered. In a corpus of 700,000 files, 139 series had them,
+    and only 3 had a slice really missing too: the rest were the numbering of the scanner (magnitude
+    and phase interleaved, the same phases left out of every slice), localizers, or images the operator
+    did not keep (the monitoring of a contrast bolus, ultrasound clips). A slice really missing leaves a
+    gap in the positions, or a position with fewer images, and that is a problem.
+  - **Export the images** (right-click a node): an image as a PNG; a cine (the images of a position, or
+    the frames of a file) as an animated GIF in its time (its trigger times, or its frame time); a stack
+    of one image a position as an animated GIF through its positions; a cine of several slices, a GIF
+    of each slice. At full resolution, with the window dragged in the preview (if it shows that node),
+    or the one of the header, or that of most of the values. A series writes one file per
+    orientation; a study (a patient) a folder of its own, with its series in it.
+  - **Export to NIfTI** (right-click a node): an orientation (or a position, an image) as a `.nii`
+    volume: columns x rows x positions (x images per position, in their time order: 4-D, with the step
+    of the trigger times). The values as stored, with their rescale in the header (as 32-bit floats,
+    rescaled, when the files do not all share it); its place from ImagePositionPatient and
+    ImageOrientationPatient (sform and qform, RAS, a gantry tilt included). The window of the header
+    as `cal_min` / `cal_max`.
+  - **Report (HTML)** (the *Report* button for the whole folder, or right-click a node; *DICOM >
+    DICOM report* in the menu of a folder): a web page with the totals, the problems found (linked to
+    their series) and, by patient and study, a table of the series: a thumbnail, number, modality,
+    description, plane and size, pixel spacing and thickness, Z range and spacing, files, size and
+    problems and notes. The name of the patient only when *Hide patient identity* is off. Where the
+    files of each patient, study and series are, from the folder of the report (`.\...`): their
+    folder, two or three of them, or the folder that holds them all and how many.
+    - Nothing is asked: it is written to a temporary folder (`%TEMP%\DicomStudyCount\reports`, where
+      those of more than 7 days go when another one is written) and opened in the browser; to keep
+      one, *Save as* there. One self-contained file: the thumbnails are inside it, nothing is loaded
+      from anywhere.
+    - Each study in its color (the one of its folders and icons): a bar, a square by its title, a frame
+      around its table, a dot by its series in the lists of problems and notes; never under text.
+    - Patients and studies fold (folded at first when there are more than 3 studies, showing their
+      title and counts; a patient of one study folds as one); *Expand all* / *Collapse all*, and a link
+      to a series opens what it is folded in.
+  - The exports and the report are written in a thread of their own (the status bar counts them;
+    Esc stops them), never into the DICOM files: no name already there is overwritten (" (2)"...).
+  - The headers are read with DCMTK up to the pixels (several files at once; values of more than
+    4 KB are not read), the files only read: about 14,000 files in 10 s from a local disk, 120 MB of
+    memory; 139,000 files (10,500 series) in 140 s and 800 MB. Files not downloaded from a cloud are
+    skipped. The bars between the panes move; the
+    window, its panes and the options are remembered (`HKCU\Software\DicomStudyCount\Explorer`).
 - **Columns of the DICOM files**: Explorer columns that can be shown, sorted, grouped and
   filtered like any other (right-click a column header > *More...*, they all start with "DICOM"):
 
@@ -176,7 +272,8 @@ tree** opens the whole folder tree with one color per study.
 ## The folder
 
 Everything the tool needs is in its folder; what it writes while working (caches, reports, icons)
-goes to `%LOCALAPPDATA%\DicomStudyCount\` (see [What it writes, and where](#what-it-writes-and-where)).
+goes to `%LOCALAPPDATA%\DicomStudyCount\`, and the reports of the DICOM explorer to
+`%TEMP%\DicomStudyCount\reports\` (see [What it writes, and where](#what-it-writes-and-where)).
 
 | Path | What |
 |---|---|
@@ -185,7 +282,7 @@ goes to `%LOCALAPPDATA%\DicomStudyCount\` (see [What it writes, and where](#what
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
 | `bin\DicomStudyCount.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs |
-| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`) |
+| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
 | `third_party\` | DCMTK 3.7.0 and OpenJPEG 2.5.3 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
 
 ## Installation
@@ -235,6 +332,9 @@ menu, so the menu cannot tell a counted folder from one that is not.
 - **Show/hide DICOM columns**: shows all the DICOM columns of the files in that Explorer window (after
   its other columns, fitted to their content), or hides them all if any is visible. On the background
   of a window it acts on that window; on a folder of the list, on the window showing the list.
+- **DICOM explorer**: opens the explorer of the folder (see above).
+- **DICOM report**: the same, and the report of the folder written in `%TEMP%\DicomStudyCount\reports` (a
+  name not used yet) and opened in the browser.
 - **Unblock (allow preview)**: files downloaded from the Internet carry a "mark of the web" (a
   `Zone.Identifier` stream), and Windows does not show them in the preview pane ("The file you are
   attempting to preview could harm your computer"). This removes that mark from the DICOM files (DICOMDIR included) of
@@ -263,7 +363,11 @@ menu, so the menu cannot tell a counted folder from one that is not.
 .\Count-DicomStudies.ps1 D:\Patients -Clean              # what "DICOM > Clean" does (-ClearComments: the same)
 .\Count-DicomStudies.ps1 D:\Patients -ToggleColumns      # what "DICOM > Show/hide DICOM columns" does
 .\Count-DicomStudies.ps1 D:\Patients -Unblock            # what "DICOM > Unblock (allow preview)" does
+rundll32 .\bin\DicomShell.dll,Explore D:\Patients        # what "DICOM > DICOM explorer" does
+rundll32 .\bin\DicomShell.dll,Explore /report D:\Patients   # what "DICOM > DICOM report" does
 ```
+
+(`rundll32` with a full path to the DLL; without a folder the explorer opens the last one.)
 
 ## What it writes, and where
 
@@ -275,13 +379,17 @@ menu, so the menu cannot tell a counted folder from one that is not.
 | Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
+| DICOM explorer | `HKCU\Software\DicomStudyCount\Explorer` (its window, panes, options, last folder and the last folder of its exports) | `-Uninstall` |
+| Reports of the DICOM explorer | `%TEMP%\DicomStudyCount\reports\*.html` (those of more than 7 days go when another one is written) | `-Uninstall` |
 | Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\DicomStudyCount\Chain` (what those programs had), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
 | Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (and `.img` with `-Img`; the one another program had is kept in `HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain` and gets its files back) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 
-The tool never modifies, moves or deletes DICOM files. The reports and the index contain file paths
-and DICOM UIDs, but no patient names or IDs read from the files (folder names, of course, may carry
-patient information), and they stay on the local machine.
+The tool never modifies, moves or deletes DICOM files. The problems reports and the index of the counts
+contain file paths and DICOM UIDs, but no patient names or IDs read from the files (folder names, of
+course, may carry patient information), and they stay on the local machine. The HTML reports of the
+DICOM explorer do carry the patient IDs (and the names, sex and birth dates when *Hide patient
+identity* is off): mind that before sending one to anyone.
 
 ## Notes and limitations
 
@@ -299,11 +407,15 @@ patient information), and they stay on the local machine.
   clearly different hues (saturated colors would make the text unreadable).
 - The icons live in `%LOCALAPPDATA%` of the user who counted, and `desktop.ini` points there: on
   another PC or user account the folders show the plain folder icon (never a broken one) until they
-  are counted there. Large icon views can take a few seconds to show them the first time. On the same account, a deleted icon is rebuilt by the background watcher, the
-  tree window or the next count.
+  are counted there. Large icon views can take a few seconds to show them the first time. On the
+  same account, a deleted icon is rebuilt by the background watcher, the tree window or the next count.
 - Explorer's sorting and search are case-insensitive, while study tags are case-sensitive.
 - Incomplete series are judged on the range of InstanceNumbers seen (min..max): gaps before the lowest
   number seen cannot be detected. Non-image series such as Siemens *PhoenixZIPReport* often have gaps.
+  And a gap is not always an image lost: scanners number magnitude and phase images together, leave
+  the same phases out of every slice, and operators do not keep every image (localizers, the monitoring
+  of a contrast bolus). The DICOM explorer tells them apart by the positions of the slices (see its
+  *Checks*).
 - Copies with re-generated UIDs (re-exported or anonymized studies) are not detected as duplicates:
   that would need a hash of the pixel data, i.e. reading whole files.
 - **Quarantine** of identical duplicates (moving copies to a `_DicomQuarantine` folder, with a log to

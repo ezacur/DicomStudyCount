@@ -101,7 +101,11 @@ $menuEntries = @(
     @{ Name = '2Tree'; Label = 'Show tree'; Args = '-ShowTree' },
     @{ Name = '3Clean'; Label = 'Clean'; Args = '-Clean' },
     @{ Name = '4Columns'; Label = 'Show/hide DICOM columns'; Args = '-ToggleColumns' },
-    @{ Name = '5Unblock'; Label = 'Unblock (allow preview)'; Args = '-Unblock' }
+    @{ Name = '5Unblock'; Label = 'Unblock (allow preview)'; Args = '-Unblock' },
+    # (not the script: the explorer of bin\DicomShell.dll, the copy the icons use)
+    @{ Name = '6Explorer'; Label = 'DICOM explorer'; Explorer = '' },
+    # (the same, writing the report of the folder in %TEMP%\DicomStudyCount\reports and opening it)
+    @{ Name = '7Report'; Label = 'DICOM report'; Explorer = '/report ' }
 )
 # The DICOM columns of the files (bin\DicomStudyCount.propdesc), in the order they are shown
 $dicomColumns = 'StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber', 'SeriesDescription',
@@ -151,6 +155,11 @@ if ($Install) {
     Set-ItemProperty -LiteralPath $runKey -Name $runName -Value $watchCommand
     Stop-Watcher
     Start-Process conhost.exe -ArgumentList ($watchCommand -replace '^conhost\.exe ', '')
+    # The copy of bin\DicomShell.dll that tools\Register-DicomIcons.ps1 registers (by its hash)
+    $shellDll = Join-Path $PSScriptRoot 'bin\DicomShell.dll'
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $dllHash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($shellDll))[0..7] | ForEach-Object { $_.ToString('x2') })
+    $shellCopy = Join-Path $env:LOCALAPPDATA "DicomStudyCount\shellext\DicomShell-$dllHash.dll"
     foreach ($parent in $menuParents) {
         foreach ($old in $oldMenuNames) {
             if (Test-Path -LiteralPath "$parent\$old") { Remove-Item -LiteralPath "$parent\$old" -Recurse -Force }
@@ -166,18 +175,16 @@ if ($Install) {
             $key = "$menu\shell\$($entry.Name)"
             # conhost --headless runs PowerShell without opening a console window
             $command = 'conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Path "%V" {1}' -f $PSCommandPath, $entry.Args
+            if ($null -ne $entry.Explorer) { $command = 'rundll32.exe "{0}",Explore {1}"%V"' -f $shellCopy, $entry.Explorer }
             New-Item -Path "$key\command" -Force | Out-Null
             Set-ItemProperty -LiteralPath $key -Name 'MUIVerb' -Value $entry.Label
             Set-ItemProperty -LiteralPath "$key\command" -Name '(default)' -Value $command
         }
     }
     # Icons of the DICOM files (bin\DicomShell.dll, registered for the user)
-    $shellDll = Join-Path $PSScriptRoot 'bin\DicomShell.dll'
     & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Dll $shellDll -Script $PSCommandPath -Img:$Img
     # The columns of the DICOM files: Windows takes property handlers from HKLM only. No UAC prompt
     # when the DLL and the column schema installed are already these ones.
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $dllHash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($shellDll))[0..7] | ForEach-Object { $_.ToString('x2') })
     $server = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{21329A2B-09B3-4250-9103-9267877321EB}\InprocServer32')
     $installedSchema = Join-Path $env:ProgramFiles 'DicomStudyCount\DicomStudyCount.propdesc'
     $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
@@ -213,6 +220,9 @@ if ($Uninstall) {
         }
     }
     & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Uninstall
+    Remove-Item -LiteralPath 'HKCU:\Software\DicomStudyCount\Explorer' -Recurse -Force -ErrorAction SilentlyContinue
+    # The reports of the explorer, in a temporary folder of their own
+    Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) 'DicomStudyCount\reports') -Recurse -Force -ErrorAction SilentlyContinue
     if ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\DicomStudyCount\PropertyHandler')) {
         Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') @('-Uninstall')
     }
@@ -1164,7 +1174,7 @@ try {
     # From the context menu a drive root arrives as 'D:"' because of the trailing backslash escaping
     $Path = $Path.Trim().Trim('"')
     if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
-    # Long form: the same folder through an 8.3 short name ("ERNEST~1") must be the same location
+    # Long form: the same folder through an 8.3 short name ("JOHNDO~1") must be the same location
     $root = [DicomStudyCount.Paths]::Long((Resolve-Path -LiteralPath $Path).ProviderPath)
 
     if ($ShowDuplicates) {
