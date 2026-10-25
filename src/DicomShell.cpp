@@ -2886,6 +2886,7 @@ public:
     }
     void ShowFiles(const std::vector<std::wstring>& files, int index)
     {
+        StopPoster();
         Play(false);
         windowSet = false;
         zoom = 1;
@@ -2905,6 +2906,27 @@ public:
     }
     void ShowIndex(int index) { GoSlice(index); }    // another one of the same files
     std::function<void(int)> moved;
+    // The explorer's thumbnail of a node (0xRRGGBB pixels, its frames moving), in place of the first of
+    // its files until the slider, the keys or the cine go to them
+    struct PosterFrame { int width = 0, height = 0; std::vector<DWORD> px; };
+    void ShowPoster(std::vector<PosterFrame> frames, int delay, const std::wstring& caption)
+    {
+        if (!hosted || frames.empty()) return;
+        Play(false);
+        const bool had = !view.pixels.empty();
+        poster = std::move(frames);
+        posterFrame = 0;
+        view = Rendered();
+        view.summary = caption;
+        PosterPixels();
+        slice = -1;
+        current.clear();
+        zoom = 1;
+        KillTimer(wnd, TimerPoster);
+        if (poster.size() > 1) SetTimer(wnd, TimerPoster, static_cast<UINT>((std::max)(20, delay)), nullptr);
+        SetWindowTextW(wnd, view.summary.c_str());
+        Shown(had);
+    }
     // The file shown and the window dragged over it (monochrome): the exports of the explorer take it
     bool DraggedWindow(std::wstring& file, double& center, double& width) const
     {
@@ -2919,7 +2941,24 @@ private:
     enum { TabColumns, TabHeader, TabTags, TabDirectory, TabCount };
     enum class Drag { None, Split, Window, Pan, Zoom, Track };
     static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2;
-    static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2;
+    static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2, TimerPoster = 3;
+    std::vector<PosterFrame> poster;                // hosted: the thumbnail shown before the files (none: empty)
+    size_t posterFrame = 0;
+
+    void PosterPixels()
+    {
+        const PosterFrame& p = poster[posterFrame % poster.size()];
+        view.width = p.width;
+        view.height = p.height;
+        view.pixels = p.px;
+    }
+
+    void StopPoster()
+    {
+        if (poster.empty()) return;
+        KillTimer(wnd, TimerPoster);
+        poster.clear();
+    }
     static constexpr const wchar_t* Settings = L"Software\\DicomStudyCount\\Preview";
 
     LONG refs = 1;
@@ -3679,7 +3718,7 @@ private:
         DrawTextW(dc, label, -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         right = overlayRect.left - Px(14);
 
-        const int n = Count(), at = Position();
+        const int n = Count(), at = poster.empty() ? Position() : 0;     // (the thumbnail: the slider at the first file)
         if (n > 1 && at >= 0)
         {
             const int s = Px(10);
@@ -3702,6 +3741,7 @@ private:
             wchar_t where[96];
             if (view.frames > 1 && series.size() > 1)
                 swprintf_s(where, L"Frame %d / %d   File %d / %d", at + 1, n, slice + 1, static_cast<int>(series.size()));
+            else if (!poster.empty()) swprintf_s(where, L"Thumbnail   %d files", n);
             else swprintf_s(where, view.frames > 1 ? L"Frame %d / %d" : L"Slice %d / %d", at + 1, n);
             GetTextExtentPoint32W(dc, where, static_cast<int>(wcslen(where)), &ext);
             RECT w = { right - ext.cx, barArea.top, right, barArea.bottom };
@@ -3739,7 +3779,8 @@ private:
     void Step(int delta)
     {
         const int n = Count();
-        if (n > 1 && Position() >= 0) GoTo((std::max)(0, (std::min)(n - 1, Position() + delta)));
+        if (!poster.empty() && n > 0) GoTo(0);
+        else if (n > 1 && Position() >= 0) GoTo((std::max)(0, (std::min)(n - 1, Position() + delta)));
     }
 
     // Another frame of the file, with the same window
@@ -3759,6 +3800,7 @@ private:
     void GoSlice(int i)
     {
         if (i < 0 || i >= static_cast<int>(series.size()) || i == slice) return;
+        StopPoster();
         Rendered next;
         try
         {
@@ -3847,6 +3889,7 @@ private:
     // The cine: the frames at the pace of the file, the slices at 10 a second, round and round
     void Play(bool on)
     {
+        if (on && !poster.empty()) GoSlice(0);     // (from the thumbnail: the files, from the first one)
         playing = on && Count() > 1;
         if (playing)
         {
@@ -4014,6 +4057,12 @@ private:
                 const int n = self->Count();
                 if (n < 2 || self->Position() < 0) self->Play(false);
                 else self->GoTo((self->Position() + 1) % n);
+            }
+            else if (self && wp == TimerPoster && !self->poster.empty())
+            {
+                self->posterFrame++;
+                self->PosterPixels();
+                InvalidateRect(hwnd, &self->imageArea, FALSE);
             }
             return 0;
         case WM_KEYDOWN:
@@ -5832,6 +5881,7 @@ struct ThumbAsk
 {
     int node = -1;
     unsigned generation = 0;
+    bool big = false;                               // for the image panel (larger), not for the floating one
     enum Kind { Single, Cascade, Grid } kind = Single;
     std::vector<Stack> stacks;                      // Single: one; Cascade: the orientations; Grid: the series
     DWORD background = 0;
@@ -5841,9 +5891,12 @@ struct ThumbDone
 {
     int node = -1;
     unsigned generation = 0;
+    bool big = false;
     Thumb thumb;
 };
 
+// Two at a time can be waiting: the one of the image panel (first) and the floating one; another one of
+// the same kind replaces it, and drops it if it is being made
 class ThumbWorker
 {
 public:
@@ -5864,8 +5917,9 @@ public:
     {
         {
             std::lock_guard<std::mutex> hold(lock);
-            pending = std::make_unique<ThumbAsk>(std::move(a));
-            stale = true;
+            const int k = a.big ? 0 : 1;
+            if (running == k) stale = true;
+            pending[k] = std::make_unique<ThumbAsk>(std::move(a));
         }
         wake.notify_one();
     }
@@ -5875,7 +5929,8 @@ private:
     UINT message;
     std::mutex lock;
     std::condition_variable wake;
-    std::unique_ptr<ThumbAsk> pending;
+    std::unique_ptr<ThumbAsk> pending[2];          // big, small
+    int running = -1;
     std::atomic<bool> stale{ false };
     bool quit = false;
     std::thread thread;
@@ -5887,16 +5942,22 @@ private:
             std::unique_ptr<ThumbAsk> a;
             {
                 std::unique_lock<std::mutex> hold(lock);
-                wake.wait(hold, [&] { return quit || pending; });
+                wake.wait(hold, [&] { return quit || pending[0] || pending[1]; });
                 if (quit) return;
-                a = std::move(pending);
+                running = pending[0] ? 0 : 1;
+                a = std::move(pending[running]);
                 stale = false;
             }
             auto done = std::make_unique<ThumbDone>();
             done->node = a->node;
             done->generation = a->generation;
+            done->big = a->big;
             try { done->thumb = Make(*a); }
             catch (...) { done->thumb = Thumb(); done->thumb.error = L"it could not be made"; }
+            {
+                std::lock_guard<std::mutex> hold(lock);
+                running = -1;
+            }
             if (stale) continue;
             if (PostMessageW(window, message, 0, reinterpret_cast<LPARAM>(done.get()))) done.release();
         }
@@ -5904,13 +5965,15 @@ private:
 
     Thumb Make(const ThumbAsk& a)
     {
-        if (a.kind == ThumbAsk::Single) return StackThumb(a.stacks[0], 256, 128, false, &stale);
+        // (the panel's, about twice the size of the floating one)
+        const int single = a.big ? 512 : 256, tile = a.big ? 192 : 128;
+        if (a.kind == ThumbAsk::Single) return StackThumb(a.stacks[0], single, tile, false, &stale);
         Thumb out;
         std::vector<Picture> tiles;
         for (const Stack& s : a.stacks)
         {
             if (stale) return out;
-            Thumb t = StackThumb(s, a.kind == ThumbAsk::Grid ? 112 : 160, 128, true, &stale);
+            Thumb t = StackThumb(s, a.kind == ThumbAsk::Grid ? (a.big ? 176 : 112) : (a.big ? 288 : 160), tile, true, &stale);
             if (t.frames.empty())
             {
                 Picture black;
@@ -6044,6 +6107,7 @@ private:
     int popupNode = -1, popupFrame = 0;
     std::unique_ptr<ThumbWorker> worker;
     std::unordered_map<int, std::shared_ptr<Thumb>> thumbs;     // by node, for this gathering
+    std::unordered_map<int, std::shared_ptr<Thumb>> posters;    // the larger ones of the image panel
     unsigned generation = 0;
     // An export or a report being written
     std::unique_ptr<ExportJob> job;
@@ -6318,6 +6382,7 @@ private:
     {
         HidePopup();
         thumbs.clear();
+        posters.clear();
         generation++;
         hoverItem = nullptr;
         ready = false;
@@ -7079,7 +7144,29 @@ private:
         sliderNode = under;
         std::vector<std::wstring> paths;
         for (int f : nodes[under].files) paths.push_back(data->files[f].path);
+        // Not an image: what the floating thumbnail shows (the middle slice, the mosaic, the cine...),
+        // larger, until the slider goes to its files
+        if (nodes[n].level != Level::Image)
+        {
+            preview->ShowFiles(paths, -1);
+            if (posters.count(n)) ShowPoster(n);
+            else AskThumb(n, true);
+            return;
+        }
         preview->ShowFiles(paths, index);
+    }
+
+    void ShowPoster(int n)
+    {
+        auto it = posters.find(n);
+        if (!preview || it == posters.end() || n != sliderNode) return;
+        const Thumb& t = *it->second;
+        if (t.frames.empty()) { preview->ShowIndex(0); return; }      // (no thumbnail: the first file)
+        std::vector<PreviewHandler::PosterFrame> frames;
+        for (const Picture& p : t.frames) frames.push_back({ p.width, p.height, p.px });
+        std::wstring caption = nodes[n].text;
+        if (!t.caption.empty()) caption += L"   -   " + t.caption;
+        preview->ShowPoster(std::move(frames), t.delay, caption);
     }
 
     // The slider (or the cine) moved: an image chosen in the tree follows it
@@ -7722,12 +7809,13 @@ private:
         return best;
     }
 
-    void AskThumb(int n)
+    void AskThumb(int n, bool big = false)
     {
         ThumbAsk a;
         a.node = n;
         a.generation = generation;
-        const COLORREF bg = GetSysColor(COLOR_INFOBK);
+        a.big = big;
+        const COLORREF bg = GetSysColor(big ? COLOR_WINDOW : COLOR_INFOBK);     // (behind a cascade: the panel's, or the popup's)
         a.background = (static_cast<DWORD>(GetRValue(bg)) << 16) | (GetGValue(bg) << 8) | GetBValue(bg);
         const GatherNode& node = nodes[n];
         if (node.level == Level::Series && node.children.size() > 1)
@@ -7753,6 +7841,12 @@ private:
     {
         std::unique_ptr<ThumbDone> done(d);
         if (d->generation != generation || d->node <= 0 || d->node >= static_cast<int>(nodes.size())) return;
+        if (d->big)
+        {
+            posters[d->node] = std::make_shared<Thumb>(std::move(d->thumb));
+            ShowPoster(d->node);
+            return;
+        }
         thumbs[d->node] = std::make_shared<Thumb>(std::move(d->thumb));
         if (popupNode == d->node) { popupFrame = 0; PlacePopup(); }
     }

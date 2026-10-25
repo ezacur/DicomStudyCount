@@ -142,6 +142,8 @@ tree** opens the whole folder tree with one color per study.
     the positions, trigger times, files, folders, size...), and its **image**: the preview's image,
     with its slider and cine over the files under the node (an image: over those of its node), the
     window, the zoom and the overlay. When an image is chosen, the tree follows the slider and the cine.
+    Any other node shows first what its floating thumbnail shows (below), larger and moving when it
+    is a cine; the slider, the keys or the cine button go from it to its files.
   - Under them, its **full info**: the attributes of its files level by level, as `DCMgroup` gathers
     them. First those of the node itself, then *Varies in the node* (how many values, the first
     ones, and in how many files it is missing), then those the files of each node above share that
