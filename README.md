@@ -84,13 +84,14 @@ tree** opens the whole folder tree with one color per study.
   one, moves the zoomed image. A double click goes back to the header's window, fitted. The bar
   between the tabs and the image moves (remembered for every preview).
 
-  Under the image, a bar steps through the frames of a multi-frame file, or else through the slices of
-  its series (the files of the folder with its SeriesInstanceUID, in the order of their Z level, then
-  of their InstanceNumber): its slider, and a button for the cine (the frames at the pace of the file,
-  the slices at 10 a second). After a click on the image, the keys do the same: Left / Right the
-  frames (or the slices), Up / Down and Page Up / Page Down the slices, Home / End, and Space for the
-  cine (also the wheel, when Explorer lets it reach the preview: it usually keeps it for its list of
-  files). The window dragged stays from slice to slice; the header and the values of the columns
+  Under the image, a bar of two rows, each with its button and its slider, gray when there is nothing
+  to go through. The first one, the times: the frames of a multi-frame file, its play button the cine
+  (at the pace of the file). The second one, the places: the slices of its series (the files of the
+  folder with its SeriesInstanceUID, in the order of their Z level, then of their InstanceNumber), its
+  button (three planes, one behind the other) jumping through them at 10 a second. After a click on the
+  image, the keys do the same: Left / Right the times, Up / Down and Page Up / Page Down the places,
+  Home / End, and Space the cine (or the jumps, when there are no times; also the wheel, when Explorer
+  lets it reach the preview: it usually keeps it for its list of files). The window dragged stays from slice to slice; the header and the values of the columns
   follow the slice shown when the stepping stops. The series is read in the background, once per
   folder while it does not change.
 
@@ -143,33 +144,78 @@ tree** opens the whole folder tree with one color per study.
     and what tells their people apart (never the names or dates).
   - *Compact* (on by default, remembered): an orientation alone in its series, and positions of one
     image each (or alone in their orientation), are left out of the tree: a stack shows its images
-    under the series, a cine of several slices its positions.
+    under the series, a cine of several slices its positions. Turning it on or off keeps the tree as open
+    as it was.  - **Unused**: under the tree, a second one for what gets in the way (hundreds of series of no
+    interest, never deleted). Right-click a node › *Move to unused* puts it there, with its patient and
+    study around it; right-click it there › *Move back to the tree* (its only entry) returns it to its
+    place. The middle button on a node, in either tree, moves it to the other one at once. What is
+    there is not drawn in the navigator, nor found by *Find*, but its floating thumbnail, its info and
+    its image work as in the tree. The trees keep what was open; the bar between them moves. It lasts
+    until the folder is read again (not remembered).
   - Beside the tree, what the chosen node is (date, description, UIDs, plane, Z range and spacing of
-    the positions, trigger times, files, folders, size...), and its **image**: the preview's image,
-    with its slider and cine over the files under the node (an image: over those of its node), the
-    window, the zoom and the overlay. When an image is chosen, the tree follows the slider and the cine.
-    Any other node shows first what its floating thumbnail shows (below), larger and moving when it
-    is a cine; the slider, the keys or the cine button go from it to its files.
+    the positions, trigger times, files, folders, size...), and its **image**: the preview's image over
+    the files under the node (an image: over those of its node), with the window, the zoom and the
+    overlay (*Overlay*, at the top, remembered). Its bar has two rows: the times (play: the frames of a multi-frame file, or the images of
+    a position, its cine) and the places (the jumps: from plane to plane - at the same time, in a cine
+    of several slices - or, under a study or a patient, from series to series), each with its slider,
+    and gray when there is nothing to go through. When an image is chosen, the tree follows them. Any
+    other node shows first what its floating thumbnail shows (below), larger and moving when it is a
+    cine; the sliders, the keys or the buttons go from it to its files. A node of one plane (a cine of one
+    slice) shows its images themselves, the cine playing.
+  - **Reference lines** (*Ref lines*, on by default, remembered): with an image shown, the mouse over
+    another node of the tree draws where its planes cut the image, dashed in dark yellow, over the image
+    and in the navigator.
+  - **Linked cursor**: the mouse over the image marks that point of the patient in the navigator (a
+    yellow dot); the mouse over the plane of the image in the navigator marks the point on the image (a
+    small crosshair).
+  - **Segmentations** (*Segmentations*, on by default, remembered): the DICOM SEG and RT Structure Sets
+    of the study of the image shown are drawn over it - the masks of the SEG frames in its plane, faint
+    inside and strong at the edge, in the color of each segment; the contours of the structure sets in
+    its plane, in the color of each ROI - and the contours, all of them, in the navigator. Read when an
+    image of their study is shown; the frames of a SEG are matched to the image by their planes. In the tree, the images
+    with a segmentation in their plane say `seg`, the nodes above them how many (`(97 segmented)`), and
+    their check boxes are green. A SEG or a structure set is seen only with the images in the folder
+    opened: open the folder of the whole study.
+  - **Series kind** (experimental): each series says what kind it looks to be, in the tree (`«cine short
+    axis»`), in the info of the node, and as a column of the files in Explorer (below).
+  - **Derived images** (ImageType DERIVED: reformats, maps, MIPs...) are in italic (and not in bold) in the tree, and a
+    node with derived and original images under it has a light gray background. Derived and original
+    images, and images in different frames of reference, are never in the same orientation (volume):
+    the orientation says `derived`, or its frame of reference (`[FoR 3fa1c2]`) when its series has more
+    than one.
   - Under them, its **full info**: the attributes of its files level by level, as `DCMgroup` gathers
     them. First those of the node itself, then *Varies in the node* (how many values, the first
     ones, and in how many files it is missing), then those the files of each node above share that
     the next one up does not (the position, the orientation, the series, the study, the patient,
-    all the files), in the color of their level. Its box filters them by tag, name or value (text, or
-    a regular expression: `window|slice`). The names of the patient and of the staff, birth date,
+    all the files), in the color of their level; the triangle of each group folds it, and it stays
+    folded from node to node. The Tag column is folded too (a narrow one): a click on its title opens
+    it, or folds it again (remembered). The box under the list filters them by tag, name or value
+    (text, or a regular expression: `window|slice`). Right-click a row › *Plot ... along the files* (or a
+    double click on it) plots that attribute under the list, file after file in the order of the tree:
+    a line for each of its numbers (up to 3: x, y, z of ImagePositionPatient), or its texts as rows.
+    Missing phases, slices out of order or repeated, a window that changes half way show at once. The
+    image shown is marked; the mouse over it says which file and its value, and a click chooses that
+    image in the tree. It follows the node chosen; its x closes it. The names of the patient and of the staff, birth date,
     address and phone are hidden (*Hide patient identity*, on by default).
   - **Navigator** (*Navigator*, off by default, remembered), as `DCMexplorer( ... , 'nav' )` (mTools): at
     the right of the full info, the images as planes where they are in the patient, in 3-D. Those of
     the chosen node in red, the rest of its study in gray (the coordinates of the patient are those of
     a study), the images of one position as one plane; when the node is one plane, its image is drawn
-    on it. The mouse over a plane (its outline, or the image drawn on it) outlines it in black, frames
-    in black in the tree the images in it (or, in a closed branch, the node that holds them), and says
-    which they are.
+    on it; while the cine or the jumps go, the image shown is drawn on its plane. The mouse over a plane
+    (its outline, or the image drawn on it) outlines it in blue, frames in black in the tree the images
+    in it (or, in a closed branch, the node that holds them), and says which they are. The other way
+    round, the mouse over a node of the tree frames its planes in black there (always, with or without
+    *Hover preview*). A double click on a plane chooses in the tree its first image (by instance number);
+    elsewhere, it starts the view again. The check box of each node of the tree turns its planes on and
+    off there, and those of everything under it (a node partly on shows a third state); Space toggles
+    the chosen one.
     A small figure of the patient turns with them (`L` and `R` at its hands); a click on a side
     of it looks from that side (its face: from the front, its head: from above...). Drag to rotate,
     right-drag up and down (or the wheel) to zoom, Shift+drag (or the middle button) to move, double click
     to start again.
-  - *Find*: text or a regular expression over the lines of the tree; the nodes found are marked, Enter
-    or F3 goes to the next one (Shift+F3 the previous one).
+  - *Find* (under the trees): text or a regular expression over the lines of the trees; the nodes found
+    are marked in both, and for those in a closed branch, the node shown that holds them. Enter or F3
+    goes to the next one in the tree (Shift+F3 the previous one).
   - Right-click a node: its files in Explorer (selected), the paths of its files or its full info to
     the clipboard, expand or collapse everything under it, and its exports and report (below; the
     letters X, N and R choose them). Double click on an image: its folder in Explorer. Ctrl+C copies
@@ -251,6 +297,7 @@ tree** opens the whole folder tree with one color per study.
   | DICOM Z level | position of the slice along its normal (mm), as `xZ` of DICOMstack: comparable only between slices with the same frame of reference |
   | DICOM frame of reference | 6-character hash of the FrameOfReferenceUID |
   | DICOM trigger time | ms after the R wave (cine phase) |
+  | DICOM series kind (experimental) | what kind of series the file is of, guessed from its description, protocol, sequence name, image type, inversion time, number of cardiac phases and plane: `localizer`, `cine short axis` / `cine 4-chamber` / `cine 2-chamber` / `cine 3-chamber`, `late enhancement`, `T1 mapping`, `T2 mapping`, `T2* mapping`, `perfusion`, `flow`, `angiography`, `diffusion`, `dynamic contrast`, `T2-weighted`, `segmentation`, `RT structures`, `screen capture`, `report`, for CT `CT angiography` and `calcium score`; empty when nothing says |
   | DICOM plane (experimental) | as `slicePlaneName` of DICOMstack: `AX`/`COR`/`SAG` only within 1e-3 rad of a cardinal plane, otherwise the nearest cardiac view `hla`/`vla`/`lvot`/`sa` (`tools\New-PlaneClouds.ps1` takes its reference orientations from DICOMstack.m) |
   | DICOM duplicated in | the other copies of the file found by the last count, in the counted folder or in other counted locations (`(differs)` when their bytes differ) |
 

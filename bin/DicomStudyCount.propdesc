@@ -216,6 +216,16 @@
       <displayInfo displayType="String" defaultColumnWidth="8" />
     </propertyDescription>
 
+    <!-- What kind of series the file is of, guessed from its description, protocol, sequence, image type
+         and plane: localizer, cine short axis / 4- / 2- / 3-chamber, late enhancement, T1 / T2 / T2* mapping,
+         perfusion, dynamic contrast, flow, angiography, diffusion, T2-weighted, segmentation, RT structures... -->
+    <propertyDescription name="DicomStudyCount.SeriesKind" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="30">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM series kind (experimental)" />
+      <displayInfo displayType="String" defaultColumnWidth="16" />
+    </propertyDescription>
+
     <!-- Which kinds of identifying data the header holds, never their values: "YES: name, birth date,
          institution", "no", "de-identified" (PatientIdentityRemoved). It cannot see text burned into
          the pixels that the header does not declare, nor data hidden in private tags. -->

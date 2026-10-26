@@ -109,7 +109,7 @@ $menuEntries = @(
 )
 # The DICOM columns of the files (bin\DicomStudyCount.propdesc), in the order they are shown
 $dicomColumns = 'StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber', 'SeriesDescription',
-    'Plane', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness', 'Frames',
+    'Plane', 'SeriesKind', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness', 'Frames',
     'ImageType', 'ObjectType', 'Compression', 'Protocol', 'Manufacturer', 'FrameOfReference', 'StudyDate',
     'PatientID', 'SensitiveData', 'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' |
     ForEach-Object { "DicomStudyCount.$_" }

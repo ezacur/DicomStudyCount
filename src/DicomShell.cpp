@@ -46,6 +46,7 @@
 #include <exdisp.h>
 #include <commctrl.h>
 #include <uxtheme.h>
+#include <vssym32.h>
 #include <thumbcache.h>
 #include <propsys.h>
 #include <propkey.h>
@@ -58,6 +59,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <set>
 #include <new>
 #include <numeric>
 #include <regex>
@@ -80,6 +82,7 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "normaliz.lib")
+#pragma comment(lib, "msimg32.lib")
 
 #pragma comment(linker, "/EXPORT:DllGetClassObject,PRIVATE")
 #pragma comment(linker, "/EXPORT:DllCanUnloadNow,PRIVATE")
@@ -168,6 +171,7 @@ struct Header
     std::string acquisitionDateTime, acquisitionDate, acquisitionTime, contentDate, contentTime;
     std::string seriesDate, seriesTime, studyDate;
     std::string numberOfFrames, triggerTime, sliceThickness, pixelSpacing;
+    std::string scanningSequence, sequenceName, inversionTime, cardiacImages;   // (what kind of series it is)
     // Identifying data, for the "sensitive data" column (its values are never shown)
     std::string patientName, birthDate, address, phone, otherNames, otherIds, motherName;
     std::string institution, institutionAddress, referring, performing, operators;
@@ -332,6 +336,18 @@ static Kind ReadDataset(Parser& p, File& f, Header& h, unsigned last)
             break;
         case 0x00180050:                                           // SliceThickness
             if (!p.String(len, h.sliceThickness)) return Kind::Dicom;
+            break;
+        case 0x00180020:                                           // ScanningSequence
+            if (!p.String(len, h.scanningSequence)) return Kind::Dicom;
+            break;
+        case 0x00180024:                                           // SequenceName
+            if (!p.String(len, h.sequenceName)) return Kind::Dicom;
+            break;
+        case 0x00180082:                                           // InversionTime
+            if (!p.String(len, h.inversionTime)) return Kind::Dicom;
+            break;
+        case 0x00181090:                                           // CardiacNumberOfImages
+            if (!p.String(len, h.cardiacImages)) return Kind::Dicom;
             break;
         case 0x00181030:                                           // ProtocolName
             if (!p.String(len, h.protocolName)) return Kind::Dicom;
@@ -1153,6 +1169,7 @@ static const PROPERTYKEY PKEY_Compression = { FMTID_Dicom, 25 };
 static const PROPERTYKEY PKEY_Protocol = { FMTID_Dicom, 26 };
 static const PROPERTYKEY PKEY_Manufacturer = { FMTID_Dicom, 27 };
 static const PROPERTYKEY PKEY_Plane = { FMTID_Dicom, 28 };
+static const PROPERTYKEY PKEY_SeriesKind = { FMTID_Dicom, 30 };
 
 // The most common SOP classes by name; any other one as its UID
 static std::wstring ObjectType(const std::string& uid)
@@ -1400,6 +1417,75 @@ static std::wstring PlaneName(const Header& h)
     return names[best];
 }
 
+// What kind of series a file is of, guessed (experimental) from its description, protocol and sequence,
+// its image type and its plane: localizer, cine (short axis, 4-, 2-, 3-chamber), late enhancement, T1 / T2 /
+// T2* mapping, perfusion, flow, angiography, diffusion, T2 / black blood; segmentations and structure sets;
+// for CT, angiography and calcium score. Empty when nothing says.
+static std::wstring SeriesKindIn(const Header& h, const std::wstring& plane, std::string t)
+{
+    t = " " + t + " ";
+    for (char& c : t) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    for (char& c : t) if (c == '_' || c == '-' || c == '/' || c == '(' || c == ')' || c == '.') c = ' ';
+    auto has = [&](std::initializer_list<const char*> words) {
+        for (const char* w : words) if (t.find(w) != std::string::npos) return true;
+        return false;
+    };
+    std::string type = h.imageType;
+    for (char& c : type) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+    if (h.sopClass == "1.2.840.10008.5.1.4.1.1.66.4") return L"segmentation";
+    if (h.sopClass == "1.2.840.10008.5.1.4.1.1.481.3") return L"RT structures";
+    if (h.sopClass.rfind("1.2.840.10008.5.1.4.1.1.88.", 0) == 0) return L"report";
+    if (h.sopClass.rfind("1.2.840.10008.5.1.4.1.1.7", 0) == 0) return L"screen capture";
+    if (type.find("LOCALIZER") != std::string::npos ||
+        has({ " survey", "scout", " loc ", "localizer", "localiser", "topogram", "scanogram", "tfl loc", "3 plane", "3plane", "tri pilot" }))
+        return L"localizer";
+    const std::string m = h.modality;
+    if (m == "CT")
+    {
+        if (has({ "calcium", "cascore", "ca score", "agatston" })) return L"calcium score";
+        if (has({ "angio", "cta", "coronar", "ccta" })) return L"CT angiography";
+        return L"CT";
+    }
+    if (m == "US") return L"ultrasound";
+    if (m == "XA") return L"X-ray angiography";
+    if (m != "MR") return std::wstring();
+    if (has({ " flow", "qflow", "q flow", "venc", " pc ", "phase contrast", "velocity", " vel " })) return L"flow";
+    if (has({ "molli", "t1map", "t1 map", "t1 mapping", "look locker", "looklocker", "lookl", "smart1", "saskia" })) return L"T1 mapping";
+    if (has({ "t2map", "t2 map", "t2 mapping", "t2 prep map" })) return L"T2 mapping";
+    if (has({ "t2*", "t2star", "t2 star", "t2s " })) return L"T2* mapping";
+    if (has({ "perf", "first pass", "firstpass" }) || (has({ " dyn" }) && has({ " gd", "gado", "contrast", " ca " }))) return L"perfusion";
+    if (has({ " dce", "dynamic", " dyn ", " dyn" })) return L"dynamic contrast";
+    double ti = 0;
+    const bool inversion = Numbers(h.inversionTime, &ti, 1) && ti > 150 && ti < 500;
+    if (has({ " lge", "psir", " mde", "delayed", " de ", "viab", "late gad", "late enh", "phase sensitive", "tfl psir" }) ||
+        (inversion && has({ " ir ", "tfl", "tfe", "gre" })))
+        return L"late enhancement";
+    if (has({ "angio", " mra", "cemra", " ce mra", " tof ", "3d ce" })) return L"angiography";
+    if (has({ "dti", "dwi", "diff", "tensor" })) return L"diffusion";
+    double phases = 0;
+    const bool many = Numbers(h.cardiacImages, &phases, 1) && phases > 1;
+    if (has({ "cine", "btfe", "trufi", "fiesta", "ssfp", "retro", "sbtfe" }) || (many && !has({ "perf" })))
+    {
+        if (plane == L"sa") return L"cine short axis";
+        if (plane == L"hla") return L"cine 4-chamber";
+        if (plane == L"vla") return L"cine 2-chamber";
+        if (plane == L"lvot") return L"cine 3-chamber";
+        return L"cine";
+    }
+    if (has({ "stir", "haste", " tse", "black", "dark blood", " db ", "t2w", "t2 w" })) return L"T2-weighted";
+    return std::wstring();
+}
+
+// (the description of the series first: the protocol and the sequence are often those of the whole study - "Prostate
+// DWI" in all of its series - and only say when the description does not)
+static std::wstring SeriesKind(const Header& h, const std::wstring& plane)
+{
+    const std::wstring own = SeriesKindIn(h, plane, h.seriesDescription);
+    if (!own.empty() && own != L"CT") return own;
+    const std::wstring all = SeriesKindIn(h, plane, h.seriesDescription + " " + h.protocolName + " " + h.sequenceName);
+    return all.empty() ? own : all;
+}
+
 // COM object: the properties of a DICOM file, read from its header when it is initialized
 class PropertyHandler : public IInitializeWithFile, public IPropertyStore, public IPropertyStoreCapabilities
 {
@@ -1472,6 +1558,7 @@ public:
             Set(PKEY_Protocol, Widen(h.protocolName, h.charset));
             Set(PKEY_Manufacturer, Widen(h.manufacturer, h.charset));
             Set(PKEY_Plane, PlaneName(h));
+            Set(PKEY_SeriesKind, SeriesKind(h, PlaneName(h)));
             Set(PKEY_SensitiveData, SensitiveData(h));
             Set(PKEY_StudyUid, Widen(h.studyUid));
             Set(PKEY_SeriesUid, Widen(h.seriesUid));
@@ -2630,7 +2717,7 @@ static HRESULT ReadAll(IStream* stream, std::vector<char>& data)
 // The DICOM columns, as the tab "Columns" of the preview lists them: the order of Properties > Details
 static const PROPERTYKEY* const g_columnKeys[] = {
     &PKEY_StudyHash, &PKEY_SeriesHash, &PKEY_Modality, &PKEY_SeriesNumber, &PKEY_InstanceNumber, &PKEY_SeriesDescription,
-    &PKEY_Protocol, &PKEY_Plane, &PKEY_Acquired, &PKEY_TriggerTime, &PKEY_ZLevel, &PKEY_Rows, &PKEY_Columns,
+    &PKEY_Protocol, &PKEY_Plane, &PKEY_SeriesKind, &PKEY_Acquired, &PKEY_TriggerTime, &PKEY_ZLevel, &PKEY_Rows, &PKEY_Columns,
     &PKEY_PixelSpacing, &PKEY_SliceThickness, &PKEY_Frames, &PKEY_ImageType, &PKEY_ObjectType, &PKEY_Compression,
     &PKEY_Manufacturer, &PKEY_FrameOfReference, &PKEY_StudyDate, &PKEY_PatientID, &PKEY_SensitiveData,
     &PKEY_ImageOrientation, &PKEY_StudyUid, &PKEY_SeriesUid, &PKEY_DuplicatedIn };
@@ -2989,7 +3076,7 @@ public:
         series.clear();
         slice = -1;
         current.clear();
-        playing = stale = windowSet = plain = false;
+        playing = jumping = stale = windowSet = plain = false;
         for (HFONT* f : { &font, &uiFont, &boldFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
         if (background) { DeleteObject(background); background = nullptr; }
         if (item) { item->Release(); item = nullptr; }
@@ -3109,14 +3196,24 @@ public:
         bounds = rc;
         return CreateWindows();
     }
-    // (frames: of each file, which one of an enhanced multi-frame file it is; -1: the file as it is)
-    void ShowFiles(const std::vector<std::wstring>& files, int index, const std::vector<int>& frames = {})
+    // (frames: of each file, which one of an enhanced multi-frame file it is; -1: the file as it is. space,
+    // time: of each file, its place - a plane or a series - and its position, whose files are its times; the
+    // jumps go through the places, delay ms apart)
+    void ShowFiles(const std::vector<std::wstring>& files, int index, const std::vector<int>& frames = {},
+                   const std::vector<int>& space = {}, const std::vector<int>& time = {}, int delay = 100,
+                   const wchar_t* places = L"Plane")
     {
+        spaceName = places;
         StopPoster();
         Play(false);
+        Jump(false);
+        spaceOf = space.size() == files.size() ? space : std::vector<int>();
+        timeOf = time.size() == files.size() ? time : std::vector<int>();
+        jumpDelay = delay;
         windowSet = false;
         zoom = 1;
         series = files;
+        Places();
         seriesFrames = frames;
         if (std::none_of(seriesFrames.begin(), seriesFrames.end(), [](int f) { return f >= 0; })) seriesFrames.clear();
         slice = -1;
@@ -3133,6 +3230,64 @@ public:
         Shown(had);
     }
     void ShowIndex(int index) { GoSlice(index); }    // another one of the same files
+    bool Stepping() const { return playing || jumping || slice >= 0; }     // (going through the files)
+    bool Running() const { return playing || jumping; }
+    void StartCine() { Play(true); }
+    bool Overlay() const { return overlay; }
+    // Hosted: lines over the image (reference lines: where other planes cut it), and a small crosshair, in
+    // the coordinates of its pixels (columns, rows; 0 the middle of the first one)
+    void SetGuides(std::vector<std::array<double, 4>> lines)
+    {
+        guides = std::move(lines);
+        if (wnd) InvalidateRect(wnd, &imageArea, FALSE);
+    }
+    void SetCrosshair(bool on, double column = 0, double row = 0)
+    {
+        if (!on && !crosshair) return;
+        crosshair = on;
+        crossColumn = column;
+        crossRow = row;
+        if (wnd) InvalidateRect(wnd, &imageArea, FALSE);
+    }
+    std::function<void(bool, double, double)> pointed;     // the mouse over the image (column, row), or off it
+    // Hosted: segmentations over the image: a mask of its size (0xAARRGGBB, its colors by alpha already, top
+    // down; none: empty) and contours (in the coordinates of its pixels)
+    struct Outline { COLORREF color = 0; bool closed = true; std::vector<std::array<double, 2>> points; };
+    void SetSegmentation(int width, int height, const std::vector<DWORD>& argb, std::vector<Outline> lines)
+    {
+        if (maskBitmap) { DeleteObject(maskBitmap); maskBitmap = nullptr; }
+        maskWidth = maskHeight = 0;
+        if (width > 0 && height > 0 && argb.size() >= static_cast<size_t>(width) * height)
+        {
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth = width;
+            bi.bmiHeader.biHeight = -height;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            void* bits = nullptr;
+            maskBitmap = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (maskBitmap && bits) { memcpy(bits, argb.data(), static_cast<size_t>(width) * height * 4); maskWidth = width; maskHeight = height; }
+        }
+        outlines = std::move(lines);
+        if (wnd) InvalidateRect(wnd, &imageArea, FALSE);
+    }
+    void SetOverlay(bool on)
+    {
+        overlay = on;
+        DWORD value = overlay ? 1 : 0;
+        RegSetKeyValueW(HKEY_CURRENT_USER, Settings, L"Overlay", REG_DWORD, &value, sizeof(value));
+        if (wnd) { InvalidateRect(wnd, &imageArea, FALSE); InvalidateRect(wnd, &barArea, FALSE); }
+    }
+    std::function<void(bool)> running;              // the cine or the jumps started (true) or stopped
+    // The image shown, as drawn (0xRRGGBB, top-down): none if there is no image
+    const std::vector<DWORD>* Pixels(int& width, int& height) const
+    {
+        if (view.pixels.empty()) return nullptr;
+        width = view.width;
+        height = view.height;
+        return &view.pixels;
+    }
     std::function<void(int)> moved;
     // The explorer's thumbnail of a node (0xRRGGBB pixels, its frames moving), in place of the first of
     // its files until the slider, the keys or the cine go to them
@@ -3141,6 +3296,7 @@ public:
     {
         if (!hosted || frames.empty()) return;
         Play(false);
+        Jump(false);
         const bool had = !view.pixels.empty();
         poster = std::move(frames);
         posterFrame = 0;
@@ -3167,10 +3323,16 @@ public:
 
 private:
     enum { TabColumns, TabHeader, TabTags, TabDirectory, TabCount };
-    enum class Drag { None, Split, Window, Pan, Zoom, Track };
+    enum class Drag { None, Split, Window, Pan, Zoom, Track, TrackSpace };
     static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2;
-    static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2, TimerPoster = 3;
+    static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2, TimerPoster = 3, TimerJump = 4;
     std::vector<PosterFrame> poster;                // hosted: the thumbnail shown before the files (none: empty)
+    std::vector<std::array<double, 4>> guides;      // hosted: lines over the image (column, row to column, row)
+    HBITMAP maskBitmap = nullptr;                   // hosted: the segmentations over the image
+    int maskWidth = 0, maskHeight = 0;
+    std::vector<Outline> outlines;
+    bool crosshair = false, pointing = false;       // (and the mouse over it, tracked to its leaving)
+    double crossColumn = 0, crossRow = 0;
     std::vector<int> seriesFrames;                  // hosted: the frame of each file of `series` (empty: none)
     size_t posterFrame = 0;
 
@@ -3246,7 +3408,14 @@ private:
     std::shared_ptr<SeriesScan> scan;
     std::vector<std::wstring> series;               // the files of its series, in order (empty until read)
     int slice = -1;                                 // the one shown, in `series`
-    bool overlay = true, playing = false;
+    bool overlay = true, playing = false, jumping = false;     // the cine (in time), the jumps (in space)
+    // Hosted: of each file of `series`, its place in space (a plane, or a series) and in time (its position:
+    // the files of one are its times); empty: each file a place of its own
+    std::vector<int> spaceOf, timeOf;
+    std::vector<std::vector<int>> spaces;           // the files of each place in space, in order
+    std::map<int, std::vector<int>> times;          // the files of each position, in order
+    std::vector<int> spaceIndex;                    // of each file, its place in `spaces`
+    int jumpDelay = 100;                            // ms from place to place
     bool plain = false;                             // not DICOM, and nothing before: only a line saying so
     bool hosted = false;                            // in the DICOM explorer: the image alone
     bool stale = false;                             // its header and values are those of a slice shown before
@@ -3261,7 +3430,8 @@ private:
     bool selecting = false;                         // the tree selection changes from the code
     RECT bounds = {};
     RECT tabArea = {}, tabRects[TabCount] = {}, contentArea = {}, splitArea = {}, imageArea = {}, statusArea = {};
-    RECT barArea = {}, playRect = {}, trackRect = {}, overlayRect = {};
+    RECT barArea = {}, playRect = {}, jumpRect = {}, trackRect = {}, spaceTrackRect = {}, overlayRect = {};
+    const wchar_t* spaceName = L"Slice";            // what the places are (planes, series; the files of a folder: slices)
     int tab = TabColumns;
     int split = 450;                                // the share of the top panel, in thousandths
     Drag drag = Drag::None;
@@ -3704,15 +3874,15 @@ private:
         const int top = tabArea.bottom, bottom = h - line > top ? h - line : top;
         if (hosted)
         {
-            // The image over all of it, its bar under it
-            const int image = bottom - line > top ? bottom - line : top;
+            // The image over all of it, its bar under it (two rows: the times, the places)
+            const int image = bottom - 2 * line > top ? bottom - 2 * line : top;
             contentArea = splitArea = {};
             imageArea = { 0, top, w, image };
             barArea = { 0, image, w, bottom };
         }
         else if (!view.pixels.empty())
         {
-            const int image = bottom - line > top ? bottom - line : top;
+            const int image = bottom - 2 * line > top ? bottom - 2 * line : top;
             int y = top + static_cast<int>(static_cast<long long>(image - top - bar) * split / 1000);
             if (y > image - bar - line) y = image - bar - line;
             if (y < top + line) y = top + line;
@@ -3813,6 +3983,69 @@ private:
                               view.pixels.data() + static_cast<size_t>(y0) * view.width, &bi, DIB_RGB_COLORS, SRCCOPY);
                 RestoreDC(dc, saved);
             }
+            // The segmentations: their mask (its colors through) and their contours
+            if (hosted && poster.empty() && (maskBitmap || !outlines.empty()))
+            {
+                const int saved = SaveDC(dc);
+                IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
+                if (maskBitmap)
+                {
+                    HDC src = CreateCompatibleDC(dc);
+                    HGDIOBJ kept = SelectObject(src, maskBitmap);
+                    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+                    AlphaBlend(dc, static_cast<int>(std::lround(left)), static_cast<int>(std::lround(top)),
+                               static_cast<int>(std::lround(view.width * scale)), static_cast<int>(std::lround(view.height * scale)),
+                               src, 0, 0, maskWidth, maskHeight, blend);
+                    SelectObject(src, kept);
+                    DeleteDC(src);
+                }
+                for (const Outline& o : outlines)
+                {
+                    HPEN pen = CreatePen(PS_SOLID, Px(2), o.color);
+                    HGDIOBJ kept = SelectObject(dc, pen);
+                    std::vector<POINT> pts;
+                    for (const auto& p : o.points)
+                        pts.push_back({ static_cast<LONG>(std::lround(left + (p[0] + 0.5) * scale)), static_cast<LONG>(std::lround(top + (p[1] + 0.5) * scale)) });
+                    if (o.closed && pts.size() > 2) pts.push_back(pts.front());
+                    if (pts.size() > 1) Polyline(dc, pts.data(), static_cast<int>(pts.size()));
+                    SelectObject(dc, kept);
+                    DeleteObject(pen);
+                }
+                RestoreDC(dc, saved);
+            }
+            // The reference lines (dashed, dark yellow) and the crosshair, over the image in sight
+            if (hosted && poster.empty() && (!guides.empty() || crosshair))
+            {
+                const int saved = SaveDC(dc);
+                IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
+                auto at = [&](double c, double r) { return POINT{ static_cast<LONG>(std::lround(left + (c + 0.5) * scale)), static_cast<LONG>(std::lround(top + (r + 0.5) * scale)) }; };
+                LOGBRUSH lb = { BS_SOLID, RGB(214, 170, 0), 0 };
+                const DWORD dashes[2] = { static_cast<DWORD>(Px(6)), static_cast<DWORD>(Px(4)) };
+                HPEN dashed = ExtCreatePen(PS_GEOMETRIC | PS_USERSTYLE | PS_ENDCAP_FLAT, 1, &lb, 2, dashes);
+                HGDIOBJ before = SelectObject(dc, dashed);
+                for (const auto& g : guides)
+                {
+                    const POINT a = at(g[0], g[1]), b = at(g[2], g[3]);
+                    MoveToEx(dc, a.x, a.y, nullptr);
+                    LineTo(dc, b.x, b.y);
+                }
+                if (crosshair)
+                {
+                    HPEN cross = CreatePen(PS_SOLID, Px(2), RGB(255, 220, 0));
+                    SelectObject(dc, cross);
+                    const POINT p = at(crossColumn, crossRow);
+                    const int k = Px(8);
+                    MoveToEx(dc, p.x - k, p.y, nullptr); LineTo(dc, p.x - Px(2), p.y);
+                    MoveToEx(dc, p.x + Px(2), p.y, nullptr); LineTo(dc, p.x + k, p.y);
+                    MoveToEx(dc, p.x, p.y - k, nullptr); LineTo(dc, p.x, p.y - Px(2));
+                    MoveToEx(dc, p.x, p.y + Px(2), nullptr); LineTo(dc, p.x, p.y + k);
+                    SelectObject(dc, dashed);
+                    DeleteObject(cross);
+                }
+                SelectObject(dc, before);
+                DeleteObject(dashed);
+                RestoreDC(dc, saved);
+            }
             // The overlay, on the part of the image in sight
             RECT shown = { static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top)),
                            static_cast<LONG>(std::lround(left + view.width * scale)), static_cast<LONG>(std::lround(top + view.height * scale)) };
@@ -3911,90 +4144,125 @@ private:
         RestoreDC(dc, saved);
     }
 
-    // The image bar: play / pause and the slider of the frames (of a multi-frame file) or of the slices
-    // (of its series) with where it is, and the check box of the overlay at the right
+    // The image bar, two rows: the times (play / pause, the frames of a multi-frame file or the images of a
+    // position) with the check box of the overlay at the right; the places (the jumps through the planes
+    // or the series, or the files of a folder). Each one gray when there is nothing to go through.
     void PaintBar(HDC dc)
     {
-        playRect = trackRect = overlayRect = {};
+        playRect = jumpRect = trackRect = spaceTrackRect = overlayRect = {};
         if (barArea.bottom <= barArea.top) return;
         SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
-        const int cy = (barArea.top + barArea.bottom) / 2;
-        int left = barArea.left + Px(6), right = barArea.right - Px(6);
+        const int middle = (barArea.top + barArea.bottom) / 2;
+        const RECT rows[2] = { { barArea.left, barArea.top, barArea.right, middle }, { barArea.left, middle, barArea.right, barArea.bottom } };
         HBRUSH accent = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT)), ink = CreateSolidBrush(textColor);
-        HBRUSH groove = CreateSolidBrush(Dim(30)), border = CreateSolidBrush(Dim(60));
+        HBRUSH groove = CreateSolidBrush(Dim(30)), border = CreateSolidBrush(Dim(60)), off = CreateSolidBrush(Dim(35));
         HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN)), oldBrush = SelectObject(dc, ink);
-
-        static const wchar_t label[] = L"Overlay";
         SIZE ext = {};
-        GetTextExtentPoint32W(dc, label, ARRAYSIZE(label) - 1, &ext);
-        const int box = Px(13);
-        overlayRect = { right - ext.cx - Px(6) - box, barArea.top, right, barArea.bottom };
-        RECT square = { overlayRect.left, cy - box / 2, overlayRect.left + box, cy - box / 2 + box };
-        if (overlay)
-        {
-            FillRect(dc, &square, accent);
-            HPEN pen = CreatePen(PS_SOLID, Px(2), RGB(255, 255, 255));
-            SelectObject(dc, pen);
-            POINT check[3] = { { square.left + box * 22 / 100, cy }, { square.left + box * 42 / 100, cy + box * 22 / 100 },
-                               { square.left + box * 78 / 100, cy - box * 22 / 100 } };
-            Polyline(dc, check, 3);
-            SelectObject(dc, GetStockObject(NULL_PEN));
-            DeleteObject(pen);
-        }
-        else FrameRect(dc, &square, border);
-        ::SetTextColor(dc, textColor);
-        RECT text = { square.right + Px(6), barArea.top, right, barArea.bottom };
-        DrawTextW(dc, label, -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        right = overlayRect.left - Px(14);
 
-        const int n = Count(), at = poster.empty() ? Position() : 0;     // (the thumbnail: the slider at the first file)
-        if (n > 1 && at >= 0)
+        // The overlay, at the right of the first row (hosted: the check box of the explorer)
+        if (!hosted)
         {
-            const int s = Px(10);
-            playRect = { left, barArea.top, left + Px(20), barArea.bottom };
-            const int px = (playRect.left + playRect.right) / 2;
-            if (playing)
+            const RECT& r = rows[0];
+            const int cy = (r.top + r.bottom) / 2, right = r.right - Px(6);
+            static const wchar_t label[] = L"Overlay";
+            GetTextExtentPoint32W(dc, label, ARRAYSIZE(label) - 1, &ext);
+            const int box = Px(13);
+            overlayRect = { right - ext.cx - Px(6) - box, r.top, right, r.bottom };
+            RECT square = { overlayRect.left, cy - box / 2, overlayRect.left + box, cy - box / 2 + box };
+            if (overlay)
             {
-                RECT a = { px - s / 2, cy - s / 2, px - s / 2 + s * 35 / 100, cy - s / 2 + s };
-                RECT b = { px + s / 2 - s * 35 / 100, cy - s / 2, px + s / 2, cy - s / 2 + s };
-                FillRect(dc, &a, ink);
-                FillRect(dc, &b, ink);
+                FillRect(dc, &square, accent);
+                HPEN pen = CreatePen(PS_SOLID, Px(2), RGB(255, 255, 255));
+                SelectObject(dc, pen);
+                POINT check[3] = { { square.left + box * 22 / 100, cy }, { square.left + box * 42 / 100, cy + box * 22 / 100 },
+                                   { square.left + box * 78 / 100, cy - box * 22 / 100 } };
+                Polyline(dc, check, 3);
+                SelectObject(dc, GetStockObject(NULL_PEN));
+                DeleteObject(pen);
+            }
+            else FrameRect(dc, &square, border);
+            ::SetTextColor(dc, textColor);
+            RECT text = { square.right + Px(6), r.top, right, r.bottom };
+            DrawTextW(dc, label, -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        const int rightEdge = hosted ? barArea.right - Px(6) : overlayRect.left - Px(14);
+        const bool any = Count() > 0 && (Position() >= 0 || !poster.empty());
+
+        // A row: its button, its slider at `at` of `n`, and where it is
+        auto row = [&](int which, bool active, int at, int n, const std::wstring& where, RECT& button, RECT& track) {
+            const RECT& r = rows[which];
+            const int cy = (r.top + r.bottom) / 2;
+            int left = r.left + Px(6), right = rightEdge;
+            const RECT b = { left, r.top, left + Px(24), r.bottom };
+            if (active) button = b;
+            const int px = (b.left + b.right) / 2, s = Px(10);
+            if (which == 0)
+            {
+                SelectObject(dc, active ? ink : off);
+                if (playing)
+                {
+                    RECT a1 = { px - s / 2, cy - s / 2, px - s / 2 + s * 35 / 100, cy - s / 2 + s };
+                    RECT a2 = { px + s / 2 - s * 35 / 100, cy - s / 2, px + s / 2, cy - s / 2 + s };
+                    FillRect(dc, &a1, ink);
+                    FillRect(dc, &a2, ink);
+                }
+                else
+                {
+                    POINT triangle[3] = { { px - s / 2 + 1, cy - s / 2 }, { px - s / 2 + 1, cy + s / 2 }, { px + s / 2, cy } };
+                    Polygon(dc, triangle, 3);
+                }
             }
             else
             {
-                POINT play[3] = { { px - s / 2 + 1, cy - s / 2 }, { px - s / 2 + 1, cy + s / 2 }, { px + s / 2, cy } };
-                Polygon(dc, play, 3);
+                // Three planes one behind the other (the front one in the accent color while jumping)
+                HPEN edge = CreatePen(PS_SOLID, 1, active ? textColor : Dim(35));
+                SelectObject(dc, edge);
+                for (int k = 2; k >= 0; k--)
+                {
+                    const int dy = (1 - k) * Px(4), w = Px(7), h = Px(2), skew = Px(4);     // (k 2 the back one, at the top)
+                    POINT sheet[4] = { { px - w, cy + dy + h }, { px - w + skew, cy + dy - h }, { px + w, cy + dy - h }, { px + w - skew, cy + dy + h } };
+                    SelectObject(dc, k == 0 ? (jumping ? accent : (active ? ink : off)) : GetStockObject(active ? WHITE_BRUSH : LTGRAY_BRUSH));
+                    Polygon(dc, sheet, 4);
+                }
+                SelectObject(dc, GetStockObject(NULL_PEN));
+                DeleteObject(edge);
             }
-            left = playRect.right + Px(8);
-
-            wchar_t where[96];
-            if (view.frames > 1 && series.size() > 1 && seriesFrames.empty())
-                swprintf_s(where, L"Frame %d / %d   File %d / %d", at + 1, n, slice + 1, static_cast<int>(series.size()));
-            else if (!poster.empty()) swprintf_s(where, L"Thumbnail   %d files", n);
-            else swprintf_s(where, view.frames > 1 ? L"Frame %d / %d" : L"Slice %d / %d", at + 1, n);
-            GetTextExtentPoint32W(dc, where, static_cast<int>(wcslen(where)), &ext);
-            RECT w = { right - ext.cx, barArea.top, right, barArea.bottom };
+            left = b.right + Px(8);
+            GetTextExtentPoint32W(dc, where.c_str(), static_cast<int>(where.size()), &ext);
+            const int textWidth = (std::max)(static_cast<int>(ext.cx), Px(110));
+            RECT w = { right - textWidth, r.top, right, r.bottom };
             if (w.left > left + Px(40))
             {
-                ::SetTextColor(dc, Dim(70));
-                DrawTextW(dc, where, -1, &w, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                ::SetTextColor(dc, active ? Dim(70) : Dim(40));
+                DrawTextW(dc, where.c_str(), -1, &w, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                 right = w.left - Px(12);
             }
             if (right - left > Px(30))
             {
-                trackRect = { left, barArea.top, right, barArea.bottom };
-                const int x = left + static_cast<int>(static_cast<long long>(right - left) * at / (n - 1));
-                RECT track = { left, cy - Px(1), right, cy - Px(1) + Px(2) }, done = { left, track.top, x, track.bottom };
-                FillRect(dc, &track, groove);
-                FillRect(dc, &done, accent);
-                SelectObject(dc, accent);
+                const int x = n > 1 ? left + static_cast<int>(static_cast<long long>(right - left) * (std::max)(0, at) / (n - 1)) : left;
+                RECT groove1 = { left, cy - Px(1), right, cy - Px(1) + Px(2) }, done = { left, groove1.top, x, groove1.bottom };
+                FillRect(dc, &groove1, groove);
+                if (active)
+                {
+                    track = { left, r.top, right, r.bottom };
+                    FillRect(dc, &done, accent);
+                }
+                SelectObject(dc, active ? accent : off);
                 const int k = Px(5);
                 Ellipse(dc, x - k, cy - k, x + k + 1, cy + k + 1);
             }
-        }
+        };
+        wchar_t where[96];
+        const int nt = any ? TimeCount() : 0, ns = any ? SpaceCount() : 0;
+        const int at = any ? TimeIndex() : 0, as = any ? SpaceIndex() : 0;
+        swprintf_s(where, OverFrames() ? L"Frame %d / %d" : L"Time %d / %d", at + 1, (std::max)(1, nt));
+        row(0, nt > 1, at, nt, where, playRect, trackRect);
+        if (!poster.empty()) swprintf_s(where, L"Thumbnail   %d files", Count());
+        else swprintf_s(where, L"%s %d / %d", spaceName, as + 1, (std::max)(1, ns));
+        row(1, ns > 1, as, ns, where, jumpRect, spaceTrackRect);
         SelectObject(dc, oldPen);
         SelectObject(dc, oldBrush);
-        for (HBRUSH b : { accent, ink, groove, border }) DeleteObject(b);
+        for (HBRUSH b : { accent, ink, groove, border, off }) DeleteObject(b);
     }
 
     // The slider of the image bar: the frames of a multi-frame file, or else the files of its series
@@ -4023,6 +4291,7 @@ private:
         catch (...) { why = L"it cannot be shown"; }
         if (!why.empty()) view.frame = f;           // no image, and the stepping goes on from there
         Shown(had);
+        if (hosted && moved && (playing || jumping)) moved(slice);     // (the explorer draws it where it is)
     }
 
     // Another file of the series: the window dragged stays, and the zoom while the size of the image
@@ -4131,22 +4400,144 @@ private:
         InvalidateRect(wnd, &barArea, FALSE);
     }
 
-    // The cine: the frames at the pace of the file, the slices at 10 a second, round and round
+    // The places of the files: in space (planes or series) and in time (the files of each position)
+    void Places()
+    {
+        spaces.clear();
+        times.clear();
+        spaceIndex.assign(series.size(), 0);
+        std::map<int, size_t> at;
+        for (size_t i = 0; i < series.size(); i++)
+        {
+            const int key = spaceOf.empty() ? static_cast<int>(i) : spaceOf[i];
+            auto r = at.emplace(key, spaces.size());
+            if (r.second) spaces.emplace_back();
+            spaces[r.first->second].push_back(static_cast<int>(i));
+            spaceIndex[i] = static_cast<int>(r.first->second);
+            times[timeOf.empty() ? static_cast<int>(i) : timeOf[i]].push_back(static_cast<int>(i));
+        }
+    }
+
+    // How many times the image shown has (the frames of its file, or the images of its position), and how
+    // many places its files have
+    bool OverFrames() const { return view.frames > 1 && seriesFrames.empty(); }
+    int TimeCount() const
+    {
+        if (OverFrames()) return view.frames;
+        if (slice < 0 || slice >= static_cast<int>(series.size()) || timeOf.empty()) return poster.empty() ? 1 : FirstTimes();
+        auto it = times.find(timeOf[slice]);
+        return it == times.end() ? 1 : static_cast<int>(it->second.size());
+    }
+    int FirstTimes() const      // (the thumbnail shown: the times of the first file)
+    {
+        if (timeOf.empty() || series.empty()) return 1;
+        auto it = times.find(timeOf[0]);
+        return it == times.end() ? 1 : static_cast<int>(it->second.size());
+    }
+    int SpaceCount() const
+    {
+        if (series.size() != spaceIndex.size()) return static_cast<int>(series.size());
+        return static_cast<int>(spaces.size());
+    }
+
+    // Where the image shown is in time (its frame, or among the images of its position) and in space
+    int TimeIndex() const
+    {
+        if (OverFrames()) return view.frame;
+        if (slice < 0 || timeOf.empty()) return 0;
+        auto it = times.find(timeOf[slice]);
+        if (it == times.end()) return 0;
+        return static_cast<int>(std::find(it->second.begin(), it->second.end(), slice) - it->second.begin());
+    }
+    int SpaceIndex() const
+    {
+        if (slice < 0) return 0;
+        if (series.size() != spaceIndex.size()) return slice;
+        return spaceIndex[slice];
+    }
+
+    // To a time of the image shown (a frame, or an image of its position)
+    void GoTime(int k)
+    {
+        if (OverFrames()) { GoFrame(k); return; }
+        if (series.empty() || timeOf.empty()) return;
+        const int base = slice >= 0 ? slice : 0;
+        const std::vector<int>& same = times[timeOf[base]];
+        if (k >= 0 && k < static_cast<int>(same.size())) GoSlice(same[k]);
+    }
+
+    // To a place: the plane (at the same time, if it has it) or the series
+    void GoSpace(int target)
+    {
+        const int n = SpaceCount();
+        if (n < 1 || target < 0 || target >= n) return;
+        if (series.size() != spaceIndex.size()) { GoSlice(target); return; }
+        int phase = 0;
+        if (slice >= 0 && !timeOf.empty())
+        {
+            const std::vector<int>& mine = times[timeOf[slice]];
+            phase = static_cast<int>(std::find(mine.begin(), mine.end(), slice) - mine.begin());
+        }
+        const std::vector<int>& next = spaces[target];
+        std::vector<int> first;                     // (its first position)
+        for (int f : next) if (timeOf.empty() || timeOf[f] == timeOf[next[0]]) first.push_back(f);
+        GoSlice(first[(std::min)(phase, static_cast<int>(first.size()) - 1)]);
+    }
+
+    // The next time: the next frame, or the next image of the position, round and round
+    void StepTime(int delta)
+    {
+        if (OverFrames()) { GoFrame(((view.frame + delta) % view.frames + view.frames) % view.frames); return; }
+        if (slice < 0 || timeOf.empty()) return;
+        const std::vector<int>& same = times[timeOf[slice]];
+        const int k = static_cast<int>(std::find(same.begin(), same.end(), slice) - same.begin());
+        const int n = static_cast<int>(same.size());
+        if (n > 1) GoSlice(same[((k + delta) % n + n) % n]);
+    }
+
+    // The next place: the next plane (at the same time, if it has it) or series, round and round
+    void StepSpace(int delta)
+    {
+        const int n = SpaceCount();
+        if (n < 2) return;
+        if (!poster.empty() && slice < 0) { GoSlice(0); return; }
+        GoSpace(((SpaceIndex() + delta) % n + n) % n);
+    }
+
+    // The cine: the frames at the pace of the file, the images of a position at 10 a second, round and round
     void Play(bool on)
     {
         if (on && !poster.empty()) GoSlice(0);     // (from the thumbnail: the files, from the first one)
-        playing = on && Count() > 1;
+        if (on) Jump(false);
+        playing = on && TimeCount() > 1;
         if (playing)
         {
-            const double ms = view.frames > 1 && view.frameTime > 0 ? view.frameTime : 100;
+            const double ms = OverFrames() && view.frameTime > 0 ? view.frameTime : 100;
             SetTimer(wnd, TimerCine, static_cast<UINT>((std::max)(15.0, (std::min)(1000.0, ms))), nullptr);
         }
         else
         {
             KillTimer(wnd, TimerCine);
-            if (stale) SetTimer(wnd, TimerSettle, 300, nullptr);     // the header of the slice it stopped at
+            if (stale && !jumping) SetTimer(wnd, TimerSettle, 300, nullptr);     // the header of the slice it stopped at
         }
         InvalidateRect(wnd, &barArea, FALSE);
+        if (running) running(playing || jumping);
+    }
+
+    // The jumps: plane after plane (or series after series), round and round
+    void Jump(bool on)
+    {
+        if (on && !poster.empty()) GoSlice(0);
+        if (on) Play(false);
+        jumping = on && SpaceCount() > 1;
+        if (jumping) SetTimer(wnd, TimerJump, static_cast<UINT>((std::max)(15, (std::min)(2000, jumpDelay))), nullptr);
+        else
+        {
+            if (wnd) KillTimer(wnd, TimerJump);
+            if (stale && !playing && wnd) SetTimer(wnd, TimerSettle, 300, nullptr);
+        }
+        if (wnd) InvalidateRect(wnd, &barArea, FALSE);
+        if (running) running(playing || jumping);
     }
 
     // The keys of the image, when it has the focus (a click on it): Left / Right the frames (or the
@@ -4157,24 +4548,38 @@ private:
         if (view.pixels.empty() && Count() < 2) return false;
         switch (key)
         {
-        case VK_LEFT: Step(-1); return true;
-        case VK_RIGHT: Step(1); return true;
-        case VK_UP: case VK_PRIOR: GoSlice(slice - 1); return true;
-        case VK_DOWN: case VK_NEXT: GoSlice(slice + 1); return true;
+        case VK_LEFT: if (TimeCount() > 1) StepTime(-1); else Step(-1); return true;
+        case VK_RIGHT: if (TimeCount() > 1) StepTime(1); else Step(1); return true;
+        case VK_UP: case VK_PRIOR: if (!poster.empty()) GoSlice(0); else StepSpace(-1); return true;
+        case VK_DOWN: case VK_NEXT: if (!poster.empty()) GoSlice(0); else StepSpace(1); return true;
         case VK_HOME: GoTo(0); return true;
         case VK_END: GoTo(Count() - 1); return true;
-        case VK_SPACE: Play(!playing); return true;
+        case VK_SPACE: if (TimeCount() > 1) Play(!playing); else Jump(!jumping); return true;
         }
         return false;
     }
 
-    // Dragging along the slider
+    // Dragging along the slider of the places
+    void TrackSpaceTo(POINT pt)
+    {
+        const int n = SpaceCount();
+        if (n < 2 || spaceTrackRect.right <= spaceTrackRect.left) return;
+        const double t = static_cast<double>(pt.x - spaceTrackRect.left) / (spaceTrackRect.right - spaceTrackRect.left);
+        const int k = static_cast<int>(std::lround((std::max)(0.0, (std::min)(1.0, t)) * (n - 1)));
+        if (k != SpaceIndex() || slice < 0) GoSpace(k);
+    }
+
+    // Dragging along the slider of the times
     void TrackTo(POINT pt)
     {
-        const int n = Count();
-        if (n < 2 || trackRect.right <= trackRect.left) return;
-        const double t = static_cast<double>(pt.x - trackRect.left) / (trackRect.right - trackRect.left);
-        GoTo(static_cast<int>(std::lround((std::max)(0.0, (std::min)(1.0, t)) * (n - 1))));
+        const int nt = TimeCount();
+        if (nt > 1 && trackRect.right > trackRect.left)
+        {
+            const double t = static_cast<double>(pt.x - trackRect.left) / (trackRect.right - trackRect.left);
+            const int k = static_cast<int>(std::lround((std::max)(0.0, (std::min)(1.0, t)) * (nt - 1)));
+            if (!poster.empty() && slice < 0) GoSlice(0);
+            if (k != TimeIndex()) GoTime(k);
+        }
     }
 
     // Dragging over the image: right widens the window (less contrast), up lowers its center (brighter).
@@ -4294,14 +4699,18 @@ private:
         case WM_TIMER:
             if (self && wp == TimerSettle)
             {
-                if (self->playing) KillTimer(hwnd, TimerSettle);     // again when it stops
+                if (self->playing || self->jumping) KillTimer(hwnd, TimerSettle);     // again when it stops
                 else self->Settle();
             }
             else if (self && wp == TimerCine)
             {
-                const int n = self->Count();
-                if (n < 2 || self->Position() < 0) self->Play(false);
-                else self->GoTo((self->Position() + 1) % n);
+                if (self->TimeCount() < 2 || self->Position() < 0) self->Play(false);
+                else self->StepTime(1);
+            }
+            else if (self && wp == TimerJump)
+            {
+                if (self->SpaceCount() < 2) self->Jump(false);
+                else self->StepSpace(1);
             }
             else if (self && wp == TimerPoster && !self->poster.empty())
             {
@@ -4320,7 +4729,7 @@ private:
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
                 for (const RECT& r : self->tabRects) if (PtInRect(&r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
-                for (const RECT* r : { &self->playRect, &self->trackRect, &self->overlayRect })
+                for (const RECT* r : { &self->playRect, &self->jumpRect, &self->trackRect, &self->spaceTrackRect, &self->overlayRect })
                     if (PtInRect(r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
                 if (PtInRect(&self->splitArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZENS)); return TRUE; }
                 if (self->view.imaging && PtInRect(&self->imageArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZEALL)); return TRUE; }
@@ -4335,13 +4744,10 @@ private:
                 if (PtInRect(&self->imageArea, pt) || PtInRect(&self->barArea, pt)) ::SetFocus(hwnd);
                 if (PtInRect(&self->splitArea, pt)) { self->drag = Drag::Split; self->dragFrom = pt; SetCapture(hwnd); }
                 else if (PtInRect(&self->playRect, pt)) self->Play(!self->playing);
+                else if (PtInRect(&self->jumpRect, pt)) self->Jump(!self->jumping);
                 else if (PtInRect(&self->overlayRect, pt))
                 {
-                    self->overlay = !self->overlay;
-                    DWORD value = self->overlay ? 1 : 0;
-                    RegSetKeyValueW(HKEY_CURRENT_USER, Settings, L"Overlay", REG_DWORD, &value, sizeof(value));
-                    InvalidateRect(hwnd, &self->imageArea, FALSE);
-                    InvalidateRect(hwnd, &self->barArea, FALSE);
+                    self->SetOverlay(!self->overlay);
                 }
                 else if (PtInRect(&self->trackRect, pt))
                 {
@@ -4349,11 +4755,40 @@ private:
                     SetCapture(hwnd);
                     self->TrackTo(pt);
                 }
+                else if (PtInRect(&self->spaceTrackRect, pt))
+                {
+                    self->drag = Drag::TrackSpace;
+                    SetCapture(hwnd);
+                    self->TrackSpaceTo(pt);
+                }
                 else if (self->view.imaging && PtInRect(&self->imageArea, pt))
                     self->StartImageDrag((wp & MK_SHIFT) ? Drag::Pan : Drag::Window, pt);
             }
             return 0;
         case WM_MOUSEMOVE:
+            // Hosted: where the mouse is on the image (the explorer shows it in its navigator)
+            if (self && self->hosted && self->pointed && self->drag == Drag::None)
+            {
+                const POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                const double scale = self->Scale();
+                bool inside = false;
+                double column = 0, row = 0;
+                if (scale > 0 && self->poster.empty() && self->slice >= 0 && PtInRect(&self->imageArea, pt))
+                {
+                    const double left = (self->imageArea.left + self->imageArea.right) / 2.0 - self->viewX * scale;
+                    const double top = (self->imageArea.top + self->imageArea.bottom) / 2.0 - self->viewY * scale;
+                    column = (pt.x - left) / scale - 0.5;
+                    row = (pt.y - top) / scale - 0.5;
+                    inside = column >= -0.5 && row >= -0.5 && column < self->view.width - 0.5 && row < self->view.height - 0.5;
+                }
+                if (inside && !self->pointing)
+                {
+                    TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, hwnd, 0 };
+                    TrackMouseEvent(&t);
+                }
+                if (inside || self->pointing) self->pointed(inside, column, row);
+                self->pointing = inside;
+            }
             if (self && self->drag != Drag::None)
             {
                 POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -4361,6 +4796,7 @@ private:
                 else if (self->drag == Drag::Pan) self->PanTo(pt);
                 else if (self->drag == Drag::Zoom) self->ZoomTo(pt);
                 else if (self->drag == Drag::Track) self->TrackTo(pt);
+                else if (self->drag == Drag::TrackSpace) self->TrackSpaceTo(pt);
                 else
                 {
                     const int top = self->tabArea.bottom, room = self->barArea.top - top - (self->splitArea.bottom - self->splitArea.top);
@@ -4372,6 +4808,9 @@ private:
                     }
                 }
             }
+            return 0;
+        case WM_MOUSELEAVE:
+            if (self && self->pointing) { self->pointing = false; if (self->pointed) self->pointed(false, 0, 0); }
             return 0;
         case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN:
@@ -5250,6 +5689,198 @@ static std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored
     s.bits = allocated <= 8 ? 8 : allocated <= 16 ? 16 : 32;
     if (representation == 1) s.bits = -s.bits;
     return std::wstring();
+}
+
+// ----- Segmentations drawn over the images: DICOM SEG (masks, frame by frame, each frame of a segment and
+// with its plane) and RT Structure Sets (contours: points of the patient, plane by plane)
+
+static const char* const SegSopClass = "1.2.840.10008.5.1.4.1.1.66.4";
+static const char* const RtStructSopClass = "1.2.840.10008.5.1.4.1.1.481.3";
+
+// A color of CIELab as DICOM writes it (L 0..65535 for 0..100, a and b 0..65535 for -128..127) in sRGB
+static COLORREF FromCieLab(Uint16 l16, Uint16 a16, Uint16 b16)
+{
+    const double L = l16 * 100.0 / 65535, a = a16 * 255.0 / 65535 - 128, b = b16 * 255.0 / 65535 - 128;
+    double fy = (L + 16) / 116, fx = fy + a / 500, fz = fy - b / 200;
+    auto inv = [](double t) { return t > 6.0 / 29 ? t * t * t : 3 * (6.0 / 29) * (6.0 / 29) * (t - 4.0 / 29); };
+    const double X = 0.95047 * inv(fx), Y = inv(fy), Z = 1.08883 * inv(fz);
+    double rgb[3] = { 3.2406 * X - 1.5372 * Y - 0.4986 * Z, -0.9689 * X + 1.8758 * Y + 0.0415 * Z, 0.0557 * X - 0.2040 * Y + 1.0570 * Z };
+    int out[3];
+    for (int k = 0; k < 3; k++)
+    {
+        double v = rgb[k] <= 0.0031308 ? 12.92 * rgb[k] : 1.055 * std::pow((std::max)(0.0, rgb[k]), 1 / 2.4) - 0.055;
+        out[k] = static_cast<int>(std::lround((std::max)(0.0, (std::min)(1.0, v)) * 255));
+    }
+    return RGB(out[0], out[1], out[2]);
+}
+
+struct SegFrame
+{
+    double origin[3] = {}, row[3] = {}, column[3] = {}, dx = 1, dy = 1;
+    int columns = 0, rows = 0, segment = 1;
+    bool any = false;                               // (some of the mask is set)
+    std::vector<Uint8> mask;                        // 1: in the segment
+};
+
+struct Contour
+{
+    std::vector<std::array<double, 3>> points;      // in the patient (mm)
+    COLORREF color = 0;
+    bool closed = true;
+};
+
+struct Overlay
+{
+    std::wstring path;
+    bool rt = false, loaded = false, failed = false;
+    std::string study;
+    std::vector<SegFrame> frames;                   // a SEG
+    std::map<int, COLORREF> colors;                 // (of its segments)
+    double spacing = 0;                             // (between its frames along their normal: how near a plane must be)
+    std::vector<Contour> contours;                  // an RT Structure Set
+};
+
+// The value of an attribute in the first item of a sequence of an item (or of the shared groups)
+static std::string InGroup(DcmItem* group, const DcmTagKey& sequence, const DcmTagKey& key)
+{
+    DcmSequenceOfItems* s = nullptr;
+    OFString v;
+    if (group && group->findAndGetSequence(sequence, s).good() && s && s->card()) s->getItem(0)->findAndGetOFStringArray(key, v);
+    return std::string(v.c_str(), v.length());
+}
+
+static void LoadOverlay(Overlay& o)
+{
+    o.loaded = true;
+    InitDcmtk();
+    DcmFileFormat ff;
+    if (ff.loadFile(OFFilename(o.path.c_str(), OFTrue)).bad()) { o.failed = true; return; }
+    DcmDataset* ds = ff.getDataset();
+    if (o.rt)
+    {
+        std::map<long, COLORREF> colors;
+        DcmSequenceOfItems* rois = nullptr;
+        if (ds->findAndGetSequence(DcmTagKey(0x3006, 0x0039), rois).bad() || !rois) { o.failed = true; return; }
+        for (unsigned long r = 0; r < rois->card(); r++)
+        {
+            DcmItem* roi = rois->getItem(r);
+            COLORREF color = Palette[(5 + r) % PaletteSize];
+            OFString rgb;
+            double c[3];
+            if (roi->findAndGetOFStringArray(DcmTagKey(0x3006, 0x002A), rgb).good() && Numbers(std::string(rgb.c_str()), c, 3))
+                color = RGB(static_cast<int>(c[0]), static_cast<int>(c[1]), static_cast<int>(c[2]));
+            DcmSequenceOfItems* contours = nullptr;
+            if (roi->findAndGetSequence(DcmTagKey(0x3006, 0x0040), contours).bad() || !contours) continue;
+            for (unsigned long k = 0; k < contours->card(); k++)
+            {
+                DcmItem* item = contours->getItem(k);
+                OFString type;
+                item->findAndGetOFString(DcmTagKey(0x3006, 0x0042), type);
+                DcmElement* data = nullptr;
+                if (item->findAndGetElement(DcmTagKey(0x3006, 0x0050), data).bad() || !data) continue;
+                Contour c3;
+                c3.color = color;
+                c3.closed = type != "OPEN_PLANAR" && type != "OPEN_NONPLANAR";
+                const unsigned long n = data->getVM();
+                for (unsigned long i = 0; i + 2 < n; i += 3)
+                {
+                    Float64 x = 0, y = 0, z = 0;
+                    if (data->getFloat64(x, i).bad() || data->getFloat64(y, i + 1).bad() || data->getFloat64(z, i + 2).bad()) break;
+                    c3.points.push_back({ x, y, z });
+                }
+                if (!c3.points.empty()) o.contours.push_back(std::move(c3));
+            }
+        }
+        return;
+    }
+    // A SEG: its segments' colors, and each frame with its plane, its segment and its mask
+    DcmSequenceOfItems* segments = nullptr;
+    if (ds->findAndGetSequence(DcmTagKey(0x0062, 0x0002), segments).good() && segments)
+        for (unsigned long s = 0; s < segments->card(); s++)
+        {
+            DcmItem* item = segments->getItem(s);
+            Uint16 number = 0;
+            item->findAndGetUint16(DcmTagKey(0x0062, 0x0004), number);
+            COLORREF color = Palette[(5 + number) % PaletteSize];
+            Uint16 lab[3];
+            if (item->findAndGetUint16(DcmTagKey(0x0062, 0x000D), lab[0], 0).good() &&
+                item->findAndGetUint16(DcmTagKey(0x0062, 0x000D), lab[1], 1).good() &&
+                item->findAndGetUint16(DcmTagKey(0x0062, 0x000D), lab[2], 2).good())
+                color = FromCieLab(lab[0], lab[1], lab[2]);
+            o.colors[number] = color;
+        }
+    Uint16 rows = 0, columns = 0, allocated = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    Sint32 count = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, count).bad() || count < 1) count = 1;
+    DcmSequenceOfItems* perFrame = nullptr, *sharedSeq = nullptr;
+    ds->findAndGetSequence(DCM_PerFrameFunctionalGroupsSequence, perFrame);
+    DcmItem* shared = ds->findAndGetSequence(DCM_SharedFunctionalGroupsSequence, sharedSeq).good() && sharedSeq && sharedSeq->card() ? sharedSeq->getItem(0) : nullptr;
+    const size_t n = static_cast<size_t>(rows) * columns;
+    if (!n) { o.failed = true; return; }
+    // The pixels as they are, when they are not compressed (1 bit, or 8: fractional)
+    const E_TransferSyntax xfer = ds->getOriginalXfer();
+    const Uint8* bytes = nullptr;
+    unsigned long length = 0;
+    if (!DcmXfer(xfer).isEncapsulated())
+    {
+        DcmElement* e = nullptr;
+        Uint8* b = nullptr;
+        Uint16* w = nullptr;
+        if (ds->findAndGetElement(DCM_PixelData, e).good() && e)
+        {
+            if (e->getUint8Array(b).good() && b) bytes = b;
+            else if (e->getUint16Array(w).good() && w) bytes = reinterpret_cast<const Uint8*>(w);
+            length = e->getLength();
+        }
+    }
+    std::vector<double> along;
+    for (Sint32 k = 0; k < count; k++)
+    {
+        DcmItem* item = perFrame && static_cast<Sint32>(perFrame->card()) > k ? perFrame->getItem(static_cast<unsigned long>(k)) : nullptr;
+        auto value = [&](const DcmTagKey& sequence, const DcmTagKey& key) { std::string v = InGroup(item, sequence, key); return v.empty() ? InGroup(shared, sequence, key) : v; };
+        SegFrame f;
+        double iop[6], ipp[3], ps[2];
+        if (!Numbers(value(DCM_PlaneOrientationSequence, DCM_ImageOrientationPatient), iop, 6) ||
+            !Numbers(value(DCM_PlanePositionSequence, DCM_ImagePositionPatient), ipp, 3) ||
+            !Numbers(value(DCM_PixelMeasuresSequence, DCM_PixelSpacing), ps, 2))
+            continue;
+        for (int i = 0; i < 3; i++) { f.origin[i] = ipp[i]; f.row[i] = iop[i]; f.column[i] = iop[3 + i]; }
+        f.dy = ps[0];
+        f.dx = ps[1];
+        f.columns = columns;
+        f.rows = rows;
+        const std::string number = value(DcmTagKey(0x0062, 0x000A), DcmTagKey(0x0062, 0x000B));
+        f.segment = number.empty() ? 1 : atoi(number.c_str());
+        f.mask.assign(n, 0);
+        const size_t first = static_cast<size_t>(k) * n;
+        if (bytes && allocated == 1 && (first + n + 7) / 8 <= length)
+            for (size_t i = 0; i < n; i++) f.mask[i] = (bytes[(first + i) / 8] >> ((first + i) % 8)) & 1;
+        else if (bytes && allocated == 8 && first + n <= length)
+            for (size_t i = 0; i < n; i++) f.mask[i] = bytes[first + i] > 127;
+        else
+        {
+            Slice s;
+            if (!DecodeSlice(o.path, k, true, s).empty() || s.values.size() < n) continue;
+            float most = 0;
+            for (float v : s.values) most = (std::max)(most, v);
+            for (size_t i = 0; i < n; i++) f.mask[i] = most > 0 && s.values[i] > most / 2;
+        }
+        f.any = std::find(f.mask.begin(), f.mask.end(), 1) != f.mask.end();
+        const double normal[3] = { f.row[1] * f.column[2] - f.row[2] * f.column[1], f.row[2] * f.column[0] - f.row[0] * f.column[2],
+                                   f.row[0] * f.column[1] - f.row[1] * f.column[0] };
+        along.push_back(f.origin[0] * normal[0] + f.origin[1] * normal[1] + f.origin[2] * normal[2]);
+        o.frames.push_back(std::move(f));
+    }
+    // (the spacing of its slices: the median step between the distinct ones)
+    std::sort(along.begin(), along.end());
+    std::vector<double> steps;
+    for (size_t i = 1; i < along.size(); i++) if (along[i] - along[i - 1] > 1e-3) steps.push_back(along[i] - along[i - 1]);
+    std::sort(steps.begin(), steps.end());
+    o.spacing = steps.empty() ? 0 : steps[steps.size() / 2];
+    if (o.frames.empty()) o.failed = true;
 }
 
 // 8-bit pixels, 0xRRGGBB, top-down
@@ -6350,7 +6981,7 @@ public:
         StopJob();
         worker.reset();
         if (preview) { preview->Unload(); preview->Release(); }
-        for (HFONT f : { font, boldFont }) if (f) DeleteObject(f);
+        for (HFONT f : { font, boldFont, italicFont, boldItalicFont }) if (f) DeleteObject(f);
         if (icon) DestroyIcon(icon);
         if (smallIcon) DestroyIcon(smallIcon);
     }
@@ -6378,6 +7009,7 @@ public:
         treeWidth = static_cast<int>(ReadSetting(L"TreeWidth", 430));
         infoWidth = static_cast<int>(ReadSetting(L"InfoWidth", 380));
         topShare = static_cast<int>(ReadSetting(L"TopShare", 560));
+        unusedShare = static_cast<int>(ReadSetting(L"UnusedShare", 250));
         wnd = CreateWindowExW(0, wc.lpszClassName, L"DICOM explorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, g_module, this);
         if (!wnd) return false;
@@ -6439,8 +7071,8 @@ private:
     static constexpr UINT WM_GATHERED = WM_APP + 20, WM_THUMB = WM_APP + 21, WM_EXPORTED = WM_APP + 22;
     static constexpr UINT_PTR TimerProgress = 1, TimerFilter = 2, TimerFind = 3, TimerFollow = 4, TimerJob = 5;
     static constexpr UINT_PTR TimerFrame = 1;      // (of the floating thumbnail)
-    enum { IdPath = 100, IdBrowse, IdReload, IdReport, IdFind, IdCompact, IdIdentity, IdHover, IdFilter, IdNavigator };
-    enum class Split { None, Tree, Top, Info };
+    enum { IdPath = 100, IdBrowse, IdReload, IdReport, IdFind, IdCompact, IdIdentity, IdHover, IdFilter, IdNavigator, IdOverlay, IdRefLines, IdSegments };
+    enum class Split { None, Tree, Top, Info, Unused };
     struct Row { Uint32 tag; std::wstring value; };     // of the full info
     static constexpr COLORREF ProblemColor = RGB(196, 90, 0);
 
@@ -6454,7 +7086,7 @@ private:
     class Navigator
     {
     public:
-        ~Navigator() { if (bitmap) DeleteObject(bitmap); if (font) DeleteObject(font); }
+        ~Navigator() { for (HBITMAP b : { bitmap, liveBitmap }) if (b) DeleteObject(b); if (font) DeleteObject(font); }
 
         bool Create(HWND parent)
         {
@@ -6482,6 +7114,11 @@ private:
             planes = std::move(p);
             corners.clear();
             hover = -1;
+            marks.clear();
+            guides.clear();
+            contours.clear();
+            if (liveBitmap) { DeleteObject(liveBitmap); liveBitmap = nullptr; }
+            live = -1;
             hoverText.clear();
             hot = std::move(h);
             textured = on;
@@ -6522,10 +7159,68 @@ private:
 
         void Clear() { Set({}, {}, -1, Picture(), L"", L"", true); }
 
+        // Lines in the patient (reference lines: where the planes cut the one shown), dashed, and a point
+        void SetGuides(std::vector<std::array<float, 6>> lines)
+        {
+            guides = std::move(lines);
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
+        void SetPoint(bool on, const double* p = nullptr)
+        {
+            if (!on && !pointOn) return;
+            pointOn = on;
+            if (on && p) for (int k = 0; k < 3; k++) point[k] = p[k];
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
+        // Contours of RT Structure Sets, in the patient, each in its color
+        struct Line3 { COLORREF color = 0; bool closed = true; std::vector<std::array<float, 3>> points; };
+        void SetContours(std::vector<Line3> lines)
+        {
+            contours = std::move(lines);
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
+        // The mouse over the view: the line of sight under it (a point, and its direction), or off it
+        std::function<void(bool, const double*, const double*)> aimed;
+
+        // The image the cine or the jumps show, on its plane (-1: none)
+        void SetLive(int i, int w, int h, const std::vector<DWORD>* px)
+        {
+            if (liveBitmap) { DeleteObject(liveBitmap); liveBitmap = nullptr; }
+            live = -1;
+            if (i >= 0 && i < static_cast<int>(planes.size()) && px && w > 0 && h > 0 && px->size() >= static_cast<size_t>(w) * h)
+            {
+                BITMAPINFO bi = {};
+                bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+                bi.bmiHeader.biWidth = w;
+                bi.bmiHeader.biHeight = -h;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                void* bits = nullptr;
+                liveBitmap = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                if (liveBitmap && bits)
+                {
+                    memcpy(bits, px->data(), static_cast<size_t>(w) * h * sizeof(DWORD));
+                    live = i;
+                    liveWidth = w;
+                    liveHeight = h;
+                }
+            }
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
+
         std::function<void(int)> hovered;           // the mouse went over a plane (its index in Set), or off them (-1)
-        static constexpr COLORREF HoverColor = RGB(0, 0, 0);
+        std::function<void(int)> picked;            // a double click on a plane (its index in Set)
+        static constexpr COLORREF HoverColor = RGB(0, 90, 230);
 
         void SetHoverText(std::wstring text) { hoverText = std::move(text); if (wnd) InvalidateRect(wnd, nullptr, FALSE); }
+
+        // Planes framed in black too (those of the node under the mouse in the tree)
+        void SetMarks(std::vector<int> which)
+        {
+            if (which == marks) return;
+            marks = std::move(which);
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
 
     private:
         HWND wnd = nullptr;
@@ -6544,6 +7239,13 @@ private:
         bool shown = false;
         std::vector<POINT> corners;                 // of the planes in the window, as last drawn (4 each)
         int hover = -1;                             // the plane under the mouse
+        int live = -1, liveWidth = 0, liveHeight = 0;   // the image of the cine or the jumps, on this plane
+        std::vector<std::array<float, 6>> guides;   // reference lines (from, to)
+        std::vector<Line3> contours;                // of the segmentations
+        bool pointOn = false;                       // the point under the mouse in the image
+        double point[3] = {};
+        HBITMAP liveBitmap = nullptr;
+        std::vector<int> marks;                     // planes of the node under the mouse in the tree
         std::wstring hoverText;                     // what it is
         bool tracking = false;                      // (of the mouse leaving)
 
@@ -6702,6 +7404,23 @@ private:
             return found;
         }
 
+        // The line of sight under a point of the view: the point of the patient there on the plane of the
+        // screen, and the direction toward the viewer
+        void Aim(POINT pt)
+        {
+            if (!aimed) return;
+            RECT c;
+            GetClientRect(wnd, &c);
+            if (c.right <= 0 || c.bottom <= 0 || planes.empty()) { aimed(false, nullptr, nullptr); return; }
+            double r[3][3];
+            Axes(r);
+            const double scale = (std::min)(c.right, c.bottom) * 0.5 / radius * zoom;
+            const double x = (pt.x - c.right / 2.0 - panX) / scale, y = -(pt.y - c.bottom / 2.0 - panY) / scale;
+            double from[3], toward[3];
+            for (int k = 0; k < 3; k++) { from[k] = center[k] + x * r[0][k] + y * r[1][k]; toward[k] = r[2][k]; }
+            aimed(true, from, toward);
+        }
+
         void Hover(int i)
         {
             if (i == hover) return;
@@ -6750,7 +7469,8 @@ private:
                 std::vector<DWORD> counts;
                 for (size_t i = 0; i < planes.size(); i++)
                 {
-                    if (which == 2 ? static_cast<int>(i) != hover : (hot[i] != 0) != (which != 0)) continue;
+                    if (which == 2 ? static_cast<int>(i) != hover && static_cast<int>(i) != live && !std::binary_search(marks.begin(), marks.end(), static_cast<int>(i))
+                                   : (hot[i] != 0) != (which != 0)) continue;
                     for (int k : { 0, 1, 3, 2, 0 }) points.push_back(corners[i * 4 + k]);
                     counts.push_back(5);
                 }
@@ -6774,15 +7494,69 @@ private:
                 SelectObject(src, old);
                 DeleteDC(src);
             }
+            if (liveBitmap && live >= 0 && live < static_cast<int>(planes.size()))
+            {
+                const POINT* at = &corners[live * 4];
+                POINT to[3] = { at[0], at[1], at[2] };
+                HDC src = CreateCompatibleDC(dc);
+                HGDIOBJ old = SelectObject(src, liveBitmap);
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                PlgBlt(dc, to, src, 0, 0, liveWidth, liveHeight, nullptr, 0, 0);
+                SelectObject(src, old);
+                DeleteDC(src);
+            }
             outlines(1, RGB(220, 0, 0), Px(2));
-            outlines(2, HoverColor, Px(3));             // (the one under the mouse)
+            outlines(2, HoverColor, Px(2));             // (the one under the mouse)
+            // The contours of the segmentations
+            for (const Line3& l : contours)
+            {
+                HPEN pen = CreatePen(PS_SOLID, 1, l.color);
+                HGDIOBJ old = SelectObject(dc, pen);
+                std::vector<POINT> pts;
+                for (const auto& p : l.points) pts.push_back(project(p.data()));
+                if (l.closed && pts.size() > 2) pts.push_back(pts.front());
+                if (pts.size() > 1) Polyline(dc, pts.data(), static_cast<int>(pts.size()));
+                SelectObject(dc, old);
+                DeleteObject(pen);
+            }
+            // The reference lines, dashed, and the point of the mouse in the image
+            if (!guides.empty() || pointOn)
+            {
+                LOGBRUSH lb = { BS_SOLID, RGB(200, 155, 0), 0 };
+                const DWORD dashes[2] = { static_cast<DWORD>(Px(5)), static_cast<DWORD>(Px(3)) };
+                HPEN dashed = ExtCreatePen(PS_GEOMETRIC | PS_USERSTYLE | PS_ENDCAP_FLAT, 1, &lb, 2, dashes);
+                HGDIOBJ old = SelectObject(dc, dashed);
+                for (const auto& g : guides)
+                {
+                    const POINT a = project(&g[0]), b = project(&g[3]);
+                    MoveToEx(dc, a.x, a.y, nullptr);
+                    LineTo(dc, b.x, b.y);
+                }
+                SelectObject(dc, old);
+                DeleteObject(dashed);
+                if (pointOn)
+                {
+                    const float pf[3] = { static_cast<float>(point[0]), static_cast<float>(point[1]), static_cast<float>(point[2]) };
+                    const POINT q = project(pf);
+                    HBRUSH dot = CreateSolidBrush(RGB(255, 210, 0));
+                    HPEN rim = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+                    HGDIOBJ ob = SelectObject(dc, dot), op = SelectObject(dc, rim);
+                    const int k = Px(4);
+                    Ellipse(dc, q.x - k, q.y - k, q.x + k + 1, q.y + k + 1);
+                    SelectObject(dc, ob);
+                    SelectObject(dc, op);
+                    DeleteObject(dot);
+                    DeleteObject(rim);
+                }
+            }
             // The patient, at the bottom left, turned as the planes are: a click on a side of it, the view
             // from that side
             Figure(dc, r, w, h);
             // What it is, at the top; how to move it, at the bottom right
             SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
             RECT top = { Px(8), Px(6), w - Px(8), Px(48) };
-            const std::wstring head = planes.empty() ? (caption.empty() ? L"Choose a node of the tree" : caption + L"\nNo image here has a position in the patient")
+            const std::wstring head = planes.empty() ? (caption.empty() ? L"Choose a node of the tree" : caption + L"\n" + (detail.empty() ? L"No image here has a position in the patient" : detail))
                                                      : caption + (detail.empty() ? L"" : L"\n" + detail);
             RECT fill = top;
             DrawTextW(dc, head.c_str(), -1, &fill, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT);
@@ -6801,9 +7575,6 @@ private:
                 SetTextColor(dc, HoverColor);
                 DrawTextW(dc, hoverText.c_str(), -1, &under, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             }
-            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
-            RECT bottom = { Px(16) + (std::max)(Px(48), (std::min)(Px(120), (std::min)(w, h) / 3)), h - Px(24), w - Px(8), h - Px(4) };
-            DrawTextW(dc, L"drag: rotate   click the figure: from that side   right drag or wheel: zoom   Shift+drag: move", -1, &bottom, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
             BitBlt(target, 0, 0, w, h, dc, 0, 0, SRCCOPY);
             SelectObject(dc, oldFont);
             SelectObject(dc, oldCanvas);
@@ -6870,10 +7641,11 @@ private:
                         self->tracking = TrackMouseEvent(&t) != FALSE;
                     }
                     self->Hover(self->PlaneAt({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }));
+                    self->Aim({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
                 }
                 return 0;
             case WM_MOUSELEAVE:
-                if (self) { self->tracking = false; self->Hover(-1); }
+                if (self) { self->tracking = false; self->Hover(-1); if (self->aimed) self->aimed(false, nullptr, nullptr); }
                 return 0;
             case WM_LBUTTONUP:
             case WM_RBUTTONUP:
@@ -6905,6 +7677,12 @@ private:
                 return 0;
             case WM_LBUTTONDBLCLK:
                 if (!self) break;
+                // On a plane: its image chosen in the tree; elsewhere, the view as at first
+                if (self->picked)
+                {
+                    const int i = self->PlaneAt({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+                    if (i >= 0) { self->picked(i); return 0; }
+                }
                 self->azimuth = -37.5;
                 self->elevation = 30;
                 self->zoom = 1;
@@ -6925,10 +7703,327 @@ private:
         }
     };
 
+    // ----- the plot of an attribute along the files of a node, under the full info: its value file after file
+    // (numbers: a line for each one of them, up to 3; text: its values as rows), the image shown marked; the
+    // mouse over it says which file, a click chooses it in the tree
+
+    class Plot
+    {
+    public:
+        std::function<void(int)> picked;            // a click on a file (its index here)
+        std::function<void()> closed;               // its x
+
+        ~Plot() { if (font) DeleteObject(font); }
+
+        bool Create(HWND parent)
+        {
+            WNDCLASSEXW wc = { sizeof(wc) };
+            wc.lpfnWndProc = Proc;
+            wc.hInstance = g_module;
+            wc.hCursor = LoadCursor(nullptr, IDC_CROSS);
+            wc.lpszClassName = L"DicomStudyCountPlot";
+            if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+            wnd = CreateWindowExW(WS_EX_CLIENTEDGE, wc.lpszClassName, L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, parent, nullptr, g_module, this);
+            return wnd != nullptr;
+        }
+        bool Visible() const { return wnd && shown; }
+        void Show(bool on) { shown = on; if (wnd) ShowWindow(wnd, on ? SW_SHOWNA : SW_HIDE); }
+        void Move(const RECT& r) { if (wnd) MoveWindow(wnd, r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE); }
+
+        // The values, one for each file (empty: it has none), their names, and the one shown (-1: none)
+        void Set(std::wstring what, std::vector<std::wstring> values, std::vector<std::wstring> names, int current)
+        {
+            title = std::move(what);
+            text = std::move(values);
+            files = std::move(names);
+            now = current;
+            hover = -1;
+            numbers.assign(text.size(), {});
+            categories.clear();
+            category.assign(text.size(), -1);
+            parts = 0;
+            numeric = true;
+            for (size_t i = 0; i < text.size() && numeric; i++)
+            {
+                if (text[i].empty()) continue;
+                std::vector<double> v;
+                size_t from = 0;
+                while (from <= text[i].size())
+                {
+                    size_t to = text[i].find(L'\\', from);
+                    if (to == std::wstring::npos) to = text[i].size();
+                    const std::wstring part = text[i].substr(from, to - from);
+                    wchar_t* end = nullptr;
+                    const double x = wcstod(part.c_str(), &end);
+                    while (end && *end == L' ') end++;
+                    if (part.empty() || !end || *end || !std::isfinite(x)) { numeric = false; break; }
+                    v.push_back(x);
+                    from = to + 1;
+                }
+                if (v.size() > 3) v.resize(3);
+                parts = (std::max)(parts, v.size());
+                numbers[i] = std::move(v);
+            }
+            if (!numeric)
+                for (size_t i = 0; i < text.size(); i++)
+                {
+                    if (text[i].empty()) continue;
+                    auto it = std::find(categories.begin(), categories.end(), text[i]);
+                    category[i] = static_cast<int>(it - categories.begin());
+                    if (it == categories.end()) categories.push_back(text[i]);
+                }
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
+        void SetCurrent(int i) { if (i != now) { now = i; if (wnd) InvalidateRect(wnd, nullptr, FALSE); } }
+
+    private:
+        HWND wnd = nullptr;
+        HFONT font = nullptr;
+        UINT fontDpi = 0;
+        bool shown = false, numeric = true;
+        std::wstring title;
+        std::vector<std::wstring> text, files, categories;
+        std::vector<std::vector<double>> numbers;
+        std::vector<int> category;
+        size_t parts = 0;
+        int now = -1, hover = -1;
+        RECT area = {}, closeBox = {};
+
+        int Px(int n) const { const UINT dpi = GetDpiForWindow(wnd); return MulDiv(n, dpi ? dpi : 96, 96); }
+
+        // The range of the values, and where a file and a value are in the window
+        void Range(double& lo, double& hi) const
+        {
+            lo = 1e300;
+            hi = -1e300;
+            if (numeric) { for (const auto& v : numbers) for (double x : v) { lo = (std::min)(lo, x); hi = (std::max)(hi, x); } }
+            else { lo = 0; hi = categories.empty() ? 1 : static_cast<double>(categories.size() - 1); }
+            if (lo > hi) { lo = 0; hi = 1; }
+            if (hi - lo < 1e-12) { lo -= 1; hi += 1; }
+            const double m = (hi - lo) * 0.06;
+            lo -= m;
+            hi += m;
+        }
+        int X(int i) const
+        {
+            const int n = static_cast<int>(text.size());
+            return n <= 1 ? (area.left + area.right) / 2 : area.left + static_cast<int>(static_cast<long long>(area.right - area.left) * i / (n - 1));
+        }
+        int Y(double v, double lo, double hi) const { return area.bottom - static_cast<int>(std::lround((v - lo) / (hi - lo) * (area.bottom - area.top))); }
+        int At(int x) const     // (the file nearest a point)
+        {
+            const int n = static_cast<int>(text.size());
+            if (n == 0 || area.right <= area.left) return -1;
+            const double t = static_cast<double>(x - area.left) / (area.right - area.left);
+            return (std::max)(0, (std::min)(n - 1, static_cast<int>(std::lround(t * (n - 1)))));
+        }
+
+        void Paint(HDC target)
+        {
+            RECT c;
+            GetClientRect(wnd, &c);
+            const int w = c.right, h = c.bottom;
+            if (w <= 0 || h <= 0) return;
+            HDC dc = CreateCompatibleDC(target);
+            HBITMAP canvas = CreateCompatibleBitmap(target, w, h);
+            HGDIOBJ oldCanvas = SelectObject(dc, canvas);
+            FillRect(dc, &c, GetSysColorBrush(COLOR_WINDOW));
+            const UINT dpi = GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96;
+            if (!font || fontDpi != dpi)
+            {
+                if (font) DeleteObject(font);
+                fontDpi = dpi;
+                font = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+            }
+            HGDIOBJ oldFont = SelectObject(dc, font);
+            SetBkMode(dc, TRANSPARENT);
+            const int n = static_cast<int>(text.size());
+            // Its title, the file under the mouse, and the x that closes it
+            closeBox = { w - Px(22), Px(2), w - Px(4), Px(20) };
+            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+            DrawTextW(dc, L"\u00D7", -1, &closeBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            std::wstring head = title;
+            if (hover >= 0 && hover < n)
+                head += L"     #" + std::to_wstring(hover + 1) + L":  " + (text[hover].empty() ? L"(none)" : text[hover]) +
+                        (hover < static_cast<int>(files.size()) ? L"   " + files[hover] : L"");
+            // (several numbers: which line is which)
+            int legend = closeBox.left - Px(4);
+            if (numeric && parts > 1)
+            {
+                static const COLORREF ink[3] = { RGB(0, 90, 230), RGB(220, 60, 60), RGB(0, 150, 80) };
+                static const wchar_t* const names[3] = { L"1st", L"2nd", L"3rd" };
+                for (int k = static_cast<int>(parts) - 1; k >= 0; k--)
+                {
+                    SIZE ext = {};
+                    GetTextExtentPoint32W(dc, names[k], 3, &ext);
+                    RECT r = { legend - ext.cx, Px(3), legend, Px(20) };
+                    SetTextColor(dc, ink[k]);
+                    DrawTextW(dc, names[k], 3, &r, DT_RIGHT | DT_SINGLELINE);
+                    legend -= ext.cx + Px(8);
+                }
+            }
+            SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+            RECT top = { Px(6), Px(3), legend - Px(4), Px(20) };
+            DrawTextW(dc, head.c_str(), -1, &top, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            area = { Px(numeric ? 64 : 120), Px(26), w - Px(12), h - Px(20) };
+            if (n > 0 && area.right > area.left + Px(20) && area.bottom > area.top + Px(20))
+            {
+                double lo, hi;
+                Range(lo, hi);
+                HPEN axis = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+                HGDIOBJ oldPen = SelectObject(dc, axis);
+                SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+                // The rows of the values: 5 numbers, or the texts
+                std::vector<std::pair<double, std::wstring>> ticks;
+                if (numeric)
+                    for (int k = 0; k <= 4; k++)
+                    {
+                        double v = lo + (hi - lo) * (0.06 / 1.12 + k * (1 - 0.12 / 1.12) / 4);
+                        if (std::fabs(v) < (hi - lo) * 1e-9) v = 0;     // (not -1.4e-14)
+                        wchar_t b[32];
+                        swprintf_s(b, L"%.4g", v);
+                        ticks.push_back({ v, b });
+                    }
+                else
+                {
+                    const size_t step = categories.size() > 8 ? (categories.size() + 7) / 8 : 1;
+                    for (size_t k = 0; k < categories.size(); k += step) ticks.push_back({ static_cast<double>(k), categories[k] });
+                }
+                for (const auto& [v, label] : ticks)
+                {
+                    const int y = Y(v, lo, hi);
+                    MoveToEx(dc, area.left, y, nullptr);
+                    LineTo(dc, area.right, y);
+                    RECT r = { Px(4), y - Px(8), area.left - Px(6), y + Px(8) };
+                    DrawTextW(dc, label.c_str(), -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                }
+                RECT first = { area.left - Px(20), area.bottom + Px(2), area.left + Px(60), h };
+                DrawTextW(dc, L"1", -1, &first, DT_LEFT | DT_SINGLELINE);
+                RECT last = { area.right - Px(320), area.bottom + Px(2), area.right + Px(4), h };
+                DrawTextW(dc, (std::to_wstring(n) + L" (files, in the order of the tree)").c_str(), -1, &last, DT_RIGHT | DT_SINGLELINE);
+                // The image shown, and the file under the mouse
+                auto vertical = [&](int i, COLORREF color) {
+                    if (i < 0 || i >= n) return;
+                    HPEN pen = CreatePen(PS_SOLID, 1, color);
+                    SelectObject(dc, pen);
+                    MoveToEx(dc, X(i), area.top, nullptr);
+                    LineTo(dc, X(i), area.bottom);
+                    SelectObject(dc, axis);
+                    DeleteObject(pen);
+                };
+                vertical(now, RGB(230, 120, 0));
+                vertical(hover, RGB(150, 150, 150));
+                // The values: a line for each number (broken where a file has none), dots when they are few
+                static const COLORREF colors[3] = { RGB(0, 90, 230), RGB(220, 60, 60), RGB(0, 150, 80) };
+                const size_t lines = numeric ? (std::max)(parts, static_cast<size_t>(1)) : 1;
+                for (size_t k = 0; k < lines; k++)
+                {
+                    HPEN pen = CreatePen(PS_SOLID, Px(1) + (n < 200 ? 1 : 0), colors[k % 3]);
+                    HBRUSH dot = CreateSolidBrush(colors[k % 3]);
+                    SelectObject(dc, pen);
+                    HGDIOBJ oldBrush = SelectObject(dc, dot);
+                    std::vector<POINT> run;
+                    auto flush = [&]() { if (run.size() > 1) Polyline(dc, run.data(), static_cast<int>(run.size())); run.clear(); };
+                    for (int i = 0; i < n; i++)
+                    {
+                        double v;
+                        if (numeric) { if (k >= numbers[i].size()) { flush(); continue; } v = numbers[i][k]; }
+                        else { if (category[i] < 0) { flush(); continue; } v = category[i]; }
+                        const POINT p = { X(i), Y(v, lo, hi) };
+                        run.push_back(p);
+                        if (n <= 300) Rectangle(dc, p.x - Px(2), p.y - Px(2), p.x + Px(2) + 1, p.y + Px(2) + 1);
+                    }
+                    flush();
+                    SelectObject(dc, oldBrush);
+                    SelectObject(dc, axis);
+                    DeleteObject(pen);
+                    DeleteObject(dot);
+                }
+                SelectObject(dc, oldPen);
+                DeleteObject(axis);
+            }
+            BitBlt(target, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, oldFont);
+            SelectObject(dc, oldCanvas);
+            DeleteObject(canvas);
+            DeleteDC(dc);
+        }
+
+        static LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+        {
+            auto self = reinterpret_cast<Plot*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            switch (msg)
+            {
+            case WM_NCCREATE:
+                self = static_cast<Plot*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+                self->wnd = hwnd;
+                break;
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps;
+                HDC dc = BeginPaint(hwnd, &ps);
+                if (self) self->Paint(dc);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_SIZE:
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            case WM_MOUSEMOVE:
+                if (self)
+                {
+                    const POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                    const int i = pt.y >= self->area.top - self->Px(4) && pt.y <= self->area.bottom + self->Px(4) ? self->At(pt.x) : -1;
+                    if (i != self->hover)
+                    {
+                        self->hover = i;
+                        TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, hwnd, 0 };
+                        TrackMouseEvent(&t);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                }
+                return 0;
+            case WM_MOUSELEAVE:
+                if (self && self->hover >= 0) { self->hover = -1; InvalidateRect(hwnd, nullptr, FALSE); }
+                return 0;
+            case WM_LBUTTONDOWN:
+                if (self)
+                {
+                    const POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                    if (PtInRect(&self->closeBox, pt)) { self->Show(false); if (self->closed) self->closed(); return 0; }
+                    if (self->hover >= 0 && self->picked) self->picked(self->hover);
+                }
+                return 0;
+            case WM_SETCURSOR:
+                if (self && LOWORD(lp) == HTCLIENT)
+                {
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    ScreenToClient(hwnd, &pt);
+                    SetCursor(LoadCursor(nullptr, PtInRect(&self->closeBox, pt) ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                break;
+            case WM_NCDESTROY:
+                if (self) self->wnd = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                break;
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    };
+
     HWND wnd = nullptr, pathBox = nullptr, browse = nullptr, reload = nullptr, reportButton = nullptr, findLabel = nullptr, findBox = nullptr;
-    HWND compactBox = nullptr, identityBox = nullptr, hoverBox = nullptr, navigatorBox = nullptr, tree = nullptr, info = nullptr, filterLabel = nullptr, filterBox = nullptr;
+    HWND compactBox = nullptr, identityBox = nullptr, hoverBox = nullptr, navigatorBox = nullptr, overlayBox = nullptr, refBox = nullptr, segBox = nullptr, tree = nullptr, info = nullptr, filterLabel = nullptr, filterBox = nullptr;
     HWND full = nullptr, status = nullptr;
     int firstProblemRow = INT_MAX;                  // of the info: the rows of the problems, from this one
+    std::vector<int> groupKind;                     // of the full info: the kind of each group (by its id: its level, 100 what varies)
+    std::vector<std::wstring> groupTitle;           // and its title (after its triangle)
+    std::set<int> folded;                           // the kinds of group folded (they stay so from node to node)
     // The floating thumbnail of the node under the mouse in the tree
     HWND popup = nullptr;
     bool hoverPreview = true, hoverArmed = false;
@@ -6944,7 +8039,35 @@ private:
     bool planesMade = false;
     int navigated = -1;                             // the planes the navigator shows: of this node (a study, mostly)
     std::vector<int> navScene;                      // the plane of each one it draws
+    std::vector<int> navSceneOf;                    // and where each plane is among them (-1: not drawn)
+    int currentFile = -1;                           // the file the image panel shows (-1: a thumbnail, or none)
+    Plot plot;                                      // an attribute along the files of the node chosen
+    Uint32 plotTag = 0;                             // (which one)
+    std::vector<int> plotFiles;                     // (its files, in order)
+    bool refLines = true;                           // reference lines: where the planes of the node under the mouse cut it
+    bool showSegments = true;                       // segmentations (SEG, RT Structure Sets) over the images
+    std::vector<Overlay> overlays;                  // those in the folder (read when an image of their study is shown)
+    std::vector<size_t> segmentedCount;             // each node: how many of its images have a segmentation in their plane
+    std::vector<char> fileDerived;                  // each file: a derived image (ImageType DERIVED), not an original one
+    std::vector<Uint32> fileFrame;                  // and its frame of reference (an id of the pool, +1; 0: none)
+    std::vector<size_t> derivedCount;               // each node: how many of its files are derived
+    HFONT italicFont = nullptr, boldItalicFont = nullptr;
+    int marked = -1;                                // the node under the mouse in the tree, its planes framed there
+    bool markTracking = false;                      // (of the mouse leaving the tree)
     std::vector<int> lit;                           // the nodes of the plane under the mouse there, marked in the tree
+    std::vector<char> fileOn;                       // each file: drawn in the navigator (the check boxes of the tree)
+    std::vector<size_t> onCount;                    // each node: how many of its files are
+    // The unused tree, under the tree: the parts of it put aside (not drawn in the navigator). Both show the
+    // same nodes: the tree those with files in use, the unused one those with files put aside.
+    HWND unusedLabel = nullptr, unusedTree = nullptr;
+    HWND hoverTree = nullptr;                       // the tree the mouse is over
+    std::vector<char> fileUnused;                   // each file: put aside
+    std::vector<size_t> usedCount;                  // each node: how many of its files are not
+    std::vector<HTREEITEM> unusedItem;              // each node: its item in the unused tree
+    std::vector<char> unusedFilled;                 // its shown children are there
+    std::vector<signed char> openMemory;            // each node: open (1) or not (0) when last in the tree (-1: never), for Compact
+    int unusedShare = 250;                          // (of the height of the trees, in thousandths)
+    RECT unusedSplit = {}, trees = {};              // the bar between the trees, and where both are
     unsigned generation = 0;
     // An export or a report being written
     std::unique_ptr<ExportJob> job;
@@ -7000,6 +8123,7 @@ private:
         WriteSetting(L"TreeWidth", static_cast<DWORD>(treeWidth));
         WriteSetting(L"InfoWidth", static_cast<DWORD>(infoWidth));
         WriteSetting(L"TopShare", static_cast<DWORD>(topShare));
+        WriteSetting(L"UnusedShare", static_cast<DWORD>(unusedShare));
     }
 
     int Px(int n) const
@@ -7032,11 +8156,22 @@ private:
         compactBox = make(0, L"BUTTON", L"Compact", WS_TABSTOP | BS_AUTOCHECKBOX, IdCompact);
         hoverBox = make(0, L"BUTTON", L"Hover preview", WS_TABSTOP | BS_AUTOCHECKBOX, IdHover);
         navigatorBox = make(0, L"BUTTON", L"Navigator", WS_TABSTOP | BS_AUTOCHECKBOX, IdNavigator);
+        overlayBox = make(0, L"BUTTON", L"Overlay", WS_TABSTOP | BS_AUTOCHECKBOX, IdOverlay);
+        refBox = make(0, L"BUTTON", L"Ref lines", WS_TABSTOP | BS_AUTOCHECKBOX, IdRefLines);
+        segBox = make(0, L"BUTTON", L"Segmentations", WS_TABSTOP | BS_AUTOCHECKBOX, IdSegments);
+        showSegments = ReadSetting(L"Segmentations", 1) != 0;
+        Button_SetCheck(segBox, showSegments ? BST_CHECKED : BST_UNCHECKED);
+        refLines = ReadSetting(L"ReferenceLines", 1) != 0;
+        Button_SetCheck(refBox, refLines ? BST_CHECKED : BST_UNCHECKED);
         identityBox = make(0, L"BUTTON", L"Hide patient identity", WS_TABSTOP | BS_AUTOCHECKBOX, IdIdentity);
         // (no tooltips of its own: the floating thumbnail writes the line of the node)
         tree = make(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
                     TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS, 0);
         SetWindowSubclass(tree, TreeProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        unusedLabel = make(0, L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
+        unusedTree = make(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
+                          TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS, 0);
+        SetWindowSubclass(unusedTree, TreeProc, 1, reinterpret_cast<DWORD_PTR>(this));
         popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
                                 L"DicomStudyCountThumb", L"", WS_POPUP | WS_BORDER, 0, 0, 10, 10, wnd, nullptr, g_module, this);
         if (popup) SetLayeredWindowAttributes(popup, 0, 255, LWA_ALPHA);
@@ -7045,6 +8180,8 @@ private:
         filterLabel = make(0, L"STATIC", L"Full info", SS_LEFT | SS_CENTERIMAGE, 0);
         filterBox = make(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IdFilter);
         full = make(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER, 0);
+        SetWindowSubclass(full, FullProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        SetWindowSubclass(ListView_GetHeader(full), HeaderProc, 1, reinterpret_cast<DWORD_PTR>(this));
         status = make(0, STATUSCLASSNAMEW, L"", SBARS_SIZEGRIP, 0);
         SendMessageW(findBox, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"text or regex; Enter / F3: next"));
         SendMessageW(filterBox, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Filter: tag, name or value (text or regex)"));
@@ -7052,8 +8189,23 @@ private:
         Button_SetCheck(identityBox, hideIdentity ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(hoverBox, hoverPreview ? BST_CHECKED : BST_UNCHECKED);
         navigator.hovered = [this](int i) { Light(i); };
+        if (plot.Create(wnd))
+        {
+            plot.closed = [this]() { plotTag = 0; Layout(); };
+            plot.picked = [this](int i) { PlotPicked(i); };
+        }
+        navigator.picked = [this](int i) { Pick(i); };
+        navigator.aimed = [this](bool on, const double* from, const double* toward) { Aimed(on, from, toward); };
         if (navigator.Create(wnd) && ReadSetting(L"Navigator", 0)) { Button_SetCheck(navigatorBox, BST_CHECKED); navigator.Show(true); }
         SetWindowTheme(tree, L"Explorer", nullptr);
+        SetWindowTheme(unusedTree, L"Explorer", nullptr);
+        TreeView_SetExtendedStyle(unusedTree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+        UnusedLabel();
+        // (check boxes, with a third state, partly on: what the navigator draws; set after the tree is made, as its
+        // documentation asks, the partial one first: the images of the boxes are made with the style)
+        TreeView_SetExtendedStyle(tree, TVS_EX_PARTIALCHECKBOXES, TVS_EX_PARTIALCHECKBOXES);
+        SetWindowLongPtrW(tree, GWL_STYLE, GetWindowLongPtrW(tree, GWL_STYLE) | TVS_CHECKBOXES);
+        CheckImages();
         TreeView_SetExtendedStyle(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
         for (HWND list : { info, full })
         {
@@ -7070,6 +8222,7 @@ private:
         column(info, 0, L"Node", 130);
         column(info, 1, L"", 400);
         column(full, 0, L"Tag", 95);
+        TagColumn(ReadSetting(L"TagColumn", 0) != 0);
         column(full, 1, L"Attribute", 230);
         column(full, 2, L"Value", 600);
         ListView_EnableGroupView(full, TRUE);
@@ -7078,8 +8231,11 @@ private:
         preview = new (std::nothrow) PreviewHandler();
         if (preview)
         {
-            preview->moved = [this](int i) { Followed(i); };
+            preview->moved = [this](int i) { ShownFile(i); Live(i); Followed(i); };
+            preview->running = [this](bool on) { if (!on) navigator.SetLive(-1, 0, 0, nullptr); };
+            preview->pointed = [this](bool on, double column, double row) { Pointed(on, column, row); };
             preview->Host(wnd, imageRect);
+            Button_SetCheck(overlayBox, preview->Overlay() ? BST_CHECKED : BST_UNCHECKED);
             preview->ShowFiles({}, -1);
         }
     }
@@ -7092,10 +8248,15 @@ private:
                            CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         boldFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
-        for (HWND h : { pathBox, browse, reload, reportButton, findLabel, findBox, compactBox, hoverBox, navigatorBox, identityBox, tree, info, filterLabel,
+        for (HFONT* f : { &italicFont, &boldItalicFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
+        italicFont = CreateFontW(points9, 0, 0, 0, FW_NORMAL, TRUE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        boldItalicFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, TRUE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        for (HWND h : { pathBox, browse, reload, reportButton, findLabel, findBox, compactBox, hoverBox, navigatorBox, overlayBox, refBox, segBox, identityBox, tree, unusedTree, info, filterLabel,
                         filterBox, full, status })
             if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-        if (filterLabel) SendMessageW(filterLabel, WM_SETFONT, reinterpret_cast<WPARAM>(boldFont), TRUE);
+        for (HWND h : { filterLabel, unusedLabel }) if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(boldFont), TRUE);
     }
 
     // The folder and the options at the top, the tree at the left; at the right the node and its image,
@@ -7119,12 +8280,14 @@ private:
         right -= Px(108) + gap;
         put(navigatorBox, right - Px(84), Px(84));
         right -= Px(84) + gap;
+        put(segBox, right - Px(108), Px(108));
+        right -= Px(108) + gap;
+        put(refBox, right - Px(80), Px(80));
+        right -= Px(80) + gap;
+        put(overlayBox, right - Px(74), Px(74));
+        right -= Px(74) + gap;
         put(compactBox, right - Px(80), Px(80));
         right -= Px(80) + gap * 2;
-        put(findBox, right - Px(200), Px(200));
-        right -= Px(200) + Px(4);
-        put(findLabel, right - Px(34), Px(34));
-        right -= Px(34) + gap * 2;
         put(reportButton, right - Px(76), Px(76));
         right -= Px(76) + Px(4);
         put(reload, right - Px(70), Px(70));
@@ -7136,7 +8299,18 @@ private:
         const int top = y + line + m;
         const int width = w - 2 * m;
         int tw = (std::max)(Px(150), (std::min)(Px(treeWidth), width - Px(300)));
-        MoveWindow(tree, m, top, tw, bottom - top, TRUE);
+        // (the tree, and the unused one under it)
+        trees = { m, top, m + tw, bottom };
+        // (and Find under them)
+        const int ch = bottom - top - gap - line - Px(4) - line;
+        const int uh = (std::max)(Px(40), (std::min)(ch - Px(80), static_cast<int>(static_cast<long long>(ch) * unusedShare / 1000)));
+        const int mh = ch - uh;
+        MoveWindow(tree, m, top, tw, mh, TRUE);
+        unusedSplit = { m, top + mh, m + tw, top + mh + gap };
+        MoveWindow(unusedLabel, m, top + mh + gap, tw, line, TRUE);
+        MoveWindow(unusedTree, m, top + mh + gap + line, tw, uh, TRUE);
+        MoveWindow(findLabel, m, bottom - line, Px(34), line, TRUE);
+        MoveWindow(findBox, m + Px(38), bottom - line, tw - Px(38), line, TRUE);
         treeSplit = { m + tw, top, m + tw + gap, bottom };
         const int x0 = m + tw + gap, x1 = w - m, h = bottom - top;
         int th = static_cast<int>(static_cast<long long>(h - gap - line) * topShare / 1000);
@@ -7149,12 +8323,19 @@ private:
         if (preview) preview->SetRect(&imageRect);
         topSplit = { x0, top + th, x1, top + th + gap };
         const int fy = top + th + gap;
-        MoveWindow(filterLabel, x0, fy, Px(70), line, TRUE);
-        MoveWindow(filterBox, x0 + Px(70), fy, (std::min)(Px(420), (navigator.Visible() ? (x1 - x0 - gap) / 2 : x1 - x0) - Px(70)), line, TRUE);
-        // (the navigator, if shown, at the right of the full info: half of it each)
+        // (the navigator, if shown, at the right of the full info: half of it each; the filter under the list)
         const bool navigating = navigator.Visible();
         const int fw = navigating ? (x1 - x0 - gap) / 2 : x1 - x0;
-        MoveWindow(full, x0, fy + line + Px(4), fw, bottom - fy - line - Px(4), TRUE);
+        MoveWindow(filterLabel, x0, fy, Px(70), line, TRUE);
+        const int listTop = fy + line + Px(4), listBottom = bottom - line - Px(4);
+        if (plot.Visible())
+        {
+            const int ph = (listBottom - listTop) * 45 / 100;
+            MoveWindow(full, x0, listTop, fw, listBottom - ph - gap - listTop, TRUE);
+            plot.Move({ x0, listBottom - ph, x0 + fw, listBottom });
+        }
+        else MoveWindow(full, x0, listTop, fw, listBottom - listTop, TRUE);
+        MoveWindow(filterBox, x0, bottom - line, fw, line, TRUE);
         if (navigating) navigator.Move({ x0 + fw + gap, fy, x1, bottom });
         InvalidateRect(wnd, nullptr, TRUE);
     }
@@ -7235,7 +8416,14 @@ private:
         selected = sliderNode = -1;
         following = true;                           // (no selection events while the tree empties)
         TreeView_DeleteAllItems(tree);
+        TreeView_DeleteAllItems(unusedTree);
         following = false;
+        fileUnused.clear();
+        usedCount.clear();
+        unusedItem.clear();
+        unusedFilled.clear();
+        openMemory.clear();
+        UnusedLabel();
         navPlanes.clear();
         filePlane.clear();
         planesMade = false;
@@ -7243,6 +8431,10 @@ private:
         navigator.Clear();
         navScene.clear();
         lit.clear();
+        overlays.clear();
+        segmentedCount.clear();
+        fileOn.clear();
+        onCount.clear();
         nodes.clear();
         fileNode.clear();
         ListView_DeleteAllItems(info);
@@ -7266,6 +8458,31 @@ private:
         if (!data) return;
         if (data->thread.joinable()) data->thread.join();
         Build();
+        fileOn.assign(data->files.size(), 1);
+        overlays.clear();
+        for (size_t f = 0; f < data->files.size(); f++)
+        {
+            const Gathered& g = data->files[f];
+            if (g.frame > 0) continue;                  // (an enhanced file once)
+            const std::wstring* c = AttributeOf(static_cast<int>(f), 0x00080016);
+            if (!c) continue;
+            const bool seg = *c == Widen(SegSopClass), rt = *c == Widen(RtStructSopClass);
+            if (!seg && !rt) continue;
+            Overlay o;
+            o.path = g.path;
+            o.rt = rt;
+            o.study = g.study;
+            overlays.push_back(std::move(o));
+        }
+        MarkSegmented();
+        derivedCount.assign(nodes.size(), 0);
+        for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) derivedCount[i] += fileDerived[f];
+        onCount.resize(nodes.size());
+        for (size_t i = 0; i < nodes.size(); i++) onCount[i] = nodes[i].files.size();
+        fileUnused.assign(data->files.size(), 0);
+        usedCount = onCount;
+        unusedItem.assign(nodes.size(), nullptr);
+        unusedFilled.assign(nodes.size(), 0);
         ready = true;
         ComputeShown();
         FillTree();
@@ -7329,6 +8546,18 @@ private:
         nodes.clear();
         const std::vector<Gathered>& files = data->files;
         fileNode.assign(files.size(), -1);
+        // Derived or original (the first value of ImageType), and the frame of reference: volumes apart
+        fileDerived.assign(files.size(), 0);
+        fileFrame.assign(files.size(), 0);
+        for (size_t f = 0; f < files.size(); f++)
+        {
+            if (const auto* a = Find(files[f].attributes, 0x00080008))
+            {
+                const std::wstring& t = data->pool.Text(a->second);
+                fileDerived[f] = t.size() >= 7 && _wcsnicmp(t.c_str(), L"DERIVED", 7) == 0;
+            }
+            if (const auto* a = Find(files[f].attributes, 0x00200052)) fileFrame[f] = a->second + 1;
+        }
         // The images in their order first (instance number, trigger time, time, name): the groups below
         // a series come in the order of their first image
         std::vector<int> all(files.size());
@@ -7748,6 +8977,7 @@ private:
             auto same = [&](const std::vector<int>& o) {
                 const Gathered& h = files[o[0]];
                 if (g.oriented != h.oriented || g.rows != h.rows || g.columns != h.columns) return false;
+                if (fileDerived[f] != fileDerived[o[0]] || fileFrame[f] != fileFrame[o[0]]) return false;
                 for (int k = 0; k < 6 && g.oriented; k++) if (std::fabs(g.orientation[k] - h.orientation[k]) > 1e-4) return false;
                 return true;
             };
@@ -7816,9 +9046,44 @@ private:
     std::wstring Label(int i) const
     {
         std::wstring s = Plain(i);
+        if (i < static_cast<int>(segmentedCount.size()) && segmentedCount[i])
+            s += nodes[i].level == Level::Image ? std::wstring(L"   seg") : L"   (" + std::to_wstring(segmentedCount[i]) + L" segmented)";
         const auto& flags = nodes[i].flags;
         for (size_t k = 0; k < flags.size(); k++) s += (k ? L", " : L"   \u26A0 ") + flags[k];
         return s;
+    }
+
+    // What kind of series a node is of (its series), guessed as the column of the files does: its first file,
+    // and the number of images of its positions when the header does not say how many phases
+    std::wstring KindOf(int n) const
+    {
+        while (n > 0 && nodes[n].level > Level::Series) n = nodes[n].parent;
+        if (n <= 0 || nodes[n].level != Level::Series || nodes[n].files.empty()) return std::wstring();
+        const int f = nodes[n].files[0];
+        const Gathered& g = data->files[f];
+        auto get = [&](Uint32 tag) { const std::wstring* s = AttributeOf(f, tag); return s ? Narrow(*s) : std::string(); };
+        Header h;
+        h.sopClass = get(0x00080016);
+        h.modality = g.modality;
+        h.imageType = get(0x00080008);
+        h.seriesDescription = g.seriesDescription;
+        h.protocolName = get(0x00181030);
+        h.sequenceName = get(0x00180024);
+        h.scanningSequence = get(0x00180020);
+        h.inversionTime = get(0x00180082);
+        h.cardiacImages = get(0x00181090);
+        h.imageOrientation = g.orientationText;
+        if (h.cardiacImages.empty() && !g.trigger.empty())
+        {
+            size_t most = 0;
+            std::function<void(int)> walk = [&](int x) {
+                if (nodes[x].level == Level::Position) { most = (std::max)(most, nodes[x].files.size()); return; }
+                for (int c : nodes[x].children) walk(c);
+            };
+            walk(n);
+            if (most > 1) h.cardiacImages = std::to_string(most);
+        }
+        return SeriesKind(h, PlaneName(h));
     }
 
     std::wstring Plain(int i) const
@@ -7856,12 +9121,22 @@ private:
             if (n.children.size() == 1) add(Size(n.children[0]));
             else add(L"(" + std::to_wstring(n.children.size()) + L" orientations)");
             add(L"(" + files(count) + L")");
+            const std::wstring kind = KindOf(i);
+            if (!kind.empty()) add(L"\u00AB" + kind + L"\u00BB");     // (guessed)
             return s;
         }
         case Level::Orientation:
+        {
             add(Size(i));
+            if (!fileDerived.empty() && fileDerived[n.files[0]]) add(L"derived");
+            // (a series in more than one frame of reference: which one)
+            bool others = false;
+            for (int o : nodes[n.parent].children)
+                if (fileFrame[nodes[o].files[0]] != fileFrame[n.files[0]]) others = true;
+            if (others && fileFrame[n.files[0]]) add(L"[FoR " + Hash6(Narrow(data->pool.Text(fileFrame[n.files[0]] - 1))) + L"]");
             add(L"(" + files(count) + L")");
             return s;
+        }
         case Level::Position:
             if (g.hasZ) { swprintf_s(buffer, L"Z %.2f mm", g.z); add(buffer); }
             else if (g.placed) add(L"Position " + Widen(g.positionText));
@@ -7933,6 +9208,110 @@ private:
             if (nodes[i].level == Level::Image) nodes[i].text = Label(static_cast<int>(i));     // (Z or not)
     }
 
+    // A node in the tree (some of its files in use), or in the unused one (some of them put aside)
+    bool InTree(int n, bool unused) const
+    {
+        if (usedCount.empty()) return !unused;
+        return unused ? usedCount[n] < nodes[n].files.size() : usedCount[n] > 0;
+    }
+
+    bool HasShown(int n, bool unused) const
+    {
+        for (int c : nodes[n].shown) if (InTree(c, unused)) return true;
+        return false;
+    }
+
+    // The shown children of a node with files put aside into the unused tree
+    void InsertUnused(int n)
+    {
+        if (n < 0 || unusedFilled.empty() || unusedFilled[n]) return;
+        HTREEITEM under = n == 0 ? TVI_ROOT : unusedItem[n];
+        if (!under) return;
+        unusedFilled[n] = 1;
+        for (int c : nodes[n].shown)
+        {
+            if (!InTree(c, true)) continue;
+            TVINSERTSTRUCTW is = {};
+            is.hParent = under;
+            is.hInsertAfter = TVI_LAST;
+            is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+            is.item.pszText = const_cast<wchar_t*>(nodes[c].text.c_str());
+            is.item.lParam = c;
+            is.item.cChildren = HasShown(c, true) ? 1 : 0;
+            unusedItem[c] = TreeView_InsertItem(unusedTree, &is);
+        }
+    }
+
+    HTREEITEM UnusedItemOf(int n)
+    {
+        if (n <= 0 || n >= static_cast<int>(unusedItem.size())) return nullptr;
+        if (unusedItem[n]) return unusedItem[n];
+        const int p = nodes[n].shownParent;
+        if (p < 0 || (p > 0 && !UnusedItemOf(p))) return nullptr;
+        InsertUnused(p);
+        return unusedItem[n];
+    }
+
+    // A tree again (after nodes went from one to the other), as it was: what was open, chosen and at its top
+    void Refill(bool unused)
+    {
+        HWND t = unused ? unusedTree : tree;
+        auto itemOf = [&](size_t i) { return unused ? (i < unusedItem.size() ? unusedItem[i] : nullptr) : nodes[i].item; };
+        auto nodeOf = [&](HTREEITEM it) {
+            TVITEMW tv = { TVIF_PARAM };
+            tv.hItem = it;
+            return it && TreeView_GetItem(t, &tv) ? static_cast<int>(tv.lParam) : -1;
+        };
+        std::vector<int> open;
+        for (size_t i = 1; i < nodes.size(); i++)
+            if (HTREEITEM it = itemOf(i))
+                if (TreeView_GetItemState(t, it, TVIS_EXPANDED) & TVIS_EXPANDED) open.push_back(static_cast<int>(i));
+        const int chosen = nodeOf(TreeView_GetSelection(t)), first = nodeOf(TreeView_GetFirstVisible(t));
+        SendMessageW(t, WM_SETREDRAW, FALSE, 0);
+        following = true;
+        TreeView_DeleteAllItems(t);
+        if (unused) { std::fill(unusedItem.begin(), unusedItem.end(), nullptr); std::fill(unusedFilled.begin(), unusedFilled.end(), 0); }
+        else for (auto& n : nodes) { n.item = nullptr; n.filled = false; }
+        if (unused) InsertUnused(0); else Insert(0);
+        for (int n : open) if (HTREEITEM it = itemOf(n)) TreeView_Expand(t, it, TVE_EXPAND);     // (parents first)
+        if (chosen > 0) if (HTREEITEM it = itemOf(chosen)) TreeView_SelectItem(t, it);
+        following = false;
+        if (first > 0) if (HTREEITEM it = itemOf(first)) TreeView_SelectSetFirstVisible(t, it);
+        SendMessageW(t, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(t, nullptr, TRUE);
+        foundStale = true;
+    }
+
+    // A node to the unused tree (its files put aside: not in the navigator), or back to the tree
+    void MoveUnused(int n, bool aside)
+    {
+        if (!ready || n <= 0 || n >= static_cast<int>(nodes.size())) return;
+        HidePopup();
+        for (int f : nodes[n].files) fileUnused[f] = aside;
+        for (size_t i = 0; i < nodes.size(); i++)
+        {
+            size_t k = 0;
+            for (int f : nodes[i].files) if (!fileUnused[f]) k++;
+            usedCount[i] = k;
+        }
+        Refill(false);
+        Refill(true);
+        // (where it went, in sight)
+        HTREEITEM it = aside ? UnusedItemOf(n) : ItemOf(n);
+        if (it) TreeView_EnsureVisible(aside ? unusedTree : tree, it);
+        UnusedLabel();
+        if (selected > 0) Navigate(selected);
+    }
+
+    void UnusedLabel()
+    {
+        if (!unusedLabel) return;
+        size_t k = 0;
+        for (char u : fileUnused) k += u;
+        SetWindowTextW(unusedLabel, k ? (L"Unused   (" + std::to_wstring(k) + (k == 1 ? L" image)" : L" images)")).c_str()
+                                      : L"Unused   (middle click a node, or right-click it: Move to unused)");
+    }
+
     // The shown children of a node into the tree (when it is opened: a series can have thousands)
     void Insert(int n)
     {
@@ -7943,13 +9322,16 @@ private:
         SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
         for (int c : nodes[n].shown)
         {
+            if (!InTree(c, false)) continue;    // (put aside: in the unused tree)
             TVINSERTSTRUCTW is = {};
             is.hParent = under;
             is.hInsertAfter = TVI_LAST;
-            is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+            is.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN | TVIF_STATE;
             is.item.pszText = const_cast<wchar_t*>(nodes[c].text.c_str());
             is.item.lParam = c;
-            is.item.cChildren = nodes[c].shown.empty() ? 0 : 1;
+            is.item.state = INDEXTOSTATEIMAGEMASK(StateOf(c));
+            is.item.stateMask = TVIS_STATEIMAGEMASK;
+            is.item.cChildren = HasShown(c, false) ? 1 : 0;
             nodes[c].item = TreeView_InsertItem(tree, &is);
         }
         SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
@@ -7970,6 +9352,7 @@ private:
     // Patients and studies open (the series of a few studies in sight)
     void FillTree()
     {
+        foundStale = true;
         following = true;
         TreeView_DeleteAllItems(tree);
         following = false;
@@ -7984,15 +9367,55 @@ private:
         }
     }
 
-    // Compact or not: the tree again, with the same node chosen (or the one shown that holds it)
+    // Compact or not: the tree again, as open as it was (the levels that appear, open when the node above
+    // them is: what was seen is seen still), with the same node chosen (or the one shown that holds it) and
+    // the same one at its top
     void Recompact()
     {
         if (!ready) return;
         int keep = selected;
+        std::vector<char> wasOpen(nodes.size(), 0), wasIn(nodes.size(), 0);
+        openMemory.resize(nodes.size(), -1);
+        for (size_t i = 1; i < nodes.size(); i++)
+        {
+            wasIn[i] = nodes[i].shownParent >= 0;
+            if (nodes[i].item && (TreeView_GetItemState(tree, nodes[i].item, TVIS_EXPANDED) & TVIS_EXPANDED)) wasOpen[i] = 1;
+            if (nodes[i].item) openMemory[i] = wasOpen[i];
+        }
+        int first = -1;
+        if (HTREEITEM top = TreeView_GetFirstVisible(tree))
+        {
+            TVITEMW tv = { TVIF_PARAM };
+            tv.hItem = top;
+            if (TreeView_GetItem(tree, &tv)) first = static_cast<int>(tv.lParam);
+        }
         ComputeShown();
-        FillTree();
+        SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
+        following = true;
+        TreeView_DeleteAllItems(tree);
+        following = false;
+        Insert(0);
+        // (parents before their children: their items are there by then)
+        for (size_t i = 1; i < nodes.size(); i++)
+        {
+            HTREEITEM it = nodes[i].item;
+            if (!it || nodes[i].shown.empty()) continue;
+            const int p = nodes[i].shownParent;
+            const bool parentOpen = p <= 0 || (nodes[p].item && (TreeView_GetItemState(tree, nodes[p].item, TVIS_EXPANDED) & TVIS_EXPANDED));
+            // (as it was; one that comes back, as it was then; a new one, as the node above it)
+            const bool open = wasIn[i] ? wasOpen[i] != 0 : openMemory[i] >= 0 ? openMemory[i] != 0 : parentOpen;
+            if (open) TreeView_Expand(tree, it, TVE_EXPAND);
+        }
+        Refill(true);
         while (keep > 0 && nodes[keep].shownParent < 0) keep = nodes[keep].parent;
-        if (HTREEITEM item = ItemOf(keep)) { TreeView_SelectItem(tree, item); TreeView_EnsureVisible(tree, item); }
+        while (first > 0 && nodes[first].shownParent < 0) first = nodes[first].parent;
+        following = true;
+        if (HTREEITEM item = ItemOf(keep)) TreeView_SelectItem(tree, item);
+        following = false;
+        if (first > 0 && nodes[first].item) TreeView_SelectSetFirstVisible(tree, nodes[first].item);
+        SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(tree, nullptr, TRUE);
+        foundStale = true;
     }
 
     // ----- a node chosen
@@ -8004,6 +9427,7 @@ private:
         FillInfo(n);
         FillFull(n);
         Navigate(n);
+        if (plot.Visible()) FillPlot(n);
         if (!preview) return;
         // An image: the slider goes through those of the node above it in the tree; another node: its own
         int under = n, index = 0;
@@ -8021,27 +9445,57 @@ private:
         sliderNode = under;
         std::vector<std::wstring> paths;
         std::vector<int> frames;                    // (of enhanced files: which frame each image is)
+        // Where each one is: in time, its position (whose images are its times); in space, its plane - or,
+        // under a study, its series (the jumps go from series to series)
+        std::vector<int> space, time;
+        const bool bySeries = nodes[under].level <= Level::Study;
         for (int f : nodes[under].files)
         {
             paths.push_back(data->files[f].path);
             frames.push_back(data->files[f].frame);
+            int position = fileNode[f], s = -1;
+            while (position > 0 && nodes[position].level != Level::Position) position = nodes[position].parent;
+            if (position <= 0) position = fileNode[f];
+            for (int a = fileNode[f]; a > 0; a = nodes[a].parent) if (nodes[a].level == Level::Series) { s = a; break; }
+            time.push_back(position);
+            space.push_back(bySeries && s > 0 ? s : position);
+        }
+        const int delay = bySeries ? 700 : 100;
+        const wchar_t* places = bySeries ? L"Series" : L"Plane";
+        // One plane (a cine of one slice): its images themselves, the cine playing - over them the reference
+        // lines can be drawn
+        currentFile = -1;
+        Segments();
+        if (nodes[n].level != Level::Image)
+        {
+            MakePlanes();
+            const int p0 = filePlane[nodes[under].files[0]];
+            bool one = p0 >= 0;
+            for (int f : nodes[under].files) if (filePlane[f] != p0) { one = false; break; }
+            if (one)
+            {
+                preview->ShowFiles(paths, 0, frames, space, time, delay, places);
+                if (nodes[under].files.size() > 1) preview->StartCine();
+                return;
+            }
         }
         // Not an image: what the floating thumbnail shows (the middle slice, the mosaic, the cine...),
         // larger, until the slider goes to its files
         if (nodes[n].level != Level::Image)
         {
-            preview->ShowFiles(paths, -1, frames);
+            preview->ShowFiles(paths, -1, frames, space, time, delay, places);
             if (posters.count(n)) ShowPoster(n);
             else AskThumb(n, true);
             return;
         }
-        preview->ShowFiles(paths, index, frames);
+        preview->ShowFiles(paths, index, frames, space, time, delay, places);
     }
 
     void ShowPoster(int n)
     {
         auto it = posters.find(n);
         if (!preview || it == posters.end() || n != sliderNode) return;
+        if (preview->Stepping()) return;            // (the files are being gone through already: they stay)
         const Thumb& t = *it->second;
         if (t.frames.empty()) { preview->ShowIndex(0); return; }      // (no thumbnail: the first file)
         std::vector<PreviewHandler::PosterFrame> frames;
@@ -8108,9 +9562,9 @@ private:
         std::vector<int> mine, around;
         std::vector<char> seen(navPlanes.size(), 0);
         for (int f : nodes[n].files)
-            if (filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 1; mine.push_back(filePlane[f]); }
+            if (fileOn[f] && !fileUnused[f] && filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 1; mine.push_back(filePlane[f]); }
         for (int f : nodes[context].files)
-            if (filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 2; around.push_back(filePlane[f]); }
+            if (fileOn[f] && !fileUnused[f] && filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 2; around.push_back(filePlane[f]); }
         // Too many to draw (a patient, everything): some of them, evenly
         const size_t most = 40000;
         auto thin = [](std::vector<int>& v, size_t keep) {
@@ -8125,9 +9579,12 @@ private:
         std::vector<NavPlane> scene;
         std::vector<char> hot;
         Light(-1);
+        marked = -1;
         navScene.clear();
         for (int p : around) { scene.push_back(navPlanes[p]); hot.push_back(0); navScene.push_back(p); }
         for (int p : mine) { scene.push_back(navPlanes[p]); hot.push_back(1); navScene.push_back(p); }
+        navSceneOf.assign(navPlanes.size(), -1);
+        for (size_t k = 0; k < navScene.size(); k++) navSceneOf[navScene[k]] = static_cast<int>(k);
         // One plane: its image (the first one, the chosen one if an image)
         Picture picture;
         int on = -1;
@@ -8147,7 +9604,13 @@ private:
             }
         }
         std::wstring more;
-        if (total)
+        if (!total)
+        {
+            // (none drawn: none has a position, or their check boxes in the tree are off)
+            for (int f : nodes[context].files)
+                if (filePlane[f] >= 0) { more = L"Its images are turned off (the check boxes of the tree)"; break; }
+        }
+        else
         {
             wchar_t b[200];
             if (context == n) swprintf_s(b, L"%zu plane%s", red, red == 1 ? L"" : L"s");
@@ -8155,8 +9618,483 @@ private:
             more = b;
             if (total > most) more += L" (" + std::to_wstring(most) + L" of them drawn)";
         }
+        if (usedCount[n] == 0) more = L"Put aside in the unused tree: not drawn here" + (total ? L"  (" + std::to_wstring(total) + L" planes of its study)" : std::wstring());
         navigator.Set(std::move(scene), std::move(hot), on, std::move(picture), nodes[n].text, more, context != navigated);
         navigated = context;
+    }
+
+    // The check box of a node: 1 off, 2 on, 3 some of it on (its files drawn in the navigator, or not)
+    // Its image in the tree: the same box in green when images under it have segmentations (4 to 6)
+    int StateOf(int n) const
+    {
+        const bool segmented = n >= 0 && n < static_cast<int>(segmentedCount.size()) && segmentedCount[n] > 0;
+        return CheckOf(n) + (segmented ? 3 : 0);
+    }
+
+    // The images of the check boxes of the tree: off, on and partly on, plain and green (segmented)
+    void CheckImages()
+    {
+        HIMAGELIST before = TreeView_GetImageList(tree, TVSIL_STATE);
+        int size = 0, ignore = 0;
+        if (!before || !ImageList_GetIconSize(before, &size, &ignore) || size <= 0) size = Px(16);
+        HIMAGELIST list = ImageList_Create(size, size, ILC_COLOR32, 7, 0);
+        if (!list) return;
+        HTHEME theme = OpenThemeData(tree, L"BUTTON");
+        HDC screen = GetDC(tree);
+        const COLORREF back = GetSysColor(COLOR_WINDOW);
+        const DWORD tint = 0xAAE6AA;                // (light green, 0xRRGGBB as the bits of the DIB)
+        for (int k = 0; k < 7; k++)
+        {
+            BITMAPINFO bi = {};
+            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+            bi.bmiHeader.biWidth = size;
+            bi.bmiHeader.biHeight = -size;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            void* bits = nullptr;
+            HBITMAP bitmap = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!bitmap || !bits) continue;
+            HDC dc = CreateCompatibleDC(screen);
+            HGDIOBJ old = SelectObject(dc, bitmap);
+            RECT all = { 0, 0, size, size };
+            HBRUSH brush = CreateSolidBrush(back);
+            FillRect(dc, &all, brush);
+            DeleteObject(brush);
+            RECT box = all;
+            if (k > 0)
+            {
+                const int kind = (k - 1) % 3;           // (off, on, partly)
+                SIZE part = { size - 2, size - 2 };
+                if (theme) GetThemePartSize(theme, dc, BP_CHECKBOX, CBS_UNCHECKEDNORMAL, nullptr, TS_TRUE, &part);
+                box = { (size - part.cx) / 2, (size - part.cy) / 2, (size - part.cx) / 2 + part.cx, (size - part.cy) / 2 + part.cy };
+                if (theme)
+                    DrawThemeBackground(theme, dc, BP_CHECKBOX, kind == 0 ? CBS_UNCHECKEDNORMAL : kind == 1 ? CBS_CHECKEDNORMAL : CBS_MIXEDNORMAL, &box, nullptr);
+                else
+                    DrawFrameControl(dc, &box, DFC_BUTTON, DFCS_BUTTONCHECK | (kind == 1 ? DFCS_CHECKED : 0));
+                // Segmented: the box green (its blue green, an empty one light green inside)
+                if (k >= 4)
+                {
+                    GdiFlush();
+                    DWORD* px = static_cast<DWORD*>(bits);
+                    for (int y = box.top + 1; y < box.bottom - 1; y++)
+                        for (int x = box.left + 1; x < box.right - 1; x++)
+                        {
+                            DWORD& p = px[static_cast<size_t>(y) * size + x];
+                            const int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+                            if (b > r + 30 && b > g) p = (r << 16) | (b << 8) | g;     // (blue: green)
+                            else if (r > 200 && g > 200 && b > 200 && kind == 0) p = tint;     // (an empty box: light green)
+                        }
+                }
+            }
+            // (opaque: the image list draws its alpha)
+            GdiFlush();
+            DWORD* px = static_cast<DWORD*>(bits);
+            for (int i = 0; i < size * size; i++) px[i] |= 0xFF000000;
+            SelectObject(dc, old);
+            DeleteDC(dc);
+            ImageList_Add(list, bitmap, nullptr);
+            DeleteObject(bitmap);
+        }
+        ReleaseDC(tree, screen);
+        if (theme) CloseThemeData(theme);
+        TreeView_SetImageList(tree, list, TVSIL_STATE);
+        if (before && before != list) ImageList_Destroy(before);
+    }
+
+    int CheckOf(int n) const
+    {
+        if (n < 0 || n >= static_cast<int>(onCount.size())) return 2;
+        return onCount[n] == 0 ? 1 : onCount[n] == nodes[n].files.size() ? 2 : 3;
+    }
+
+    // Its check box clicked: all of it on (off if it all was), and so everything under it
+    void Toggle(int n)
+    {
+        if (!ready || n <= 0 || n >= static_cast<int>(nodes.size())) return;
+        const bool on = onCount[n] < nodes[n].files.size();
+        for (int f : nodes[n].files) fileOn[f] = on;
+        const long long delta = static_cast<long long>(on ? nodes[n].files.size() : 0) - static_cast<long long>(onCount[n]);
+        std::vector<int> down = { n };
+        while (!down.empty())
+        {
+            const int d = down.back();
+            down.pop_back();
+            onCount[d] = on ? nodes[d].files.size() : 0;
+            for (int c : nodes[d].children) down.push_back(c);
+        }
+        for (int a = nodes[n].parent; a >= 0; a = nodes[a].parent) onCount[a] = static_cast<size_t>(static_cast<long long>(onCount[a]) + delta);
+        for (size_t i = 1; i < nodes.size(); i++)
+            if (nodes[i].item) TreeView_SetItemState(tree, nodes[i].item, INDEXTOSTATEIMAGEMASK(StateOf(static_cast<int>(i))), TVIS_STATEIMAGEMASK);
+        if (selected > 0) Navigate(selected);
+    }
+
+    // The plane of a file: where its first pixel is, the directions of its rows and columns, its pixel spacing
+    struct Geometry { double origin[3], row[3], column[3], dx, dy; int columns, rows; };
+    bool GeometryOf(int f, Geometry& g) const
+    {
+        if (f < 0 || f >= static_cast<int>(data->files.size())) return false;
+        const Gathered& x = data->files[f];
+        if (!x.oriented || !x.placed || !x.rows || !x.columns) return false;
+        const std::wstring* s = AttributeOf(f, 0x00280030);
+        double dy = 0, dx = 0;
+        if (!s || swscanf_s(s->c_str(), L"%lf\\%lf", &dy, &dx) != 2 || dy <= 0 || dx <= 0) return false;
+        for (int k = 0; k < 3; k++) { g.origin[k] = x.position[k]; g.row[k] = x.orientation[k]; g.column[k] = x.orientation[3 + k]; }
+        g.dx = dx;
+        g.dy = dy;
+        g.columns = static_cast<int>(x.columns);
+        g.rows = static_cast<int>(x.rows);
+        return true;
+    }
+
+    // The file the image panel shows now (the slider moved): the reference lines on it again
+    void ShownFile(int i)
+    {
+        const int before = currentFile;
+        currentFile = sliderNode >= 0 && i >= 0 && i < static_cast<int>(nodes[sliderNode].files.size()) ? nodes[sliderNode].files[i] : -1;
+        if (currentFile != before && marked > 0) Guides(marked);
+        if (currentFile != before) Segments();
+        if (plot.Visible())
+        {
+            const auto it = std::find(plotFiles.begin(), plotFiles.end(), currentFile);
+            plot.SetCurrent(it == plotFiles.end() ? -1 : static_cast<int>(it - plotFiles.begin()));
+        }
+    }
+
+    // The reference lines: where the planes of a node cut the plane of the image shown, over it and in the
+    // navigator (-1: none)
+    void Guides(int n)
+    {
+        std::vector<std::array<double, 4>> flat;
+        std::vector<std::array<float, 6>> lines;
+        Geometry a;
+        if (refLines && n > 0 && n < static_cast<int>(nodes.size()) && GeometryOf(currentFile, a))
+        {
+            MakePlanes();
+            const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
+                                       a.row[0] * a.column[1] - a.row[1] * a.column[0] };
+            const int mine = currentFile < static_cast<int>(filePlane.size()) ? filePlane[currentFile] : -1;
+            std::vector<char> seen(navPlanes.size(), 0);
+            for (int f : nodes[n].files)
+            {
+                const int p = f < static_cast<int>(filePlane.size()) ? filePlane[f] : -1;
+                if (p < 0 || p == mine || seen[p] || lines.size() >= 400) continue;
+                seen[p] = 1;
+                // Where its edges cross the plane of the image (from its corners: 0 1 / 2 3)
+                const auto& q = navPlanes[p].p;
+                double d[4];
+                for (int c = 0; c < 4; c++)
+                {
+                    d[c] = 0;
+                    for (int k = 0; k < 3; k++) d[c] += (q[c][k] - a.origin[k]) * normal[k];
+                }
+                std::vector<std::array<double, 3>> cut;
+                static const int edges[4][2] = { { 0, 1 }, { 1, 3 }, { 3, 2 }, { 2, 0 } };
+                for (const auto& e : edges)
+                {
+                    const double u = d[e[0]], v = d[e[1]];
+                    if ((u < 0) == (v < 0) || u == v) continue;
+                    const double t = u / (u - v);
+                    std::array<double, 3> x;
+                    for (int k = 0; k < 3; k++) x[k] = q[e[0]][k] + t * (q[e[1]][k] - q[e[0]][k]);
+                    cut.push_back(x);
+                }
+                if (cut.size() < 2) continue;
+                // In the pixels of the image, cut to it
+                auto pixel = [&](const std::array<double, 3>& x, double& c, double& r) {
+                    double u = 0, v = 0;
+                    for (int k = 0; k < 3; k++) { u += (x[k] - a.origin[k]) * a.row[k]; v += (x[k] - a.origin[k]) * a.column[k]; }
+                    c = u / a.dx;
+                    r = v / a.dy;
+                };
+                double c0, r0, c1, r1;
+                pixel(cut[0], c0, r0);
+                pixel(cut[1], c1, r1);
+                double t0 = 0, t1 = 1;
+                const double lo[2] = { -0.5, -0.5 }, hi[2] = { a.columns - 0.5, a.rows - 0.5 }, p0[2] = { c0, r0 }, dp[2] = { c1 - c0, r1 - r0 };
+                bool keep = true;
+                for (int k = 0; k < 2 && keep; k++)
+                {
+                    if (std::fabs(dp[k]) < 1e-12) { if (p0[k] < lo[k] || p0[k] > hi[k]) keep = false; continue; }
+                    double ta = (lo[k] - p0[k]) / dp[k], tb = (hi[k] - p0[k]) / dp[k];
+                    if (ta > tb) std::swap(ta, tb);
+                    t0 = (std::max)(t0, ta);
+                    t1 = (std::min)(t1, tb);
+                    if (t0 > t1) keep = false;
+                }
+                if (!keep) continue;
+                flat.push_back({ c0 + t0 * dp[0], r0 + t0 * dp[1], c0 + t1 * dp[0], r0 + t1 * dp[1] });
+                std::array<float, 6> line;
+                for (int k = 0; k < 3; k++)
+                {
+                    line[k] = static_cast<float>(a.origin[k] + (c0 + t0 * dp[0]) * a.dx * a.row[k] + (r0 + t0 * dp[1]) * a.dy * a.column[k]);
+                    line[3 + k] = static_cast<float>(a.origin[k] + (c0 + t1 * dp[0]) * a.dx * a.row[k] + (r0 + t1 * dp[1]) * a.dy * a.column[k]);
+                }
+                lines.push_back(line);
+            }
+        }
+        if (preview) preview->SetGuides(std::move(flat));
+        navigator.SetGuides(std::move(lines));
+    }
+
+    // The images with a segmentation in their plane (a frame of a SEG with something in it, or a contour of a
+    // structure set), marked in the tree; their segmentations read now (only when the folder has any)
+    void MarkSegmented()
+    {
+        segmentedCount.assign(nodes.size(), 0);
+        if (overlays.empty()) return;
+        for (Overlay& o : overlays) if (!o.loaded) LoadOverlay(o);
+        std::vector<char> withSegments(data->files.size(), 0);
+        const std::wstring segClass = Widen(SegSopClass);
+        for (size_t f = 0; f < data->files.size(); f++)
+        {
+            Geometry a;
+            if (!GeometryOf(static_cast<int>(f), a)) continue;
+            const std::wstring* own = AttributeOf(static_cast<int>(f), 0x00080016);
+            if (own && *own == segClass) continue;
+            const Gathered& g = data->files[f];
+            const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
+                                       a.row[0] * a.column[1] - a.row[1] * a.column[0] };
+            double thickness = 0;
+            if (const std::wstring* t = AttributeOf(static_cast<int>(f), 0x00180050)) thickness = _wtof(t->c_str());
+            auto gapOf = [&](const double* p) { double d = 0; for (int k = 0; k < 3; k++) d += (p[k] - a.origin[k]) * normal[k]; return d; };
+            for (const Overlay& o : overlays)
+            {
+                if (o.failed || o.study != g.study) continue;
+                if (!o.rt)
+                {
+                    const double tolerance = o.spacing > 0 ? o.spacing * 0.45 : 1.0;
+                    for (const SegFrame& s : o.frames)
+                    {
+                        if (!s.any) continue;
+                        const double fn[3] = { s.row[1] * s.column[2] - s.row[2] * s.column[1], s.row[2] * s.column[0] - s.row[0] * s.column[2],
+                                               s.row[0] * s.column[1] - s.row[1] * s.column[0] };
+                        if (std::fabs(fn[0] * normal[0] + fn[1] * normal[1] + fn[2] * normal[2]) < 0.999) continue;
+                        if (std::fabs(gapOf(s.origin)) <= tolerance) { withSegments[f] = 1; break; }
+                    }
+                }
+                else
+                {
+                    const double tolerance = thickness > 0 ? thickness * 0.5 : 1.0;
+                    for (const Contour& c : o.contours)
+                    {
+                        if (c.points.empty()) continue;
+                        bool in = true;
+                        for (size_t k = 0; k < c.points.size() && in; k += (std::max)(static_cast<size_t>(1), c.points.size() / 4))
+                            if (std::fabs(gapOf(c.points[k].data())) > tolerance) in = false;
+                        if (in) { withSegments[f] = 1; break; }
+                    }
+                }
+                if (withSegments[f]) break;
+            }
+        }
+        for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) segmentedCount[i] += withSegments[f];
+        for (size_t i = 0; i < nodes.size(); i++) if (segmentedCount[i]) nodes[i].text = Label(static_cast<int>(i));
+    }
+
+    // The segmentations of the study of the image shown, over it (the masks of the SEG frames in its plane, the
+    // contours of the structure sets in its plane) and in the navigator (all the contours)
+    void Segments()
+    {
+        std::vector<DWORD> argb;
+        std::vector<PreviewHandler::Outline> flat;
+        std::vector<Navigator::Line3> lines;
+        Geometry a;
+        int width = 0, height = 0;
+        if (showSegments && !overlays.empty() && GeometryOf(currentFile, a))
+        {
+            const Gathered& shown = data->files[currentFile];
+            const std::wstring* own = AttributeOf(currentFile, 0x00080016);
+            const bool itself = own && (*own == Widen(SegSopClass));     // (a SEG shown: not over itself)
+            const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
+                                       a.row[0] * a.column[1] - a.row[1] * a.column[0] };
+            double thickness = 0;
+            if (const std::wstring* t = AttributeOf(currentFile, 0x00180050)) thickness = _wtof(t->c_str());
+            width = a.columns;
+            height = a.rows;
+            std::vector<int> label(static_cast<size_t>(width) * height, 0);
+            std::vector<COLORREF> palette(1, 0);
+            for (Overlay& o : overlays)
+            {
+                if (o.study != shown.study) continue;
+                if (!o.loaded) LoadOverlay(o);
+                if (o.failed) continue;
+                if (!o.rt && !itself)
+                {
+                    const double tolerance = o.spacing > 0 ? o.spacing * 0.45 : 1.0;
+                    for (const SegFrame& f : o.frames)
+                    {
+                        const double fn[3] = { f.row[1] * f.column[2] - f.row[2] * f.column[1], f.row[2] * f.column[0] - f.row[0] * f.column[2],
+                                               f.row[0] * f.column[1] - f.row[1] * f.column[0] };
+                        double dot = 0, gap = 0;
+                        for (int k = 0; k < 3; k++) { dot += fn[k] * normal[k]; gap += (f.origin[k] - a.origin[k]) * normal[k]; }
+                        if (std::fabs(dot) < 0.999 || std::fabs(gap) > tolerance) continue;
+                        auto it = o.colors.find(f.segment);
+                        palette.push_back(it != o.colors.end() ? it->second : Palette[(5 + f.segment) % PaletteSize]);
+                        const int id = static_cast<int>(palette.size()) - 1;
+                        // Each pixel of the image, where it is in the frame (its nearest pixel there)
+                        double u0 = 0, v0 = 0, uc = 0, vc = 0, ur = 0, vr = 0;
+                        for (int k = 0; k < 3; k++)
+                        {
+                            const double d = a.origin[k] - f.origin[k];
+                            u0 += d * f.row[k];
+                            v0 += d * f.column[k];
+                            uc += a.dx * a.row[k] * f.row[k];
+                            vc += a.dx * a.row[k] * f.column[k];
+                            ur += a.dy * a.column[k] * f.row[k];
+                            vr += a.dy * a.column[k] * f.column[k];
+                        }
+                        for (int r = 0; r < height; r++)
+                            for (int c = 0; c < width; c++)
+                            {
+                                const long u = std::lround((u0 + c * uc + r * ur) / f.dx), v = std::lround((v0 + c * vc + r * vr) / f.dy);
+                                if (u < 0 || v < 0 || u >= f.columns || v >= f.rows) continue;
+                                if (f.mask[static_cast<size_t>(v) * f.columns + u]) label[static_cast<size_t>(r) * width + c] = id;
+                            }
+                    }
+                }
+                if (o.rt)
+                {
+                    const double tolerance = thickness > 0 ? thickness * 0.5 : 1.0;
+                    for (const Contour& c3 : o.contours)
+                    {
+                        Navigator::Line3 l;
+                        l.color = c3.color;
+                        l.closed = c3.closed;
+                        for (const auto& p : c3.points) l.points.push_back({ static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]) });
+                        if (lines.size() < 5000) lines.push_back(std::move(l));
+                        // In the plane of the image: over it
+                        bool inPlane = true;
+                        PreviewHandler::Outline out;
+                        out.color = c3.color;
+                        out.closed = c3.closed;
+                        for (const auto& p : c3.points)
+                        {
+                            double gap = 0, u = 0, v = 0;
+                            for (int k = 0; k < 3; k++)
+                            {
+                                const double d = p[k] - a.origin[k];
+                                gap += d * normal[k];
+                                u += d * a.row[k];
+                                v += d * a.column[k];
+                            }
+                            if (std::fabs(gap) > tolerance) { inPlane = false; break; }
+                            out.points.push_back({ u / a.dx, v / a.dy });
+                        }
+                        if (inPlane && !out.points.empty()) flat.push_back(std::move(out));
+                    }
+                }
+            }
+            // The mask: its color, faint inside and strong at its edge
+            if (palette.size() > 1)
+            {
+                argb.assign(label.size(), 0);
+                for (int r = 0; r < height; r++)
+                    for (int c = 0; c < width; c++)
+                    {
+                        const int id = label[static_cast<size_t>(r) * width + c];
+                        if (!id) continue;
+                        auto other = [&](int rr, int cc) { return rr < 0 || cc < 0 || rr >= height || cc >= width || label[static_cast<size_t>(rr) * width + cc] != id; };
+                        const bool edge = other(r - 1, c) || other(r + 1, c) || other(r, c - 1) || other(r, c + 1);
+                        const DWORD alpha = edge ? 235 : 80;
+                        const COLORREF col = palette[id];
+                        const DWORD R = GetRValue(col) * alpha / 255, G = GetGValue(col) * alpha / 255, B = GetBValue(col) * alpha / 255;
+                        argb[static_cast<size_t>(r) * width + c] = (alpha << 24) | (R << 16) | (G << 8) | B;
+                    }
+            }
+        }
+        if (preview) preview->SetSegmentation(argb.empty() ? 0 : width, argb.empty() ? 0 : height, argb, std::move(flat));
+        navigator.SetContours(std::move(lines));
+    }
+
+    // The mouse over the image: the point of the patient there, in the navigator
+    void Pointed(bool on, double column, double row)
+    {
+        Geometry a;
+        if (!on || !GeometryOf(currentFile, a)) { navigator.SetPoint(false); return; }
+        double p[3];
+        for (int k = 0; k < 3; k++) p[k] = a.origin[k] + column * a.dx * a.row[k] + row * a.dy * a.column[k];
+        navigator.SetPoint(true, p);
+    }
+
+    // The mouse over the navigator: where its line of sight crosses the plane of the image shown, a small
+    // crosshair there on the image (and the point in the navigator)
+    void Aimed(bool on, const double* from, const double* toward)
+    {
+        Geometry a;
+        if (!preview) return;
+        if (!on || !GeometryOf(currentFile, a)) { preview->SetCrosshair(false); navigator.SetPoint(false); return; }
+        const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
+                                   a.row[0] * a.column[1] - a.row[1] * a.column[0] };
+        double along = 0, gap = 0;
+        for (int k = 0; k < 3; k++) { along += toward[k] * normal[k]; gap += (a.origin[k] - from[k]) * normal[k]; }
+        if (std::fabs(along) < 0.05) { preview->SetCrosshair(false); navigator.SetPoint(false); return; }     // (seen edge on)
+        double p[3], u = 0, v = 0;
+        for (int k = 0; k < 3; k++) p[k] = from[k] + gap / along * toward[k];
+        for (int k = 0; k < 3; k++) { u += (p[k] - a.origin[k]) * a.row[k]; v += (p[k] - a.origin[k]) * a.column[k]; }
+        const double column = u / a.dx, row = v / a.dy;
+        if (column < -0.5 || row < -0.5 || column > a.columns - 0.5 || row > a.rows - 0.5)
+        {
+            preview->SetCrosshair(false);
+            navigator.SetPoint(false);
+            return;
+        }
+        preview->SetCrosshair(true, column, row);
+        navigator.SetPoint(true, p);
+    }
+
+    // The mouse over a node of a tree (or off them: no tree): its planes framed in black in the navigator,
+    // whatever the floating thumbnail does
+    void Mark(HWND t, POINT pt)
+    {
+        int n = -1;
+        if (t && ready)
+        {
+            if (!markTracking)
+            {
+                TRACKMOUSEEVENT e = { sizeof(e), TME_LEAVE, t, 0 };
+                markTracking = TrackMouseEvent(&e) != FALSE;
+            }
+            TVHITTESTINFO hit = {};
+            hit.pt = pt;
+            HTREEITEM item = TreeView_HitTest(t, &hit);
+            TVITEMW tv = { TVIF_PARAM };
+            tv.hItem = item;
+            if (item && (hit.flags & TVHT_ONITEM) && TreeView_GetItem(t, &tv)) n = static_cast<int>(tv.lParam);
+        }
+        if (n == marked) return;
+        marked = n;
+        Guides(n);
+        std::vector<int> which;
+        if (n > 0 && n < static_cast<int>(nodes.size()) && navigator.Visible() && !navScene.empty())
+        {
+            std::vector<char> in(navPlanes.size(), 0);
+            for (int f : nodes[n].files)
+                if (fileOn[f] && !fileUnused[f] && filePlane[f] >= 0) in[filePlane[f]] = 1;
+            for (size_t i = 0; i < navScene.size(); i++) if (in[navScene[i]]) which.push_back(static_cast<int>(i));
+        }
+        navigator.SetMarks(std::move(which));
+    }
+
+    // A double click on a plane of the navigator: its first image (by instance number) chosen in the tree
+    void Pick(int i)
+    {
+        if (i < 0 || i >= static_cast<int>(navScene.size()) || navigated <= 0) return;
+        const int p = navScene[i];
+        int best = -1;
+        long bestNumber = 0;
+        for (int f : nodes[navigated].files)
+        {
+            if (filePlane[f] != p || !fileOn[f] || fileUnused[f]) continue;
+            const long number = atol(data->files[f].instance.c_str());
+            if (best < 0 || number < bestNumber || (number == bestNumber && rank[f] < rank[best])) { best = f; bestNumber = number; }
+        }
+        if (best < 0) return;
+        if (HTREEITEM item = ItemOf(fileNode[best]))
+        {
+            TreeView_SelectItem(tree, item);
+            TreeView_EnsureVisible(tree, item);
+            SetFocus(tree);
+        }
     }
 
     // The mouse over a plane of the navigator (-1: off them): the images of that plane marked in the tree,
@@ -8171,7 +10109,7 @@ private:
             size_t images = 0;
             for (int f : nodes[navigated].files)
             {
-                if (filePlane[f] != p) continue;
+                if (filePlane[f] != p || !fileOn[f] || fileUnused[f]) continue;
                 images++;
                 int x = fileNode[f];
                 while (x > 0 && !nodes[x].item) x = nodes[x].shownParent >= 0 ? nodes[x].shownParent : nodes[x].parent;
@@ -8188,6 +10126,20 @@ private:
             navigator.SetHoverText(text);
         }
         InvalidateRect(tree, nullptr, FALSE);
+    }
+
+    // The cine or the jumps on an image: it, on its plane in the navigator
+    void Live(int i)
+    {
+        if (!preview || !preview->Running() || !navigator.Visible() || sliderNode < 0 || i < 0 ||
+            i >= static_cast<int>(nodes[sliderNode].files.size()) || navSceneOf.empty())
+            return;
+        const int f = nodes[sliderNode].files[i];
+        const int p = f < static_cast<int>(filePlane.size()) ? filePlane[f] : -1;
+        const int at = p >= 0 && p < static_cast<int>(navSceneOf.size()) ? navSceneOf[p] : -1;
+        int w = 0, h = 0;
+        const std::vector<DWORD>* px = at >= 0 ? preview->Pixels(w, h) : nullptr;
+        navigator.SetLive(at, w, h, px);
     }
 
     // The slider (or the cine) moved: an image chosen in the tree follows it
@@ -8272,6 +10224,7 @@ private:
                 row(L"Device", device);
             }
             row(L"Series instance UID", Widen(g.series));
+            row(L"Kind (guessed)", KindOf(n));
             row(L"Orientations", std::to_wstring(count(Level::Orientation)));
             row(L"Positions", std::to_wstring(count(Level::Position)));
             break;
@@ -8454,6 +10407,14 @@ private:
     void FillFull(int n)
     {
         SendMessageW(full, WM_SETREDRAW, FALSE, 0);
+        // (the groups folded or not, as they were left: by their own arrow or by a click on their title)
+        for (size_t id = 1; id < groupKind.size(); id++)
+        {
+            if (ListView_GetGroupState(full, static_cast<int>(id), LVGS_COLLAPSED) & LVGS_COLLAPSED) folded.insert(groupKind[id]);
+            else folded.erase(groupKind[id]);
+        }
+        groupKind.assign(1, -1);
+        groupTitle.assign(1, std::wstring());
         ListView_DeleteAllItems(full);
         ListView_RemoveAllGroups(full);
         static const wchar_t* const levels[] = { L"All the files", L"Patient", L"Study", L"Series", L"Orientation", L"Position", L"Image" };
@@ -8466,15 +10427,18 @@ private:
                 if (Matches(text, filterText, filterRegex, filterIsRegex)) keep.push_back(&r);
             }
             if (keep.empty()) return;
-            const std::wstring title = header + L"   (" + std::to_wstring(keep.size()) + L")";
+            const std::wstring plain = header + L"   (" + std::to_wstring(keep.size()) + L")";
+            const std::wstring title = GroupTitle(plain, folded.count(kind) != 0);
             LVGROUP g = {};
             g.cbSize = sizeof(g);
             g.mask = LVGF_HEADER | LVGF_GROUPID | LVGF_STATE;
             g.pszHeader = const_cast<wchar_t*>(title.c_str());
             g.iGroupId = ++groupId;
-            g.stateMask = LVGS_COLLAPSIBLE;
-            g.state = LVGS_COLLAPSIBLE;
+            g.stateMask = LVGS_COLLAPSIBLE | LVGS_COLLAPSED;
+            g.state = folded.count(kind) ? LVGS_COLLAPSED : 0;      // (not collapsible: its triangle folds it, not an arrow at the right)
             ListView_InsertGroup(full, -1, &g);
+            groupKind.push_back(kind);
+            groupTitle.push_back(plain);
             for (const Row* r : keep)
             {
                 const std::wstring tag = TagText(r->tag), name = TagName(r->tag);
@@ -8553,23 +10517,261 @@ private:
         return rows;
     }
 
+    // The title of a group of the full info, after the triangle that folds it (down: open; right: folded)
+    static std::wstring GroupTitle(const std::wstring& title, bool fold)
+    {
+        return (fold ? L"\u25B6   " : L"\u25BC   ") + title;
+    }
+
+    // The group of the full info whose triangle is under a point (0: none)
+    int TriangleAt(HWND h, POINT pt) const
+    {
+        // (by where the titles are: the hit test of the list says which group only in lists of owner data)
+        for (int id = 1; id < static_cast<int>(groupKind.size()); id++)
+        {
+            RECT title = {}, label = {};
+            if (!ListView_GetGroupRect(h, id, LVGGR_HEADER, &title) || !PtInRect(&title, pt)) continue;
+            if (!ListView_GetGroupRect(h, id, LVGGR_LABEL, &label)) return 0;
+            return pt.x >= label.left - Px(10) && pt.x < label.left + Px(22) ? id : 0;
+        }
+        return 0;
+    }
+
+    // A click on the triangle of a group of the full info: folded, or open again (and so it stays)
+    static LRESULT CALLBACK FullProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref)
+    {
+        auto self = reinterpret_cast<DicomExplorer*>(ref);
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK)
+        {
+            const int id = self->TriangleAt(h, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+            if (id > 0 && id < static_cast<int>(self->groupKind.size()))
+            {
+                ListView_SetItemState(h, -1, 0, LVIS_SELECTED);
+                const bool fold = !(ListView_GetGroupState(h, id, LVGS_COLLAPSED) & LVGS_COLLAPSED);
+                const std::wstring title = GroupTitle(self->groupTitle[id], fold);
+                LVGROUP g = {};
+                g.cbSize = sizeof(g);
+                g.mask = LVGF_HEADER | LVGF_STATE;
+                g.pszHeader = const_cast<wchar_t*>(title.c_str());
+                g.stateMask = LVGS_COLLAPSED;
+                g.state = fold ? LVGS_COLLAPSED : 0;
+                ListView_SetGroupInfo(h, id, &g);
+                if (fold) self->folded.insert(self->groupKind[id]);
+                else self->folded.erase(self->groupKind[id]);
+                return 0;
+            }
+            // (the rest of a title: nothing - the list would choose all the rows of the group)
+            LVHITTESTINFO hit = {};
+            hit.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ListView_HitTestEx(h, &hit);
+            if (hit.flags & LVHT_EX_GROUP_HEADER) return 0;
+        }
+        if (msg == WM_LBUTTONUP)
+        {
+            LVHITTESTINFO hit = {};
+            hit.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ListView_HitTestEx(h, &hit);
+            if (hit.flags & LVHT_EX_GROUP_HEADER) return 0;     // (the list chooses the rows of a group when its title is let go)
+        }
+        if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT)
+        {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(h, &pt);
+            if (self->TriangleAt(h, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+        }
+        if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, FullProc, 1);
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+
+    // A click on the title of the Tag column (not on its edge): folded, or open
+    static LRESULT CALLBACK HeaderProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref)
+    {
+        auto self = reinterpret_cast<DicomExplorer*>(ref);
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK)
+        {
+            HDHITTESTINFO hit = {};
+            hit.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (SendMessageW(h, HDM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)) == 0 && (hit.flags & HHT_ONHEADER)) { self->TagColumn(!self->tagOpen); return 0; }
+        }
+        if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, HeaderProc, 1);
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+
+    // ----- the plot
+
+    // The tag of a row of the full info (0: none)
+    Uint32 RowTag(int row) const
+    {
+        wchar_t b[32] = {};
+        ListView_GetItemText(full, row, 0, b, ARRAYSIZE(b));
+        unsigned g = 0, e = 0;
+        return swscanf_s(b, L"(%x,%x)", &g, &e) == 2 ? (g << 16) | e : 0;
+    }
+
+    void PlotRow(int row)
+    {
+        const Uint32 tag = RowTag(row);
+        if (!tag || selected <= 0) return;
+        plotTag = tag;
+        const bool was = plot.Visible();
+        plot.Show(true);
+        FillPlot(selected);
+        if (!was) Layout();
+    }
+
+    // The values of the attribute in the files of a node, in their order
+    void FillPlot(int n)
+    {
+        if (!plotTag || n <= 0 || n >= static_cast<int>(nodes.size())) return;
+        plotFiles = nodes[n].files;
+        std::vector<std::wstring> values, names;
+        int current = -1;
+        for (size_t i = 0; i < plotFiles.size(); i++)
+        {
+            const int f = plotFiles[i];
+            const std::wstring* v = AttributeOf(f, plotTag);
+            values.push_back(v ? Shown(plotTag, *v) : std::wstring());
+            const Gathered& g = data->files[f];
+            names.push_back(g.path.substr(g.path.find_last_of(L'\\') + 1) + (g.frame >= 0 ? L" frame " + std::to_wstring(g.frame + 1) : L""));
+            if (f == currentFile) current = static_cast<int>(i);
+        }
+        const std::wstring name = TagName(plotTag);
+        plot.Set(TagText(plotTag) + L" " + (name.empty() ? L"" : name) + L"   along " + HowMany(n), std::move(values), std::move(names), current);
+    }
+
+    // A click on a file of the plot: its image chosen in the tree
+    void PlotPicked(int i)
+    {
+        if (i < 0 || i >= static_cast<int>(plotFiles.size())) return;
+        const int image = fileNode[plotFiles[i]];
+        if (HTREEITEM item = image > 0 ? ItemOf(image) : nullptr)
+        {
+            TreeView_SelectItem(tree, item);
+            TreeView_EnsureVisible(tree, item);
+        }
+    }
+
+    // The menu of the full info: the plot of the attribute of a row, the rows copied
+    void FullMenu(LPARAM lp)
+    {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int row = -1;
+        if (pt.x == -1 && pt.y == -1)
+        {
+            row = ListView_GetNextItem(full, -1, LVNI_FOCUSED);
+            RECT r = {};
+            if (row >= 0 && ListView_GetItemRect(full, row, &r, LVIR_LABEL)) { pt = { r.left, r.bottom }; ClientToScreen(full, &pt); }
+            else GetCursorPos(&pt);
+        }
+        else
+        {
+            LVHITTESTINFO hit = {};
+            hit.pt = pt;
+            ScreenToClient(full, &hit.pt);
+            row = ListView_HitTest(full, &hit);
+        }
+        const Uint32 tag = row >= 0 ? RowTag(row) : 0;
+        HMENU menu = CreatePopupMenu();
+        const std::wstring name = tag ? TagName(tag) : std::wstring();
+        AppendMenuW(menu, MF_STRING | (tag && selected > 0 ? 0 : MF_GRAYED), 1,
+                    (L"&Plot " + (name.empty() ? (tag ? TagText(tag) : std::wstring(L"the attribute")) : name) + L" along the files").c_str());
+        AppendMenuW(menu, MF_STRING, 2, L"&Copy the rows chosen");
+        const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, wnd, nullptr);
+        DestroyMenu(menu);
+        if (cmd == 1) PlotRow(row);
+        else if (cmd == 2) CopyRows(full, true);
+    }
+
+    // The Tag column of the full info: folded (a narrow one, its triangle alone) or open
+    bool tagOpen = false;
+    void TagColumn(bool open)
+    {
+        tagOpen = open;
+        WriteSetting(L"TagColumn", open ? 1 : 0);
+        std::wstring title = open ? L"\u25BE Tag" : L"\u25B8";
+        LVCOLUMNW c = {};
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = &title[0];
+        c.cx = Px(open ? 95 : 22);
+        ListView_SetColumn(full, 0, &c);
+        InvalidateRect(full, nullptr, TRUE);
+    }
+
     // ----- find in the tree
 
     std::vector<int> Order() const
     {
         std::vector<int> order;
-        std::function<void(int)> walk = [&](int i) { for (int c : nodes[i].shown) { order.push_back(c); walk(c); } };
+        std::function<void(int)> walk = [&](int i) { for (int c : nodes[i].shown) if (InTree(c, false)) { order.push_back(c); walk(c); } };
         if (!nodes.empty()) walk(0);
         return order;
     }
 
     bool Hit(int n) const { return !findText.empty() && Matches(nodes[n].text, findText, findRegex, findIsRegex); }
 
+    // Marked in a tree: the nodes found, or for those in a closed branch the node shown that holds them
+    std::vector<char> findHits, findMarks[2];
+    bool foundStale = true;
+    bool Found(int n, bool unused)
+    {
+        if (foundStale) MarkFound();
+        const auto& f = findMarks[unused ? 1 : 0];
+        return n >= 0 && n < static_cast<int>(f.size()) && f[n];
+    }
+    void MarkFound()
+    {
+        foundStale = false;
+        for (auto& f : findMarks) f.assign(nodes.size(), 0);
+        if (!ready || findText.empty()) return;
+        if (findHits.size() != nodes.size())     // (another folder read)
+        {
+            findHits.assign(nodes.size(), 0);
+            for (size_t n = 1; n < nodes.size(); n++) findHits[n] = Hit(static_cast<int>(n));
+        }
+        for (int t = 0; t < 2; t++)
+        {
+            HWND h = t ? unusedTree : tree;
+            auto itemOf = [&](int i) -> HTREEITEM { return t ? (i < static_cast<int>(unusedItem.size()) ? unusedItem[i] : nullptr) : nodes[i].item; };
+            auto open = [&](int i) { HTREEITEM it = itemOf(i); return it && (TreeView_GetItemState(h, it, TVIS_EXPANDED) & TVIS_EXPANDED); };
+            std::vector<int> chain;
+            for (size_t n = 1; n < nodes.size(); n++)
+            {
+                if (!findHits[n] || !InTree(static_cast<int>(n), t == 1)) continue;
+                int x = static_cast<int>(n);
+                while (x > 0 && nodes[x].shownParent < 0) x = nodes[x].parent;     // (left out by Compact: the one above)
+                chain.clear();
+                for (int a = x; a > 0; a = nodes[a].shownParent) chain.push_back(a);
+                std::reverse(chain.begin(), chain.end());
+                // From the top down, while the branch is open
+                int at = -1;
+                for (size_t k = 0; k < chain.size(); k++)
+                {
+                    if (!itemOf(chain[k])) break;
+                    at = chain[k];
+                    if (!open(chain[k])) break;
+                }
+                if (at > 0) findMarks[t][at] = 1;
+            }
+        }
+    }
+    void FoundAgain()
+    {
+        foundStale = true;
+        if (findText.empty()) return;
+        InvalidateRect(tree, nullptr, FALSE);
+        InvalidateRect(unusedTree, nullptr, FALSE);
+    }
+
     void FindChanged()
     {
         findText = TextOf(findBox);
         Compile(findText, findRegex, findIsRegex);
+        findHits.assign(nodes.size(), 0);
+        if (!findText.empty()) for (size_t n = 1; n < nodes.size(); n++) findHits[n] = Hit(static_cast<int>(n));
+        foundStale = true;
         InvalidateRect(tree, nullptr, TRUE);
+        InvalidateRect(unusedTree, nullptr, TRUE);
         if (!ready) return;
         if (findText.empty())
         {
@@ -8656,42 +10858,50 @@ private:
         CopyText(wnd, text);
     }
 
-    void TreeMenu(LPARAM lp)
+    void TreeMenu(LPARAM lp, bool unused)
     {
         if (!ready) return;
+        HWND t = unused ? unusedTree : tree;       // (the one clicked)
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         HTREEITEM item = nullptr;
         if (pt.x == -1 && pt.y == -1)
         {
-            item = TreeView_GetSelection(tree);
+            item = TreeView_GetSelection(t);
             RECT r = {};
-            if (item && TreeView_GetItemRect(tree, item, &r, TRUE)) { pt = { r.left, r.bottom }; ClientToScreen(tree, &pt); }
+            if (item && TreeView_GetItemRect(t, item, &r, TRUE)) { pt = { r.left, r.bottom }; ClientToScreen(t, &pt); }
         }
         else
         {
             TVHITTESTINFO hit = {};
             hit.pt = pt;
-            ScreenToClient(tree, &hit.pt);
-            item = TreeView_HitTest(tree, &hit);
-            if (item) TreeView_SelectItem(tree, item);
+            ScreenToClient(t, &hit.pt);
+            item = TreeView_HitTest(t, &hit);
+            if (item) TreeView_SelectItem(t, item);
         }
         if (!item) return;
         TVITEMW tv = { TVIF_PARAM };
         tv.hItem = item;
-        if (!TreeView_GetItem(tree, &tv)) return;
+        if (!TreeView_GetItem(t, &tv)) return;
         const int n = static_cast<int>(tv.lParam);
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, 1, nodes[n].files.size() == 1 ? L"Show in Explorer" : L"Show the files in Explorer");
-        AppendMenuW(menu, MF_STRING, 2, nodes[n].files.size() == 1 ? L"Copy the path" : L"Copy the paths of the files");
-        AppendMenuW(menu, MF_STRING, 3, L"Copy the full info");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (nodes[n].shown.empty() ? MF_GRAYED : 0), 4, L"Expand all under it");
-        AppendMenuW(menu, MF_STRING | (nodes[n].shown.empty() ? MF_GRAYED : 0), 5, L"Collapse all under it");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        const UINT busy = job ? MF_GRAYED : 0;
-        AppendMenuW(menu, MF_STRING | busy, 6, L"E&xport the images (PNG, animated GIF)...");
-        AppendMenuW(menu, MF_STRING | busy, 7, L"Export to &NIfTI...");
-        AppendMenuW(menu, MF_STRING | busy, 8, L"&Report (HTML)");
+        if (unused)
+            AppendMenuW(menu, MF_STRING, 10, L"Move back to the &tree");
+        else
+        {
+            AppendMenuW(menu, MF_STRING, 1, nodes[n].files.size() == 1 ? L"Show in Explorer" : L"Show the files in Explorer");
+            AppendMenuW(menu, MF_STRING, 2, nodes[n].files.size() == 1 ? L"Copy the path" : L"Copy the paths of the files");
+            AppendMenuW(menu, MF_STRING, 3, L"Copy the full info");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING | (nodes[n].shown.empty() ? MF_GRAYED : 0), 4, L"Expand all under it");
+            AppendMenuW(menu, MF_STRING | (nodes[n].shown.empty() ? MF_GRAYED : 0), 5, L"Collapse all under it");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            const UINT busy = job ? MF_GRAYED : 0;
+            AppendMenuW(menu, MF_STRING | busy, 6, L"E&xport the images (PNG, animated GIF)...");
+            AppendMenuW(menu, MF_STRING | busy, 7, L"Export to &NIfTI...");
+            AppendMenuW(menu, MF_STRING | busy, 8, L"&Report (HTML)");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, 9, L"Move to &unused");
+        }
         HidePopup();
         const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, wnd, nullptr);
         DestroyMenu(menu);
@@ -8705,6 +10915,8 @@ private:
         case 6: Export(n, false); break;
         case 7: Export(n, true); break;
         case 8: Report(n); break;
+        case 9: MoveUnused(n, true); break;
+        case 10: MoveUnused(n, false); break;
         }
     }
 
@@ -8713,6 +10925,13 @@ private:
     static LRESULT CALLBACK TreeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref)
     {
         auto self = reinterpret_cast<DicomExplorer*>(ref);
+        if (msg == WM_MOUSEMOVE || msg == WM_MOUSEHOVER)
+        {
+            if (self->hoverTree != h) { self->HidePopup(); self->hoverItem = nullptr; self->hoverArmed = false; }
+            self->hoverTree = h;
+        }
+        if (msg == WM_MOUSEMOVE) self->Mark(h, { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
+        if (msg == WM_MOUSELEAVE) { self->markTracking = false; self->Mark(nullptr, {}); }
         switch (msg)
         {
         case WM_MOUSEMOVE: self->HoverMove({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }); break;
@@ -8722,7 +10941,43 @@ private:
             self->HoverShow({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
             return 0;
         case WM_MOUSELEAVE: self->hoverArmed = false; self->hoverItem = nullptr; self->HidePopup(); break;
-        case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MOUSEWHEEL: case WM_VSCROLL: case WM_HSCROLL: case WM_KEYDOWN: case WM_KILLFOCUS:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
+        {
+            // A check box: ours (what the navigator draws, for everything under the node), not the tree's
+            self->HidePopup();
+            TVHITTESTINFO hit = {};
+            hit.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            HTREEITEM item = TreeView_HitTest(h, &hit);
+            if (item && h == self->tree && (hit.flags & TVHT_ONITEMSTATEICON))
+            {
+                TVITEMW tv = { TVIF_PARAM };
+                tv.hItem = item;
+                if (msg == WM_LBUTTONDOWN && TreeView_GetItem(h, &tv)) self->Toggle(static_cast<int>(tv.lParam));
+                return 0;
+            }
+            break;
+        }
+        case WM_KEYDOWN:
+            self->HidePopup();
+            if (wp == VK_SPACE && h == self->tree) { self->Toggle(self->selected); return 0; }
+            break;
+        case WM_CHAR:
+            if (wp == L' ' && h == self->tree) return 0;
+            break;
+        case WM_MBUTTONDOWN:
+        {
+            // The middle button on a node: to the other tree (used / unused)
+            self->HidePopup();
+            TVHITTESTINFO hit = {};
+            hit.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            HTREEITEM item = TreeView_HitTest(h, &hit);
+            TVITEMW tv = { TVIF_PARAM };
+            tv.hItem = item;
+            if (item && (hit.flags & TVHT_ONITEM) && TreeView_GetItem(h, &tv)) self->MoveUnused(static_cast<int>(tv.lParam), h == self->tree);
+            return 0;
+        }
+        case WM_RBUTTONDOWN: case WM_MOUSEWHEEL: case WM_VSCROLL: case WM_HSCROLL: case WM_KILLFOCUS:
             self->HidePopup();
             break;
         case WM_NCDESTROY: RemoveWindowSubclass(h, TreeProc, 1); break;
@@ -8734,12 +10989,13 @@ private:
     {
         TVHITTESTINFO hit = {};
         hit.pt = pt;
-        HTREEITEM item = TreeView_HitTest(tree, &hit);
+        HWND t = hoverTree ? hoverTree : tree;
+        HTREEITEM item = TreeView_HitTest(t, &hit);
         if (!item || !(hit.flags & TVHT_ONITEM)) return -1;
         if (where) *where = item;
         TVITEMW tv = { TVIF_PARAM };
         tv.hItem = item;
-        return TreeView_GetItem(tree, &tv) ? static_cast<int>(tv.lParam) : -1;
+        return TreeView_GetItem(t, &tv) ? static_cast<int>(tv.lParam) : -1;
     }
 
     // The mouse on another node: the thumbnail goes, and comes back if it stays still there for a moment
@@ -8756,7 +11012,7 @@ private:
         }
         if (!hoverArmed && item && (!popup || !IsWindowVisible(popup)))
         {
-            TRACKMOUSEEVENT t = { sizeof(t), TME_HOVER | TME_LEAVE, tree, 450 };
+            TRACKMOUSEEVENT t = { sizeof(t), TME_HOVER | TME_LEAVE, hoverTree ? hoverTree : tree, 450 };
             hoverArmed = TrackMouseEvent(&t) != FALSE;
         }
     }
@@ -8918,9 +11174,10 @@ private:
         ReleaseDC(popup, dc);
         const int w = (std::max)(iw, static_cast<int>(text.right)) + 2 * m + 2, h = ih + (ih ? m : 0) + text.bottom + 2 * m + 2;
         RECT r = {};
-        TreeView_GetItemRect(tree, hoverItem, &r, TRUE);
+        HWND under = hoverTree ? hoverTree : tree;
+        TreeView_GetItemRect(under, hoverItem, &r, TRUE);
         POINT at = { r.right + Px(16), r.top };
-        ClientToScreen(tree, &at);
+        ClientToScreen(under, &at);
         POINT cursor;
         GetCursorPos(&cursor);
         at.x = (std::max)(at.x, cursor.x + Px(24));
@@ -9701,14 +11958,20 @@ private:
 
     LRESULT Notify(NMHDR* h)
     {
-        if (h->hwndFrom == tree)
+        if (h->hwndFrom == tree || h->hwndFrom == unusedTree)
         {
+            const bool unused = h->hwndFrom == unusedTree;
             switch (h->code)
             {
             case TVN_ITEMEXPANDINGW:
             {
                 auto tv = reinterpret_cast<NMTREEVIEWW*>(h);
-                if (tv->action & TVE_EXPAND) Insert(static_cast<int>(tv->itemNew.lParam));
+                if (tv->action & TVE_EXPAND)
+                {
+                    if (unused) InsertUnused(static_cast<int>(tv->itemNew.lParam));
+                    else Insert(static_cast<int>(tv->itemNew.lParam));
+                }
+                FoundAgain();
                 return FALSE;
             }
             case TVN_SELCHANGEDW:
@@ -9733,13 +11996,18 @@ private:
                     if (!(cd->nmcd.uItemState & CDIS_SELECTED))
                     {
                         cd->clrText = LevelColor(static_cast<int>(nodes[n].level));
-                        if (Hit(n)) cd->clrTextBk = RGB(255, 236, 110);
+                        if (n < static_cast<int>(derivedCount.size()) && derivedCount[n] > 0 && derivedCount[n] < nodes[n].files.size())
+                            cd->clrTextBk = RGB(228, 228, 228);     // (derived and original images under it)
+                        if (Found(n, unused)) cd->clrTextBk = RGB(255, 236, 110);
                     }
                     // (the nodes of the plane under the mouse in the navigator: a black frame around them, after)
-                    const LRESULT post = std::find(lit.begin(), lit.end(), n) != lit.end() ? CDRF_NOTIFYPOSTPAINT : 0;
-                    if (nodes[n].level == Level::Series || nodes[n].level == Level::Patient)
+                    const LRESULT post = !unused && std::find(lit.begin(), lit.end(), n) != lit.end() ? CDRF_NOTIFYPOSTPAINT : 0;
+                    // (bold: series and patients; all of it derived: italic, and not bold)
+                    const bool italic = n < static_cast<int>(derivedCount.size()) && derivedCount[n] > 0 && derivedCount[n] == nodes[n].files.size();
+                    const bool bold = !italic && (nodes[n].level == Level::Series || nodes[n].level == Level::Patient);
+                    if (bold || italic)
                     {
-                        SelectObject(cd->nmcd.hdc, boldFont);
+                        SelectObject(cd->nmcd.hdc, bold ? (italic ? boldItalicFont : boldFont) : italicFont);
                         return CDRF_NEWFONT | post;
                     }
                     return CDRF_DODEFAULT | post;
@@ -9771,14 +12039,23 @@ private:
                 cd->clrText = ProblemColor;
             return CDRF_DODEFAULT;
         }
+        if (h->hwndFrom == full && h->code == NM_DBLCLK)
+        {
+            const int row = reinterpret_cast<NMITEMACTIVATE*>(h)->iItem;
+            if (row >= 0) PlotRow(row);
+            return 0;
+        }
         if (h->hwndFrom == full && h->code == NM_CUSTOMDRAW)
         {
             auto cd = reinterpret_cast<NMLVCUSTOMDRAW*>(h);
             if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
-            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
+            if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+            if (cd->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM))
             {
                 const int kind = static_cast<int>(cd->nmcd.lItemlParam);
                 cd->clrText = kind == 100 ? RGB(110, 110, 110) : LevelColor(kind);
+                // (the Tag column folded: its text not seen - it is still copied)
+                if (cd->iSubItem == 0 && !tagOpen) cd->clrText = cd->clrTextBk = GetSysColor(COLOR_WINDOW);
                 return CDRF_DODEFAULT;
             }
         }
@@ -9788,6 +12065,7 @@ private:
     Split SplitAt(POINT pt) const
     {
         if (PtInRect(&treeSplit, pt)) return Split::Tree;
+        if (PtInRect(&unusedSplit, pt)) return Split::Unused;
         if (PtInRect(&infoSplit, pt)) return Split::Info;
         if (PtInRect(&topSplit, pt)) return Split::Top;
         return Split::None;
@@ -9796,11 +12074,14 @@ private:
     void DragTo(POINT pt)
     {
         const UINT dpi = GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96;
-        RECT treeRect = {};
-        GetWindowRect(tree, &treeRect);
-        MapWindowPoints(nullptr, wnd, reinterpret_cast<POINT*>(&treeRect), 2);
+        const RECT& treeRect = trees;               // (both trees)
         if (split == Split::Tree) treeWidth = MulDiv(pt.x - treeRect.left, 96, dpi);
         else if (split == Split::Info) infoWidth = MulDiv(pt.x - treeSplit.right, 96, dpi);
+        else if (split == Split::Unused)
+        {
+            const int h = treeRect.bottom - treeRect.top - Px(6) - Px(25);
+            if (h > 0) unusedShare = (std::max)(50, (std::min)(900, static_cast<int>(static_cast<long long>(treeRect.bottom - pt.y - Px(25)) * 1000 / h)));
+        }
         else if (split == Split::Top)
         {
             const int h = treeRect.bottom - treeRect.top - Px(6) - Px(25);
@@ -9892,6 +12173,19 @@ private:
                 if (on && self->selected > 0) self->Navigate(self->selected);
                 return 0;
             }
+            case IdSegments:
+                self->showSegments = Button_GetCheck(self->segBox) == BST_CHECKED;
+                WriteSetting(L"Segmentations", self->showSegments ? 1 : 0);
+                self->Segments();
+                return 0;
+            case IdRefLines:
+                self->refLines = Button_GetCheck(self->refBox) == BST_CHECKED;
+                WriteSetting(L"ReferenceLines", self->refLines ? 1 : 0);
+                self->Guides(-1);
+                return 0;
+            case IdOverlay:
+                if (self->preview) self->preview->SetOverlay(Button_GetCheck(self->overlayBox) == BST_CHECKED);
+                return 0;
             case IdCompact:
                 self->compact = Button_GetCheck(self->compactBox) == BST_CHECKED;
                 WriteSetting(L"Compact", self->compact ? 1 : 0);
@@ -9914,7 +12208,9 @@ private:
             if (self) return self->Notify(reinterpret_cast<NMHDR*>(lp));
             break;
         case WM_CONTEXTMENU:
-            if (self && reinterpret_cast<HWND>(wp) == self->tree) { self->TreeMenu(lp); return 0; }
+            if (self && reinterpret_cast<HWND>(wp) == self->full) { self->FullMenu(lp); return 0; }
+            if (self && reinterpret_cast<HWND>(wp) == self->tree) { self->TreeMenu(lp, false); return 0; }
+            if (self && reinterpret_cast<HWND>(wp) == self->unusedTree) { self->TreeMenu(lp, true); return 0; }
             break;
         case WM_CTLCOLORSTATIC:
             SetBkColor(reinterpret_cast<HDC>(wp), GetSysColor(COLOR_WINDOW));
@@ -9926,7 +12222,7 @@ private:
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
                 const Split s = self->SplitAt(pt);
-                if (s != Split::None) { SetCursor(LoadCursor(nullptr, s == Split::Top ? IDC_SIZENS : IDC_SIZEWE)); return TRUE; }
+                if (s != Split::None) { SetCursor(LoadCursor(nullptr, s == Split::Top || s == Split::Unused ? IDC_SIZENS : IDC_SIZEWE)); return TRUE; }
             }
             break;
         case WM_LBUTTONDOWN:
