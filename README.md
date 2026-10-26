@@ -119,7 +119,13 @@ tree** opens the whole folder tree with one color per study.
   The *Overlay* check box of that bar (remembered) writes on the image what viewers show in its
   corners, never who the patient is: modality, series, description and image number; date and time,
   device and protocol; Z level, slice thickness, pixel spacing and size; the window and zoom; and the
-  patient directions at the sides (R/L, A/P, H/F, from ImageOrientationPatient).
+  patient directions at the sides (R/L, A/P, H/F, from ImageOrientationPatient). With it too, the
+  **overlay planes** of the image (groups 60xx: annotations, ROIs, CAD marks, labels the device or a
+  workstation drew), whether they come in their own OverlayData or hidden in the high bits of the
+  pixels, the first one in magenta and the others in colors of their own; the info of an image in the
+  DICOM explorer says which planes it has. A file broken in a way that makes reading its planes fail is
+  shown without them. ACR-NEMA files (the format before DICOM) without the attributes DICOM asks for
+  are read as DCMTK reads them.
 
   A **DICOMDIR** opens on a *Directory* tab: its patients (by ID, never by name), studies, series (by
   number, with how many files) and files. Choosing a file shows it under the tree, with the slider
@@ -196,7 +202,9 @@ tree** opens the whole folder tree with one color per study.
     image of their study is shown; the frames of a SEG are matched to the image by their planes. In the tree, the images
     with a segmentation in their plane say `seg`, the nodes above them how many (`(97 segmented)`), and
     their check boxes are green. A SEG or a structure set is seen only with the images in the folder
-    opened: open the folder of the whole study.
+    opened: open the folder of the whole study. The same with the **overlay planes**: the images that
+    have them say `overlay`, the nodes above them how many (`(62 with overlays)`), and their check
+    boxes are magenta (half green, half magenta when they have both). *Find* `overlay` goes to them.
   - **Series kind** (experimental): each series says what kind it looks to be, in the tree (`«cine short
     axis»`), in the info of the node, and as a column of the files in Explorer (below).
   - **Derived images** (ImageType DERIVED: reformats, maps, MIPs...) are in italic (and not in bold) in the tree, and a
@@ -220,8 +228,9 @@ tree** opens the whole folder tree with one color per study.
     address and phone are hidden (*Hide patient identity*, on by default).
   - **Navigator** (*Navigator*, off by default, remembered), as `DCMexplorer( ... , 'nav' )` (mTools): at
     the right of the full info, the images as planes where they are in the patient, in 3-D. Those of
-    the chosen node in red, the rest of its study in gray (the coordinates of the patient are those of
-    a study), the images of one position as one plane; when the node is one plane, its image is drawn
+    the chosen node in red, everything else whose check box is on in gray, of all the patients (the
+    coordinates of the patient are those of each study: other studies are where their scanner put them;
+    turn off in the tree what you do not want to see), the images of one position as one plane; when the node is one plane, its image is drawn
     on it; while the cine or the jumps go, the image shown is drawn on its plane. The mouse over a plane
     (its outline, or the image drawn on it) outlines it in blue, frames in black in the tree the images
     in it (or, in a closed branch, the node that holds them), and says which they are. The other way
@@ -234,6 +243,8 @@ tree** opens the whole folder tree with one color per study.
     of it looks from that side (its face: from the front, its head: from above...). Drag to rotate,
     right-drag up and down (or the wheel) to zoom, Shift+drag (or the middle button) to move, double click
     to start again.
+  - The **wheel** acts on the panel under the mouse (the trees, the lists, the image, the navigator),
+    not on the one with the focus.
   - *Find* (under the trees): text or a regular expression over the lines of the trees; the nodes found
     are marked in both, and for those in a closed branch, the node shown that holds them. Enter or F3
     goes to the next one in the tree (Shift+F3 the previous one).

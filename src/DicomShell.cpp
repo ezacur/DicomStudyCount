@@ -1719,6 +1719,9 @@ struct Imaging
     bool mono = false;
     std::vector<DWORD> color;
     double center = 127.5, width = 255, center0 = 127.5, width0 = 255, low = 0, high = 255;
+    // Overlay planes of the frame (60xx: in OverlayData, or in the high bits of the pixels), as one of
+    // its size: 0 nothing, k the plane k - 1 (empty: none)
+    std::vector<Uint8> planes;
 };
 
 // A record of a DICOMDIR (patient, study, series, image...): its line in the tree, the file it refers
@@ -2489,6 +2492,36 @@ static std::vector<DirNode> ReadDirectory(DcmDataset* ds)
 // One frame of the file into the pixels, by a DicomImage of its own (a JPEG 2000 one decoded first by
 // OpenJPEG). Its window: the one of the header, or the range of the pixels; `keep`: the one in use, as
 // the frames change. An empty string if it is shown; if not, why (and no pixels).
+// The overlay planes of an image into a map of its size (0 nothing, k the plane k - 1): false if it has
+// none, or if reading them fails - files broken in odd ways make DCMTK read out of bounds here, and
+// then the image is shown without them (no C++ objects in this function: it is guarded as Windows does)
+static bool OverlayPlanes(DicomImage* image, Uint8* planes, int w, int h)
+{
+    bool any = false;
+    __try
+    {
+        for (unsigned int p = 0; p < image->getOverlayCount(0) && p < 16; p++)
+        {
+            unsigned int left = 0, top = 0, pw = 0, ph = 0;
+            EM_Overlay mode = EMO_Default;
+            const Uint8* bits = static_cast<const Uint8*>(image->getOverlayData(p, left, top, pw, ph, mode, 0, 8, 0xff, 0, 0));
+            if (!bits || pw > 65535 || ph > 65535) continue;
+            for (unsigned int y = 0; y < ph; y++)
+                for (unsigned int x = 0; x < pw; x++)
+                {
+                    const unsigned int px = left + x, py = top + y;
+                    if (bits[static_cast<size_t>(y) * pw + x] && px < static_cast<unsigned int>(w) && py < static_cast<unsigned int>(h))
+                    {
+                        planes[static_cast<size_t>(py) * w + px] = static_cast<Uint8>(p + 1);
+                        any = true;
+                    }
+                }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return any;
+}
+
 static std::wstring ShowFrame(Rendered& r, int frame, bool keep)
 {
     Imaging* im = r.imaging.get();
@@ -2531,6 +2564,12 @@ static std::wstring ShowFrame(Rendered& r, int frame, bool keep)
     im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
                                              decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData,
                                              decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    // (an ACR-NEMA file, without the attributes DICOM asks for - PhotometricInterpretation...: again, as
+    // DCMTK reads those)
+    if (im->image->getStatus() == EIS_MissingAttribute)
+        im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
+                                                 decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData | CIF_AcrNemaCompatibility,
+                                                 decoded ? 0 : static_cast<unsigned long>(frame), 1);
     DicomImage& image = *im->image;
     if (image.getStatus() != EIS_Normal)
     {
@@ -2581,6 +2620,13 @@ static std::wstring ShowFrame(Rendered& r, int frame, bool keep)
     }
     r.width = w;
     r.height = h;
+    // The overlay planes (monochrome images only: DCMTK reads them with the pixels)
+    im->planes.clear();
+    if (im->mono && image.getOverlayCount(0) > 0)
+    {
+        im->planes.assign(static_cast<size_t>(w) * h, 0);
+        if (!OverlayPlanes(&image, im->planes.data(), w, h)) im->planes.clear();
+    }
     Rewindow(r);
     return std::wstring();
 }
@@ -4045,6 +4091,37 @@ private:
                 SelectObject(dc, before);
                 DeleteObject(dashed);
                 RestoreDC(dc, saved);
+            }
+            // The overlay planes of the image (with the overlay): magenta, the others in colors of their own
+            if (overlay && view.imaging && !view.imaging->planes.empty() && view.imaging->planes.size() == static_cast<size_t>(view.width) * view.height)
+            {
+                static const DWORD colors[4] = { 0xFFFF00FF, 0xFFFFD000, 0xFF00E0FF, 0xFF40FF40 };      // (0xAARRGGBB)
+                std::vector<DWORD> argb(view.imaging->planes.size(), 0);
+                for (size_t i = 0; i < argb.size(); i++)
+                    if (const Uint8 p = view.imaging->planes[i]) argb[i] = colors[(p - 1) % 4];
+                BITMAPINFO pbi = {};
+                pbi.bmiHeader.biSize = sizeof(pbi.bmiHeader);
+                pbi.bmiHeader.biWidth = view.width;
+                pbi.bmiHeader.biHeight = -view.height;
+                pbi.bmiHeader.biPlanes = 1;
+                pbi.bmiHeader.biBitCount = 32;
+                void* bits = nullptr;
+                if (HBITMAP planes = CreateDIBSection(dc, &pbi, DIB_RGB_COLORS, &bits, nullptr, 0))
+                {
+                    if (bits) memcpy(bits, argb.data(), argb.size() * sizeof(DWORD));
+                    HDC src = CreateCompatibleDC(dc);
+                    HGDIOBJ kept = SelectObject(src, planes);
+                    const int saved = SaveDC(dc);
+                    IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
+                    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+                    AlphaBlend(dc, static_cast<int>(std::lround(left)), static_cast<int>(std::lround(top)),
+                               static_cast<int>(std::lround(view.width * scale)), static_cast<int>(std::lround(view.height * scale)),
+                               src, 0, 0, view.width, view.height, blend);
+                    RestoreDC(dc, saved);
+                    SelectObject(src, kept);
+                    DeleteDC(src);
+                    DeleteObject(planes);
+                }
             }
             // The overlay, on the part of the image in sight
             RECT shown = { static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top)),
@@ -5641,8 +5718,13 @@ static std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored
         return std::wstring();
     }
     const unsigned long flags = CIF_UsePartialAccessToPixelData | (stored ? CIF_IgnoreModalityTransformation : 0);
-    DicomImage image(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer, flags,
-                     decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    std::unique_ptr<DicomImage> made = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
+                                                                    decoded ? EXS_LittleEndianExplicit : xfer, flags,
+                                                                    decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    if (made->getStatus() == EIS_MissingAttribute)     // (ACR-NEMA: as DCMTK reads it)
+        made = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer,
+                                            flags | CIF_AcrNemaCompatibility, decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    DicomImage& image = *made;
     if (image.getStatus() != EIS_Normal)
     {
         DcmXfer x(xfer);
@@ -8037,7 +8119,8 @@ private:
     std::vector<NavPlane> navPlanes;
     std::vector<int> filePlane;                     // the plane of each file (-1: none, without a position)
     bool planesMade = false;
-    int navigated = -1;                             // the planes the navigator shows: of this node (a study, mostly)
+    int navigated = -1;                             // the planes the navigator shows: of this node (all, 0)
+    int navPatient = -1;                            // and the patient of the node chosen (another one: framed again)
     std::vector<int> navScene;                      // the plane of each one it draws
     std::vector<int> navSceneOf;                    // and where each plane is among them (-1: not drawn)
     int currentFile = -1;                           // the file the image panel shows (-1: a thumbnail, or none)
@@ -8048,6 +8131,7 @@ private:
     bool showSegments = true;                       // segmentations (SEG, RT Structure Sets) over the images
     std::vector<Overlay> overlays;                  // those in the folder (read when an image of their study is shown)
     std::vector<size_t> segmentedCount;             // each node: how many of its images have a segmentation in their plane
+    std::vector<size_t> overlayCount;               // and how many have overlay planes (60xx) of their own
     std::vector<char> fileDerived;                  // each file: a derived image (ImageType DERIVED), not an original one
     std::vector<Uint32> fileFrame;                  // and its frame of reference (an id of the pool, +1; 0: none)
     std::vector<size_t> derivedCount;               // each node: how many of its files are derived
@@ -8428,11 +8512,13 @@ private:
         filePlane.clear();
         planesMade = false;
         navigated = -1;
+        navPatient = -1;
         navigator.Clear();
         navScene.clear();
         lit.clear();
         overlays.clear();
         segmentedCount.clear();
+        overlayCount.clear();
         fileOn.clear();
         onCount.clear();
         nodes.clear();
@@ -8475,6 +8561,7 @@ private:
             overlays.push_back(std::move(o));
         }
         MarkSegmented();
+        MarkOverlays();
         derivedCount.assign(nodes.size(), 0);
         for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) derivedCount[i] += fileDerived[f];
         onCount.resize(nodes.size());
@@ -9048,6 +9135,8 @@ private:
         std::wstring s = Plain(i);
         if (i < static_cast<int>(segmentedCount.size()) && segmentedCount[i])
             s += nodes[i].level == Level::Image ? std::wstring(L"   seg") : L"   (" + std::to_wstring(segmentedCount[i]) + L" segmented)";
+        if (i < static_cast<int>(overlayCount.size()) && overlayCount[i])
+            s += nodes[i].level == Level::Image ? std::wstring(L"   overlay") : L"   (" + std::to_wstring(overlayCount[i]) + L" with overlays)";
         const auto& flags = nodes[i].flags;
         for (size_t k = 0; k < flags.size(); k++) s += (k ? L", " : L"   \u26A0 ") + flags[k];
         return s;
@@ -9550,15 +9639,16 @@ private:
         for (int& p : filePlane) if (p >= 0) p = to[p];
     }
 
-    // The navigator on a node: the planes of its study (the coordinates of the patient are of a study:
-    // another one has others), its own in red; on its plane its image, if it has one plane
+    // The navigator on a node: the planes of everything whose check box is on, of all the patients (each
+    // study has coordinates of its own, so those of others are where their scanner put them: turn off what
+    // is not wanted), its own in red; on its plane its image, if it has one plane
     void Navigate(int n)
     {
         if (!navigator.Visible() || !ready || n <= 0 || n >= static_cast<int>(nodes.size())) return;
         MakePlanes();
-        int context = n;
-        while (context > 0 && nodes[context].level > Level::Study) context = nodes[context].parent;
-        if (context <= 0) context = n;
+        const int context = 0;
+        int patient = n;
+        while (patient > 0 && nodes[patient].level > Level::Patient) patient = nodes[patient].parent;
         std::vector<int> mine, around;
         std::vector<char> seen(navPlanes.size(), 0);
         for (int f : nodes[n].files)
@@ -9613,37 +9703,42 @@ private:
         else
         {
             wchar_t b[200];
-            if (context == n) swprintf_s(b, L"%zu plane%s", red, red == 1 ? L"" : L"s");
-            else swprintf_s(b, L"%zu plane%s in red, of %zu in its study", red, red == 1 ? L"" : L"s", total);
+            if (total == red) swprintf_s(b, L"%zu plane%s", red, red == 1 ? L"" : L"s");
+            else swprintf_s(b, L"%zu plane%s in red, of %zu turned on", red, red == 1 ? L"" : L"s", total);
             more = b;
             if (total > most) more += L" (" + std::to_wstring(most) + L" of them drawn)";
         }
-        if (usedCount[n] == 0) more = L"Put aside in the unused tree: not drawn here" + (total ? L"  (" + std::to_wstring(total) + L" planes of its study)" : std::wstring());
-        navigator.Set(std::move(scene), std::move(hot), on, std::move(picture), nodes[n].text, more, context != navigated);
+        if (usedCount[n] == 0) more = L"Put aside in the unused tree: not drawn here" + (total ? L"  (" + std::to_wstring(total) + L" planes turned on)" : std::wstring());
+        navigator.Set(std::move(scene), std::move(hot), on, std::move(picture), nodes[n].text, more, patient != navPatient);
         navigated = context;
+        navPatient = patient;
     }
 
     // The check box of a node: 1 off, 2 on, 3 some of it on (its files drawn in the navigator, or not)
-    // Its image in the tree: the same box in green when images under it have segmentations (4 to 6)
+    // Its image in the tree: the same box in green when images under it have segmentations (4 to 6), in
+    // magenta when they have overlay planes (7 to 9), half and half when both (10 to 12)
     int StateOf(int n) const
     {
         const bool segmented = n >= 0 && n < static_cast<int>(segmentedCount.size()) && segmentedCount[n] > 0;
-        return CheckOf(n) + (segmented ? 3 : 0);
+        const bool overlaid = n >= 0 && n < static_cast<int>(overlayCount.size()) && overlayCount[n] > 0;
+        return CheckOf(n) + 3 * ((segmented ? 1 : 0) + (overlaid ? 2 : 0));
     }
 
-    // The images of the check boxes of the tree: off, on and partly on, plain and green (segmented)
+    // The images of the check boxes of the tree: off, on and partly on; plain, green (segmented), magenta
+    // (overlay planes) and both
     void CheckImages()
     {
         HIMAGELIST before = TreeView_GetImageList(tree, TVSIL_STATE);
         int size = 0, ignore = 0;
         if (!before || !ImageList_GetIconSize(before, &size, &ignore) || size <= 0) size = Px(16);
-        HIMAGELIST list = ImageList_Create(size, size, ILC_COLOR32, 7, 0);
+        HIMAGELIST list = ImageList_Create(size, size, ILC_COLOR32, 13, 0);
         if (!list) return;
         HTHEME theme = OpenThemeData(tree, L"BUTTON");
         HDC screen = GetDC(tree);
         const COLORREF back = GetSysColor(COLOR_WINDOW);
         const DWORD tint = 0xAAE6AA;                // (light green, 0xRRGGBB as the bits of the DIB)
-        for (int k = 0; k < 7; k++)
+        const DWORD pink = 0xF0BEF0;                // (light magenta)
+        for (int k = 0; k < 13; k++)
         {
             BITMAPINFO bi = {};
             bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
@@ -9671,18 +9766,23 @@ private:
                     DrawThemeBackground(theme, dc, BP_CHECKBOX, kind == 0 ? CBS_UNCHECKEDNORMAL : kind == 1 ? CBS_CHECKEDNORMAL : CBS_MIXEDNORMAL, &box, nullptr);
                 else
                     DrawFrameControl(dc, &box, DFC_BUTTON, DFCS_BUTTONCHECK | (kind == 1 ? DFCS_CHECKED : 0));
-                // Segmented: the box green (its blue green, an empty one light green inside)
-                if (k >= 4)
+                // Segmented: the box green (its blue green, an empty one light green inside); with overlay
+                // planes: magenta (its blue magenta, an empty one light magenta); both: its left half green,
+                // its right half magenta
+                const int marks = (k - 1) / 3;          // (0 plain, 1 segmented, 2 overlays, 3 both)
+                if (marks > 0)
                 {
                     GdiFlush();
                     DWORD* px = static_cast<DWORD*>(bits);
+                    const int middle = (box.left + box.right) / 2;
                     for (int y = box.top + 1; y < box.bottom - 1; y++)
                         for (int x = box.left + 1; x < box.right - 1; x++)
                         {
+                            const bool green = marks == 1 || (marks == 3 && x < middle);
                             DWORD& p = px[static_cast<size_t>(y) * size + x];
                             const int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
-                            if (b > r + 30 && b > g) p = (r << 16) | (b << 8) | g;     // (blue: green)
-                            else if (r > 200 && g > 200 && b > 200 && kind == 0) p = tint;     // (an empty box: light green)
+                            if (b > r + 30 && b > g) p = green ? (r << 16) | (b << 8) | g : (b << 16) | (g << 8) | b;     // (blue: green, magenta)
+                            else if (r > 200 && g > 200 && b > 200 && kind == 0) p = green ? tint : pink;     // (an empty box: light)
                         }
                 }
             }
@@ -9891,6 +9991,20 @@ private:
         for (size_t i = 0; i < nodes.size(); i++) if (segmentedCount[i]) nodes[i].text = Label(static_cast<int>(i));
     }
 
+    // The images with overlay planes (an OverlayRows, 60xx,0010, in their header), marked in the tree
+    void MarkOverlays()
+    {
+        overlayCount.assign(nodes.size(), 0);
+        std::vector<char> with(data->files.size(), 0);
+        bool any = false;
+        for (size_t f = 0; f < data->files.size(); f++)
+            for (Uint32 group = 0x6000; group <= 0x601E && !with[f]; group += 2)
+                if (Find(data->files[f].attributes, (group << 16) | 0x0010)) { with[f] = 1; any = true; }
+        if (!any) return;
+        for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) overlayCount[i] += with[f];
+        for (size_t i = 0; i < nodes.size(); i++) if (overlayCount[i]) nodes[i].text = Label(static_cast<int>(i));
+    }
+
     // The segmentations of the study of the image shown, over it (the masks of the SEG frames in its plane, the
     // contours of the structure sets in its plane) and in the navigator (all the contours)
     void Segments()
@@ -10078,7 +10192,7 @@ private:
     // A double click on a plane of the navigator: its first image (by instance number) chosen in the tree
     void Pick(int i)
     {
-        if (i < 0 || i >= static_cast<int>(navScene.size()) || navigated <= 0) return;
+        if (i < 0 || i >= static_cast<int>(navScene.size()) || navigated < 0) return;
         const int p = navScene[i];
         int best = -1;
         long bestNumber = 0;
@@ -10103,7 +10217,7 @@ private:
     {
         if (lit.empty() && i < 0) return;
         lit.clear();
-        if (i >= 0 && i < static_cast<int>(navScene.size()) && navigated > 0)
+        if (i >= 0 && i < static_cast<int>(navScene.size()) && navigated >= 0)
         {
             const int p = navScene[i];
             size_t images = 0;
@@ -10279,6 +10393,12 @@ private:
             row(L"SOP instance UID", value(0x00080018));
             row(L"Object", ObjectType(Narrow(value(0x00080016))));
             row(L"Compression", Compression(Narrow(value(0x00020010))));
+            {
+                std::wstring planes;
+                for (Uint32 group = 0x6000; group <= 0x601E; group += 2)
+                    if (AttributeOf(node.files[0], (group << 16) | 0x0010)) { wchar_t b[8]; swprintf_s(b, L"%04X", group); planes += (planes.empty() ? L"" : L", ") + std::wstring(b); }
+                row(L"Overlay planes", planes);
+            }
             swprintf_s(buffer, L"%u x %u", g.columns, g.rows);
             row(L"Columns x rows", buffer);
             if (g.frame >= 0) row(L"Frame", std::to_wstring(g.frame + 1) + L" of the enhanced file");
@@ -12290,6 +12410,13 @@ extern "C" void CALLBACK ExploreW(HWND, HINSTANCE, LPWSTR line, int show)
             MSG m;
             while (GetMessageW(&m, nullptr, 0, 0) > 0)
             {
+                // The wheel to the panel under the mouse, not to the one with the focus
+                if (m.message == WM_MOUSEWHEEL || m.message == WM_MOUSEHWHEEL)
+                {
+                    const POINT at = { GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam) };
+                    HWND under = WindowFromPoint(at);
+                    if (under && under != m.hwnd && GetWindowThreadProcessId(under, nullptr) == GetCurrentThreadId()) m.hwnd = under;
+                }
                 if (explorer.PreTranslate(m)) continue;
                 TranslateMessage(&m);
                 DispatchMessageW(&m);
