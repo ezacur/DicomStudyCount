@@ -6446,7 +6446,7 @@ private:
 
     // ----- the navigator (DCMexplorer_navigator.m): a window of its own with the images as planes where
     // they are in the patient, in 3-D (orthographic); those of the node chosen in red, and the image itself
-    // on its plane when they are one plane. Drag: rotate; right drag: move; wheel: zoom; double click: again.
+    // on its plane when they are one plane. Drag: rotate; right drag (or the wheel): zoom; Shift+drag (or the middle button): move; double click: again.
 
     // An image in the patient (mm, DICOM's LPS): its corners, at the edges of its pixels
     struct NavPlane { float p[4][3]; };             // top left, top right, bottom left, bottom right
@@ -6540,7 +6540,7 @@ private:
         double center[3] = {}, radius = 1, zoom = 1, panX = 0, panY = 0;
         double azimuth = -37.5, elevation = 30;     // (degrees, view(3) of MATLAB)
         POINT last = {}, down = {};                 // (where the mouse is, and where it was pressed)
-        bool rotating = false, moving = false;
+        bool rotating = false, moving = false, zooming = false;
         bool shown = false;
         std::vector<POINT> corners;                 // of the planes in the window, as last drawn (4 each)
         int hover = -1;                             // the plane under the mouse
@@ -6803,7 +6803,7 @@ private:
             }
             SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
             RECT bottom = { Px(16) + (std::max)(Px(48), (std::min)(Px(120), (std::min)(w, h) / 3)), h - Px(24), w - Px(8), h - Px(4) };
-            DrawTextW(dc, L"drag: rotate   click the figure: from that side   right drag: move   wheel: zoom", -1, &bottom, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawTextW(dc, L"drag: rotate   click the figure: from that side   right drag or wheel: zoom   Shift+drag: move", -1, &bottom, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
             BitBlt(target, 0, 0, w, h, dc, 0, 0, SRCCOPY);
             SelectObject(dc, oldFont);
             SelectObject(dc, oldCanvas);
@@ -6836,9 +6836,12 @@ private:
                 return 0;
             case WM_LBUTTONDOWN:
             case WM_RBUTTONDOWN:
+            case WM_MBUTTONDOWN:
                 if (!self) break;
-                self->rotating = msg == WM_LBUTTONDOWN;
-                self->moving = msg == WM_RBUTTONDOWN;
+                // Left: rotate (with Shift: move); right: zoom (up: in); middle: move
+                self->moving = msg == WM_MBUTTONDOWN || (msg == WM_LBUTTONDOWN && (wp & MK_SHIFT));
+                self->rotating = msg == WM_LBUTTONDOWN && !self->moving;
+                self->zooming = msg == WM_RBUTTONDOWN;
                 self->last = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 SetFocus(hwnd);
                 self->down = self->last;
@@ -6846,7 +6849,7 @@ private:
                 SetCapture(hwnd);
                 return 0;
             case WM_MOUSEMOVE:
-                if (self && (self->rotating || self->moving))
+                if (self && (self->rotating || self->moving || self->zooming))
                 {
                     const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), dx = x - self->last.x, dy = y - self->last.y;
                     self->last = { x, y };
@@ -6855,6 +6858,7 @@ private:
                         self->azimuth = std::fmod(self->azimuth - dx * 0.5, 360.0);
                         self->elevation = (std::max)(-90.0, (std::min)(90.0, self->elevation + dy * 0.5));
                     }
+                    else if (self->zooming) self->zoom = (std::max)(0.05, (std::min)(200.0, self->zoom * std::pow(1.01, -dy)));
                     else { self->panX += dx; self->panY += dy; }
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
@@ -6873,7 +6877,8 @@ private:
                 return 0;
             case WM_LBUTTONUP:
             case WM_RBUTTONUP:
-                if (self && (self->rotating || self->moving))
+            case WM_MBUTTONUP:
+                if (self && (self->rotating || self->moving || self->zooming))
                 {
                     ReleaseCapture();
                     // A click (not a drag) on the figure: the view from that side of it
@@ -6896,7 +6901,7 @@ private:
                 }
                 break;
             case WM_CAPTURECHANGED:
-                if (self) self->rotating = self->moving = false;
+                if (self) self->rotating = self->moving = self->zooming = false;
                 return 0;
             case WM_LBUTTONDBLCLK:
                 if (!self) break;

@@ -165,7 +165,8 @@ tree** opens the whole folder tree with one color per study.
     tree the images in it (or, in a closed branch, the node that holds them), and says which they are.
     A small figure of the patient turns with them (`L` and `R` at its hands); a click on a side
     of it looks from that side (its face: from the front, its head: from above...). Drag to rotate,
-    right-drag to move, the wheel to zoom, double click to start again.
+    right-drag up and down (or the wheel) to zoom, Shift+drag (or the middle button) to move, double click
+    to start again.
   - *Find*: text or a regular expression over the lines of the tree; the nodes found are marked, Enter
     or F3 goes to the next one (Shift+F3 the previous one).
   - Right-click a node: its files in Explorer (selected), the paths of its files or its full info to
