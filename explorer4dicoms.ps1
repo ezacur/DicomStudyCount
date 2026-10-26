@@ -197,7 +197,8 @@ if ($Install) {
     Remove-ItemProperty -LiteralPath $runKey -Name $oldRunName -ErrorAction SilentlyContinue
     Set-ItemProperty -LiteralPath $runKey -Name $runName -Value $watchCommand
     Stop-Watcher
-    Start-Process conhost.exe -ArgumentList ($watchCommand -replace '^conhost\.exe ', '')
+    # (not from this folder: it would hold it, and the folder could not be renamed or moved)
+    Start-Process conhost.exe -ArgumentList ($watchCommand -replace '^conhost\.exe ', '') -WorkingDirectory $env:USERPROFILE
     # The copy of bin\DicomShell.dll that tools\Register-DicomIcons.ps1 registers (by its hash)
     $shellDll = Join-Path $PSScriptRoot 'bin\DicomShell.dll'
     $sha = [Security.Cryptography.SHA256]::Create()
