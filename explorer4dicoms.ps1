@@ -1,6 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Counts the distinct DICOM studies (StudyInstanceUID) in a folder and all its subfolders.
+    explorer4dicoms: Windows Explorer for a bag of DICOM files. Counts the distinct DICOM studies
+    (StudyInstanceUID) in a folder and all its subfolders, and installs the rest of the suite.
 
 .DESCRIPTION
     Reads only the header of each file (it stops at InstanceNumber, tag 0020,0013), so pixel
@@ -8,22 +9,22 @@
     Deflated and "raw" DICOM files without preamble. Non-DICOM files are ignored.
 
 .EXAMPLE
-    .\Count-DicomStudies.ps1 D:\Patients
+    .\explorer4dicoms.ps1 D:\Patients
 .EXAMPLE
-    .\Count-DicomStudies.ps1 D:\Patients -Detail
+    .\explorer4dicoms.ps1 D:\Patients -Detail
 .EXAMPLE
-    .\Count-DicomStudies.ps1 D:\Patients -Csv C:\temp\studies.csv
+    .\explorer4dicoms.ps1 D:\Patients -Csv C:\temp\studies.csv
 .EXAMPLE
-    .\Count-DicomStudies.ps1 D:\Patients -WriteComments    # fills Explorer's Comments column
-    .\Count-DicomStudies.ps1 D:\Patients -Clean            # as if it had never been counted
+    .\explorer4dicoms.ps1 D:\Patients -WriteComments    # fills Explorer's Comments column
+    .\explorer4dicoms.ps1 D:\Patients -Clean            # as if it had never been counted
 .EXAMPLE
-    .\Count-DicomStudies.ps1 D:\Patients -ShowTree         # folder tree with the comments
+    .\explorer4dicoms.ps1 D:\Patients -ShowTree         # folder tree with the comments
 .EXAMPLE
-    .\Count-DicomStudies.ps1 -RestoreQuarantine D:\_DicomQuarantine\Patients\20261022_091500
+    .\explorer4dicoms.ps1 -RestoreQuarantine D:\_DicomQuarantine\Patients\20261022_091500
 .EXAMPLE
-    .\Count-DicomStudies.ps1 -Install      # context menu + background watcher (-Watch) at logon
-    .\Count-DicomStudies.ps1 -Install -Img # also DICOM files named .img (remembered)
-    .\Count-DicomStudies.ps1 -Uninstall
+    .\explorer4dicoms.ps1 -Install      # context menu + background watcher (-Watch) at logon
+    .\explorer4dicoms.ps1 -Install -Img # also DICOM files named .img (remembered)
+    .\explorer4dicoms.ps1 -Uninstall
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
@@ -93,9 +94,48 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# The name of the suite, where its data and settings are; and the one it had (DicomStudyCount, when all
+# it did was to count studies): its data are moved here on -Install. The names inside the files and the
+# registry that nobody sees (the [DicomStudyCount] section of desktop.ini, the file types, the column
+# names, the machine part in Program Files) stay: the folders and columns of before keep working.
+$appName = 'explorer4dicoms'
+$oldName = 'DicomStudyCount'
+$appData = Join-Path $env:LOCALAPPDATA $appName
+
+function Move-OldData {
+    # The settings (HKCU\Software\DicomStudyCount): copied, then the old key removed
+    $oldKey = "HKCU:\Software\$oldName"
+    $newKey = "HKCU:\Software\$appName"
+    if ((Test-Path -LiteralPath $oldKey) -and -not (Test-Path -LiteralPath $newKey)) {
+        try { Rename-Item -LiteralPath $oldKey -NewName $appName }
+        catch {
+            & reg.exe copy "HKCU\Software\$oldName" "HKCU\Software\$appName" /s /f | Out-Null
+            if (Test-Path -LiteralPath $newKey) { Remove-Item -LiteralPath $oldKey -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        Write-Host "Settings moved to $newKey"
+    }
+    # The data of the counts (index, copies, problems reports): copied; the old ones removed. The icons
+    # stay where they are: the desktop.ini of the folders counted point to them (they are ours too)
+    $old = Join-Path $env:LOCALAPPDATA $oldName
+    if (Test-Path -LiteralPath $old) {
+        foreach ($part in 'index', 'duplicates', 'reports') {
+            $from = Join-Path $old $part
+            if (-not (Test-Path -LiteralPath $from)) { continue }
+            $to = Join-Path $appData $part
+            New-Item -ItemType Directory -Force $to | Out-Null
+            Copy-Item -Path (Join-Path $from '*') -Destination $to -Recurse -Force
+            Remove-Item -LiteralPath $from -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Moved $from to $to"
+        }
+        # (the copies of the DLL of before: those Explorer does not hold any more)
+        $shell = Join-Path $old 'shellext'
+        if (Test-Path -LiteralPath $shell) { Get-ChildItem -LiteralPath $shell -File | Remove-Item -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 # Context menu: a "DICOM" submenu with fixed entries (the menu cannot depend on whether the folder
 # was counted: Explorer does not read desktop.ini when it builds it). Key names set the order.
-$menuName = 'DicomStudyCount'
+$menuName = 'explorer4dicoms'
 $menuEntries = @(
     @{ Name = '1Count'; Label = 'Count studies'; Args = '-WriteComments' },
     @{ Name = '2Tree'; Label = 'Show tree'; Args = '-ShowTree' },
@@ -104,7 +144,7 @@ $menuEntries = @(
     @{ Name = '5Unblock'; Label = 'Unblock (allow preview)'; Args = '-Unblock' },
     # (not the script: the explorer of bin\DicomShell.dll, the copy the icons use)
     @{ Name = '6Explorer'; Label = 'DICOM explorer'; Explorer = '' },
-    # (the same, writing the report of the folder in %TEMP%\DicomStudyCount\reports and opening it)
+    # (the same, writing the report of the folder in %TEMP%\explorer4dicoms\reports and opening it)
     @{ Name = '7Report'; Label = 'DICOM report'; Explorer = '/report ' }
 )
 # The DICOM columns of the files (bin\DicomStudyCount.propdesc), in the order they are shown
@@ -118,9 +158,10 @@ $menuParents = @(
     'HKCU:\Software\Classes\Directory\Background\shell'
 )
 # Entries of earlier versions, directly in the context menu
-$oldMenuNames = 'CountDicomStudies', 'ShowDicomTree', 'CleanDicomInfo'
+$oldMenuNames = 'CountDicomStudies', 'ShowDicomTree', 'CleanDicomInfo', 'DicomStudyCount'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$runName = 'DicomStudyCountWatcher'
+$runName = 'explorer4dicomsWatcher'
+$oldRunName = 'DicomStudyCountWatcher'          # (of the suite when it was called DicomStudyCount)
 # conhost --headless runs PowerShell without opening a console window
 $watchCommand = 'conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Watch' -f $PSCommandPath
 
@@ -147,11 +188,13 @@ function Invoke-Elevated([string]$script, [string[]]$arguments) {
 
 function Stop-Watcher {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -like '*Count-DicomStudies.ps1*-Watch*' -and $_.ProcessId -ne $PID } |
+        Where-Object { $_.CommandLine -match '(Count-DicomStudies|explorer4dicoms)\.ps1.*-Watch' -and $_.ProcessId -ne $PID } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 if ($Install) {
+    Move-OldData
+    Remove-ItemProperty -LiteralPath $runKey -Name $oldRunName -ErrorAction SilentlyContinue
     Set-ItemProperty -LiteralPath $runKey -Name $runName -Value $watchCommand
     Stop-Watcher
     Start-Process conhost.exe -ArgumentList ($watchCommand -replace '^conhost\.exe ', '')
@@ -159,7 +202,7 @@ if ($Install) {
     $shellDll = Join-Path $PSScriptRoot 'bin\DicomShell.dll'
     $sha = [Security.Cryptography.SHA256]::Create()
     $dllHash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($shellDll))[0..7] | ForEach-Object { $_.ToString('x2') })
-    $shellCopy = Join-Path $env:LOCALAPPDATA "DicomStudyCount\shellext\DicomShell-$dllHash.dll"
+    $shellCopy = Join-Path $appData "shellext\DicomShell-$dllHash.dll"
     foreach ($parent in $menuParents) {
         foreach ($old in $oldMenuNames) {
             if (Test-Path -LiteralPath "$parent\$old") { Remove-Item -LiteralPath "$parent\$old" -Recurse -Force }
@@ -213,6 +256,7 @@ if ($Install) {
 
 if ($Uninstall) {
     Remove-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
+    Remove-ItemProperty -LiteralPath $runKey -Name $oldRunName -ErrorAction SilentlyContinue
     Stop-Watcher
     foreach ($parent in $menuParents) {
         foreach ($name in @($menuName) + $oldMenuNames) {
@@ -220,9 +264,11 @@ if ($Uninstall) {
         }
     }
     & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Uninstall
-    Remove-Item -LiteralPath 'HKCU:\Software\DicomStudyCount\Explorer' -Recurse -Force -ErrorAction SilentlyContinue
-    # The reports of the explorer, in a temporary folder of their own
-    Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) 'DicomStudyCount\reports') -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($name in $appName, $oldName) {
+        Remove-Item -LiteralPath "HKCU:\Software\$name\Explorer" -Recurse -Force -ErrorAction SilentlyContinue
+        # The reports of the explorer, in a temporary folder of their own
+        Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "$name\reports") -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\DicomStudyCount\PropertyHandler')) {
         Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') @('-Uninstall')
     }
@@ -256,7 +302,7 @@ function Hide-CommentColumn([string]$root, [switch]$Parent) {
 # write their comments again over the cleaned folders
 function Stop-CountsOn([string]$root) {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -like '*Count-DicomStudies.ps1*-WriteComments*' -and $_.ProcessId -ne $PID } |
+        Where-Object { $_.CommandLine -match '(Count-DicomStudies|explorer4dicoms)\.ps1.*-WriteComments' -and $_.ProcessId -ne $PID } |
         ForEach-Object {
             # Counts are started with -Path "<folder>" -WriteComments (conhost --headless drops the
             # quotes, so the folder is whatever lies between both parameters)
@@ -311,11 +357,11 @@ function Show-CommentColumn([string]$root) {
     }
 }
 
-# The C# part (DICOM reader, count, folder comments and icons, Explorer columns): bin\DicomStudyCount.dll,
-# built from src\DicomStudyCount.cs by tools\Build.ps1. Loaded from its bytes, so the file is never
+# The C# part (DICOM reader, count, folder comments and icons, Explorer columns): bin\Explorer4Dicoms.dll,
+# built from src\Explorer4Dicoms.cs by tools\Build.ps1. Loaded from its bytes, so the file is never
 # locked: the folder can be updated while the background watcher runs.
 if (-not ('DicomStudyCount.Scanner' -as [type])) {
-    $assembly = Join-Path $PSScriptRoot 'bin\DicomStudyCount.dll'
+    $assembly = Join-Path $PSScriptRoot 'bin\Explorer4Dicoms.dll'
     if (-not (Test-Path -LiteralPath $assembly)) { throw "Not found: $assembly (build it with tools\Build.ps1)" }
     Add-Type -AssemblyName System.Drawing
     [void][Reflection.Assembly]::Load([IO.File]::ReadAllBytes($assembly))
@@ -323,12 +369,12 @@ if (-not ('DicomStudyCount.Scanner' -as [type])) {
 
 # Problems reports (split studies, duplicated files) live outside the scanned folders,
 # one JSON file per scanned root
-$reportDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\reports'
+$reportDir = Join-Path $appData 'reports'
 # Index of counted locations, to find copies across them (one file per counted folder)
-$indexDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\index'
+$indexDir = Join-Path $appData 'index'
 # Copies of every file found by the counts, for the "DICOM duplicated in" column (written by the
 # counts next to the index, read by the property handler of bin\DicomShell.dll)
-$copiesDir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\duplicates'
+$copiesDir = Join-Path $appData 'duplicates'
 
 function Get-ReportPath([string]$root) {
     $sha = [Security.Cryptography.SHA1]::Create()

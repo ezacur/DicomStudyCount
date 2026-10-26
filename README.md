@@ -1,6 +1,27 @@
-# DicomStudyCount
+# explorer4dicoms
 
-Find duplicated DICOM files and badly organized folders straight from Windows Explorer.
+**Windows Explorer for a bag of DICOM files.**
+
+DICOM files come the way they come: a CD, an export from a PACS, a download, a disk with years of
+studies - thousands of files named `IM0001` in folders that say nothing, copies of copies, studies
+split across folders. explorer4dicoms does not move, rename or reorganize any of them. It reads their
+headers and shows you the order they have inside: which patients, studies, series and volumes there
+are, where each one is, what is missing, what is duplicated and what is put together wrongly. The
+files stay as they are; what changes is what you can see of them. Hence the plural: it is about all
+those DICOMs you have, not about one file.
+
+It works in two places at once, hence the rest of the name: in **Windows Explorer** itself (comments
+and colored icons on the folders, DICOM columns, thumbnails and preview of the files) and in its own
+**DICOM explorer**, a window with the tree of the whole bag (patient, study, series, orientation,
+position, image), its images, their full headers, a 3-D navigator of where every image is in the
+patient, their segmentations and the checks of every series.
+
+It started as *DicomStudyCount*, a script to count studies; that name is still inside a few places
+nobody sees (the section of the `desktop.ini` it writes, the names of its columns, the column schema
+in `%ProgramFiles%\DicomStudyCount`), so that the folders and columns of before keep working. The
+first `-Install` of explorer4dicoms moves the settings and data of DicomStudyCount to their new place.
+
+Find duplicated DICOM files and badly organized folders straight from Windows Explorer:
 
 Right-click a folder and choose **DICOM > Count studies**: every folder and subfolder gets a summary
 in Explorer's **Comments** column (studies, date, series) together with warnings for the problems
@@ -258,7 +279,7 @@ tree** opens the whole folder tree with one color per study.
     problems and notes. The name of the patient only when *Hide patient identity* is off. Where the
     files of each patient, study and series are, from the folder of the report (`.\...`): their
     folder, two or three of them, or the folder that holds them all and how many.
-    - Nothing is asked: it is written to a temporary folder (`%TEMP%\DicomStudyCount\reports`, where
+    - Nothing is asked: it is written to a temporary folder (`%TEMP%\explorer4dicoms\reports`, where
       those of more than 7 days go when another one is written) and opened in the browser; to keep
       one, *Save as* there. One self-contained file: the thumbnails are inside it, nothing is loaded
       from anywhere.
@@ -273,7 +294,7 @@ tree** opens the whole folder tree with one color per study.
     4 KB are not read), the files only read: about 14,000 files in 10 s from a local disk, 120 MB of
     memory; 139,000 files (10,500 series) in 140 s and 800 MB. Files not downloaded from a cloud are
     skipped. The bars between the panes move; the
-    window, its panes and the options are remembered (`HKCU\Software\DicomStudyCount\Explorer`).
+    window, its panes and the options are remembered (`HKCU\Software\explorer4dicoms\Explorer`).
 - **Columns of the DICOM files**: Explorer columns that can be shown, sorted, grouped and
   filtered like any other (right-click a column header > *More...*, they all start with "DICOM"):
 
@@ -338,13 +359,13 @@ tree** opens the whole folder tree with one color per study.
 ## The folder
 
 Everything the tool needs is in its folder; what it writes while working (caches, reports, icons)
-goes to `%LOCALAPPDATA%\DicomStudyCount\`, and the reports of the DICOM explorer to
-`%TEMP%\DicomStudyCount\reports\` (see [What it writes, and where](#what-it-writes-and-where)).
+goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer to
+`%TEMP%\explorer4dicoms\reports\` (see [What it writes, and where](#what-it-writes-and-where)).
 
 | Path | What |
 |---|---|
-| `Count-DicomStudies.ps1` | the tool: context menu, count, tree window, install |
-| `bin\DicomStudyCount.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
+| `explorer4dicoms.ps1` | the tool: context menu, count, tree window, install |
+| `bin\Explorer4Dicoms.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
 | `bin\DicomStudyCount.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs |
@@ -354,7 +375,7 @@ goes to `%LOCALAPPDATA%\DicomStudyCount\`, and the reports of the DICOM explorer
 ## Installation
 
 1. Copy (or clone) the whole folder to a permanent place, for example
-   `C:\Users\<you>\Tools\DicomStudyCount\`. The context menu points to that path, so run `-Install`
+   `C:\Users\<you>\Tools\explorer4dicoms\`. The context menu points to that path, so run `-Install`
    again if you move it.
 2. If it was downloaded as a zip, unblock its files:
    ```powershell
@@ -363,7 +384,7 @@ goes to `%LOCALAPPDATA%\DicomStudyCount\`, and the reports of the DICOM explorer
 3. Install the context menu, the background watcher, and the icons and columns of the DICOM files
    (a UAC prompt for the columns; restart Explorer to see them):
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Install
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\explorer4dicoms.ps1 -Install
    ```
    It covers `.dcm`, `.ima`, `.dicom` and files without extension; add `-Img` for DICOM files named
    `.img` (remembered by later installs). A type that another program already owns (a viewer that
@@ -383,7 +404,7 @@ administrator rights only if the columns changed.
 
 To remove the context menu and the watcher:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\Count-DicomStudies.ps1 -Uninstall
+powershell -NoProfile -ExecutionPolicy Bypass -File .\explorer4dicoms.ps1 -Uninstall
 ```
 
 ## Usage
@@ -399,7 +420,7 @@ menu, so the menu cannot tell a counted folder from one that is not.
   its other columns, fitted to their content), or hides them all if any is visible. On the background
   of a window it acts on that window; on a folder of the list, on the window showing the list.
 - **DICOM explorer**: opens the explorer of the folder (see above).
-- **DICOM report**: the same, and the report of the folder written in `%TEMP%\DicomStudyCount\reports` (a
+- **DICOM report**: the same, and the report of the folder written in `%TEMP%\explorer4dicoms\reports` (a
   name not used yet) and opened in the browser.
 - **Unblock (allow preview)**: files downloaded from the Internet carry a "mark of the web" (a
   `Zone.Identifier` stream), and Windows does not show them in the preview pane ("The file you are
@@ -421,14 +442,14 @@ menu, so the menu cannot tell a counted folder from one that is not.
 **From PowerShell:**
 
 ```powershell
-.\Count-DicomStudies.ps1 D:\Patients                     # summary and problems in the console
-.\Count-DicomStudies.ps1 D:\Patients -Detail             # plus a table of studies
-.\Count-DicomStudies.ps1 D:\Patients -Csv C:\temp\x.csv  # export the studies (';' separated)
-.\Count-DicomStudies.ps1 D:\Patients -WriteComments      # what "DICOM > Count studies" does
-.\Count-DicomStudies.ps1 D:\Patients -ShowTree           # what "DICOM > Show tree" does
-.\Count-DicomStudies.ps1 D:\Patients -Clean              # what "DICOM > Clean" does (-ClearComments: the same)
-.\Count-DicomStudies.ps1 D:\Patients -ToggleColumns      # what "DICOM > Show/hide DICOM columns" does
-.\Count-DicomStudies.ps1 D:\Patients -Unblock            # what "DICOM > Unblock (allow preview)" does
+.\explorer4dicoms.ps1 D:\Patients                     # summary and problems in the console
+.\explorer4dicoms.ps1 D:\Patients -Detail             # plus a table of studies
+.\explorer4dicoms.ps1 D:\Patients -Csv C:\temp\x.csv  # export the studies (';' separated)
+.\explorer4dicoms.ps1 D:\Patients -WriteComments      # what "DICOM > Count studies" does
+.\explorer4dicoms.ps1 D:\Patients -ShowTree           # what "DICOM > Show tree" does
+.\explorer4dicoms.ps1 D:\Patients -Clean              # what "DICOM > Clean" does (-ClearComments: the same)
+.\explorer4dicoms.ps1 D:\Patients -ToggleColumns      # what "DICOM > Show/hide DICOM columns" does
+.\explorer4dicoms.ps1 D:\Patients -Unblock            # what "DICOM > Unblock (allow preview)" does
 rundll32 .\bin\DicomShell.dll,Explore D:\Patients        # what "DICOM > DICOM explorer" does
 rundll32 .\bin\DicomShell.dll,Explore /report D:\Patients   # what "DICOM > DICOM report" does
 ```
@@ -441,15 +462,15 @@ rundll32 .\bin\DicomShell.dll,Explore /report D:\Patients   # what "DICOM > DICO
 |---|---|---|
 | Folder comments and icons | a hidden `desktop.ini` in each folder with DICOM, and the folder's Read-only attribute (needed by Explorer to read it) | `-Clean` removes only what the tool wrote and restores the attribute |
 | Comments column | open Explorer windows, and the views Explorer saves (`HKCU\...\Shell\Bags`) | `-Clean` removes it from the views of the cleaned folders |
-| Folder icon files | `%LOCALAPPDATA%\DicomStudyCount\icons\` (built when first needed; a lost one is built again from its name) | delete the folder |
-| Problems report | `%LOCALAPPDATA%\DicomStudyCount\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
-| Index of counted locations | `%LOCALAPPDATA%\DicomStudyCount\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
+| Folder icon files | `%LOCALAPPDATA%\explorer4dicoms\icons\` (built when first needed; a lost one is built again from its name; those of the folders counted before the rename stay in `%LOCALAPPDATA%\DicomStudyCount\icons\` until they are counted again) | delete the folder |
+| Problems report | `%LOCALAPPDATA%\explorer4dicoms\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
+| Index of counted locations | `%LOCALAPPDATA%\explorer4dicoms\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
-| DICOM explorer | `HKCU\Software\DicomStudyCount\Explorer` (its window, panes, options, last folder and the last folder of its exports) | `-Uninstall` |
-| Reports of the DICOM explorer | `%TEMP%\DicomStudyCount\reports\*.html` (those of more than 7 days go when another one is written) | `-Uninstall` |
-| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\DicomStudyCount\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\DicomStudyCount\Chain` (what those programs had), and `HKCU\Software\DicomStudyCount\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| DICOM explorer | `HKCU\Software\explorer4dicoms\Explorer` (its window, panes, options, last folder and the last folder of its exports) | `-Uninstall` |
+| Reports of the DICOM explorer | `%TEMP%\explorer4dicoms\reports\*.html` (those of more than 7 days go when another one is written) | `-Uninstall` |
+| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\explorer4dicoms\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\explorer4dicoms\Chain` (what those programs had), and `HKCU\Software\explorer4dicoms\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
 | Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (and `.img` with `-Img`; the one another program had is kept in `HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain` and gets its files back) and the registered schema | `-Uninstall` (asks for administrator rights) |
-| Copies of every file ("duplicated in") | `%LOCALAPPDATA%\DicomStudyCount\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
+| Copies of every file ("duplicated in") | `%LOCALAPPDATA%\explorer4dicoms\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 
 The tool never modifies, moves or deletes DICOM files. The problems reports and the index of the counts
 contain file paths and DICOM UIDs, but no patient names or IDs read from the files (folder names, of

@@ -4,21 +4,21 @@
     DICOM files without extension, .dcm, .ima and .dicom: their icon, their image and header in
     Explorer's preview pane, their thumbnail, the DICOM values shown when hovering them and in the
     Details pane, and "Show DICOM duplicates" in their context menu. -Uninstall removes it all.
-    Called by Count-DicomStudies.ps1 -Install / -Uninstall.
+    Called by explorer4dicoms.ps1 -Install / -Uninstall.
 .NOTES
-    The DLL is copied to %LOCALAPPDATA%\DicomStudyCount\shellext under a name with its hash: Explorer
+    The DLL is copied to %LOCALAPPDATA%\explorer4dicoms\shellext under a name with its hash: Explorer
     keeps the registered one loaded, so the one in bin\ can always be replaced.
     An extension that already belongs to another program (a viewer, Windows) stays its own: opening the
     files, their type and their verbs do not change. The icon, thumbnail and preview of that program
     are chained: these handlers are put in front of them (in HKCU, over its class), and give every file
-    that is not DICOM back to them, as recorded in HKCU\Software\DicomStudyCount\Chain\<ext>. The rest
+    that is not DICOM back to them, as recorded in HKCU\Software\explorer4dicoms\Chain\<ext>. The rest
     goes into SystemFileAssociations, which Windows reads for every file of that extension. -Uninstall
     puts everything back as it was.
     -Img adds .img (disc images for Windows, Analyze images...), remembered for the next installs.
 #>
 param(
     [string]$Dll,
-    [string]$Script,        # Count-DicomStudies.ps1, for the "Show DICOM duplicates" verb
+    [string]$Script,        # explorer4dicoms.ps1, for the "Show DICOM duplicates" verb
     [switch]$Img,
     [switch]$Uninstall
 )
@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 if (-not $Dll) { $Dll = Join-Path $root 'bin\DicomShell.dll' }
-if (-not $Script) { $Script = Join-Path $root 'Count-DicomStudies.ps1' }
+if (-not $Script) { $Script = Join-Path $root 'explorer4dicoms.ps1' }
 $clsid = '{F4798986-2EEA-49F6-8082-2FC552CE691B}'           # icons
 $previewClsid = '{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}'    # preview (run by Windows in prevhost.exe)
 $thumbClsid = '{F6D7D002-C00D-4893-AC73-DC78D44316C3}'      # thumbnails
@@ -36,8 +36,8 @@ $prevhostAppId = '{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}'
 $previewList = 'Software\Microsoft\Windows\CurrentVersion\PreviewHandlers'
 $classes = 'Software\Classes'
 $sfa = 'Software\Classes\SystemFileAssociations'
-$state = 'Software\DicomStudyCount\IconHandler'      # what was registered, to undo only that
-$previewSettings = 'Software\DicomStudyCount\Preview'  # the split, and the tab of each folder
+$state = 'Software\explorer4dicoms\IconHandler'      # what was registered, to undo only that
+$previewSettings = 'Software\explorer4dicoms\Preview'  # the split, and the tab of each folder
 $types = @(
     @{ Ext = '.'; ProgId = 'DicomStudyCount.NoExtension'; Name = 'File' },
     @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' },
@@ -45,7 +45,7 @@ $types = @(
     @{ Ext = '.dicom'; ProgId = 'DicomStudyCount.Dicom'; Name = 'DICOM File' },
     @{ Ext = '.img'; ProgId = 'DicomStudyCount.Img'; Name = 'Image File' }
 )
-$chain = 'Software\DicomStudyCount\Chain'           # what other programs had (read by the DLL)
+$chain = 'Software\explorer4dicoms\Chain'           # what other programs had (read by the DLL)
 $iconHandlerKey = 'ShellEx\IconHandler'
 $verbKey = 'shell\DicomStudyCountDuplicates'
 
@@ -238,13 +238,13 @@ if ($Uninstall) {
 if (-not (Test-Path -LiteralPath $Dll)) { throw "Not found: $Dll (build it with tools\Build.ps1)" }
 $sha = [Security.Cryptography.SHA256]::Create()
 $hash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($Dll))[0..7] | ForEach-Object { $_.ToString('x2') })
-$dir = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\shellext'
+$dir = Join-Path $env:LOCALAPPDATA 'explorer4dicoms\shellext'
 New-Item -ItemType Directory -Force $dir | Out-Null
 $target = Join-Path $dir "DicomShell-$hash.dll"
 if (-not (Test-Path -LiteralPath $target)) { Copy-Item -LiteralPath $Dll -Destination $target }
 
-foreach ($c in @(@($clsid, 'DicomStudyCount: icons of DICOM files'), @($previewClsid, 'DicomStudyCount: preview of DICOM files'),
-                 @($thumbClsid, 'DicomStudyCount: thumbnails of DICOM files'))) {
+foreach ($c in @(@($clsid, 'explorer4dicoms: icons of DICOM files'), @($previewClsid, 'explorer4dicoms: preview of DICOM files'),
+                 @($thumbClsid, 'explorer4dicoms: thumbnails of DICOM files'))) {
     $k = $hkcu.CreateSubKey("$classes\CLSID\$($c[0])")
     $k.SetValue('', $c[1])
     # (Its DisableLowILProcessIsolation goes to HKLM, where Explorer reads it: Register-DicomProperties.ps1)
@@ -253,7 +253,7 @@ foreach ($c in @(@($clsid, 'DicomStudyCount: icons of DICOM files'), @($previewC
     $k.SetValue('', $target)
     $k.SetValue('ThreadingModel', 'Apartment')
 }
-$hkcu.CreateSubKey($previewList).SetValue($previewClsid, 'DicomStudyCount: preview of DICOM files')
+$hkcu.CreateSubKey($previewList).SetValue($previewClsid, 'explorer4dicoms: preview of DICOM files')
 # Tags or names, of the preview before its tabs
 $p = $hkcu.OpenSubKey($previewSettings, $true)
 if ($p) { $p.DeleteValue('HeaderNames', $false) }

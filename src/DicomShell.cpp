@@ -1,6 +1,6 @@
 // DicomShell (bin\DicomShell.dll, built by tools\Build.ps1): Explorer icon handler for DICOM files. Every DICOM file gets an icon with its
 // SeriesNumber written in the color of its study (the same palette and hash as the folder boxes of
-// Count-DicomStudies.ps1), on the complementary color. Files that are not DICOM (or are a DICOMDIR)
+// explorer4dicoms.ps1), on the complementary color. Files that are not DICOM (or are a DICOMDIR)
 // keep the generic file icon.
 //
 // Only the header is read, up to SeriesNumber (0020,0011), the same way as the script's reader:
@@ -16,7 +16,7 @@
 // And the DICOM explorer: a window of its own, run by rundll32 (ExploreW), with the DICOM files of a
 // folder as a tree of patients, studies, series, orientations, positions and images.
 //
-// Registered by Count-DicomStudies.ps1 -Install for .dcm, .ima, .dicom and files without extension: the
+// Registered by explorer4dicoms.ps1 -Install for .dcm, .ima, .dicom and files without extension: the
 // icons, preview and thumbnails per user (tools\Register-DicomIcons.ps1), the properties for the
 // machine (tools\Register-DicomProperties.ps1).
 // It runs inside Explorer: every error ends in the generic icon or no properties, never in an exception.
@@ -482,7 +482,7 @@ static Kind ReadHeader(const wchar_t* path, Header& h, unsigned last)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Colors: the palette and hash of FolderIcons in Count-DicomStudies.ps1
+// Colors: the palette and hash of FolderIcons in explorer4dicoms.ps1
 
 static const unsigned Palette[] = {                     // 0xRRGGBB
     0x000000, 0x404040, 0x808080, 0xBFBFBF, 0xFFFFFF,   // black, gray 25/50/75 %, white
@@ -733,11 +733,11 @@ static HICON DrawIcon(int size, int color, const std::wstring& label)
 
 // ---------------------------------------------------------------------------------------------
 // Chaining: the handlers another program had for an extension (files without one included) before the
-// install put these in front of them (tools\Register-DicomIcons.ps1 in HKCU\Software\DicomStudyCount\
+// install put these in front of them (tools\Register-DicomIcons.ps1 in HKCU\Software\explorer4dicoms\
 // Chain\<ext>, Register-DicomProperties.ps1 in HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain\<ext>).
 // Files that are not DICOM go to them, as if this DLL were not there.
 
-static const wchar_t ChainKey[] = L"Software\\DicomStudyCount\\Chain";
+static const wchar_t ChainKey[] = L"Software\\explorer4dicoms\\Chain";
 static const wchar_t PropertyChainKey[] = L"SOFTWARE\\DicomStudyCount\\PropertyHandler\\Chain";
 
 // ".ima" (lowercase), or "(none)"
@@ -975,7 +975,7 @@ static std::wstring Widen(const std::string& s, const std::string& charset = std
 
 // 6 case-sensitive characters (62 possible each) from the 64-bit FNV-1a of a UID: for the
 // StudyInstanceUID, the same as the study tags of the folder comments, FolderComments.StudyTag in
-// src\DicomStudyCount.cs
+// src\Explorer4Dicoms.cs
 static std::wstring Hash6(const std::string& uid)
 {
     static const wchar_t Base62[] = L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -987,7 +987,7 @@ static std::wstring Hash6(const std::string& uid)
     return chars;
 }
 
-// Copies of every file found by the counts, read from %LOCALAPPDATA%\DicomStudyCount\duplicates
+// Copies of every file found by the counts, read from %LOCALAPPDATA%\explorer4dicoms\duplicates
 // (one file per counted folder: "path<TAB>other copy<TAB>..."). Reloaded when those files change,
 // checked at most every 2 seconds; shared by all the property handlers of the process.
 class Duplicates
@@ -1021,7 +1021,7 @@ private:
     {
         PWSTR local = nullptr;
         std::wstring dir;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) dir = std::wstring(local) + L"\\DicomStudyCount\\duplicates";
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) dir = std::wstring(local) + L"\\explorer4dicoms\\duplicates";
         CoTaskMemFree(local);
         return dir;
     }
@@ -3350,7 +3350,7 @@ private:
         KillTimer(wnd, TimerPoster);
         poster.clear();
     }
-    static constexpr const wchar_t* Settings = L"Software\\DicomStudyCount\\Preview";
+    static constexpr const wchar_t* Settings = L"Software\\explorer4dicoms\\Preview";
 
     LONG refs = 1;
     IShellItem* item = nullptr;
@@ -3489,7 +3489,7 @@ private:
         }
         // The tab of this folder (the columns at first), and the split of every preview
         if (!folder.empty() && !hosted)
-            tab = static_cast<int>(ReadDword(L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), TabColumns));
+            tab = static_cast<int>(ReadDword(L"Software\\explorer4dicoms\\Preview\\Tabs", folder.c_str(), TabColumns));
         if (tab < 0 || tab >= TabCount || tab == TabDirectory) tab = TabColumns;
         // A DICOMDIR opens on its tree
         directory = std::move(view.directory);
@@ -3795,7 +3795,7 @@ private:
         CloseClipboard();
     }
 
-    // The tab chosen, remembered for this folder (HKCU\Software\DicomStudyCount\Preview\Tabs)
+    // The tab chosen, remembered for this folder (HKCU\Software\explorer4dicoms\Preview\Tabs)
     void SelectTab(int t)
     {
         if (plain || t == tab || t < 0 || t >= TabCount || (t == TabDirectory && !tree)) return;
@@ -3811,7 +3811,7 @@ private:
         if (!folder.empty() && t != TabDirectory)       // (the tree: only in a DICOMDIR, always first)
         {
             DWORD value = static_cast<DWORD>(t);
-            RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\DicomStudyCount\\Preview\\Tabs", folder.c_str(), REG_DWORD,
+            RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\explorer4dicoms\\Preview\\Tabs", folder.c_str(), REG_DWORD,
                             &value, sizeof(value));
         }
         ShowContent();
@@ -7067,7 +7067,7 @@ public:
     }
 
 private:
-    static constexpr const wchar_t* Settings = L"Software\\DicomStudyCount\\Explorer";
+    static constexpr const wchar_t* Settings = L"Software\\explorer4dicoms\\Explorer";
     static constexpr UINT WM_GATHERED = WM_APP + 20, WM_THUMB = WM_APP + 21, WM_EXPORTED = WM_APP + 22;
     static constexpr UINT_PTR TimerProgress = 1, TimerFilter = 2, TimerFind = 3, TimerFollow = 4, TimerJob = 5;
     static constexpr UINT_PTR TimerFrame = 1;      // (of the floating thumbnail)
@@ -11627,13 +11627,13 @@ private:
         return out;
     }
 
-    // Where a report goes: a temporary folder of its own (%TEMP%\DicomStudyCount\reports), a name not used
+    // Where a report goes: a temporary folder of its own (%TEMP%\explorer4dicoms\reports), a name not used
     // yet; the browser saves it where it is wanted (Save as). The reports there of more than 7 days go.
     std::wstring ReportPath(int n) const
     {
         wchar_t temp[MAX_PATH + 1] = {};
         if (!GetTempPathW(MAX_PATH + 1, temp)) return std::wstring();
-        const std::wstring folder = std::wstring(temp) + L"DicomStudyCount\\reports";
+        const std::wstring folder = std::wstring(temp) + L"explorer4dicoms\\reports";
         SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
         WIN32_FIND_DATAW fd;
         HANDLE find = FindFirstFileW((folder + L"\\*.html").c_str(), &fd);
@@ -11919,7 +11919,7 @@ private:
              L"if(a){ev.preventDefault();reveal(a.getAttribute('href').slice(1));history.replaceState(null,'',a.getAttribute('href'));}});\n"
              L"if(location.hash)reveal(location.hash.slice(1));\n"
              L"function fold(open){document.querySelectorAll('details.patient,details.study').forEach(function(d){d.open=open;});}\n</script>\n";
-        h += L"<footer>Written by the DICOM explorer of DicomStudyCount. The files were only read.</footer>\n</main>\n</body>\n</html>\n";
+        h += L"<footer>Written by the DICOM explorer of explorer4dicoms. The files were only read.</footer>\n</main>\n</body>\n</html>\n";
         j->report = std::move(h);
         j->total = static_cast<long>(j->stacks.size());
         StartJob(std::move(j));

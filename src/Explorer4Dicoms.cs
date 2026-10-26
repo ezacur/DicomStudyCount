@@ -1,6 +1,6 @@
-﻿// DicomStudyCount: the C# part of Count-DicomStudies.ps1 (DICOM header reader, count, folder comments
+﻿// explorer4dicoms: the C# part of explorer4dicoms.ps1 (DICOM header reader, count, folder comments
 // and icons, Explorer columns and saved views, index of counted locations). Built into
-// bin\DicomStudyCount.dll by tools\Build.ps1 (.NET Framework 4, for Windows PowerShell 5.1).
+// bin\Explorer4Dicoms.dll by tools\Build.ps1 (.NET Framework 4, for Windows PowerShell 5.1).
 
 using System;
 using System.Collections.Concurrent;
@@ -2150,7 +2150,7 @@ namespace DicomStudyCount
 
         // Versioned, so a change in the drawing never mixes with icons already cached by Explorer
         public static readonly string Dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"DicomStudyCount\icons");
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"explorer4dicoms\icons");
         static readonly string VersionDir = Path.Combine(Dir, "v2");
 
         // Always the same color for the same study (64-bit FNV-1a of the StudyInstanceUID)
@@ -2176,7 +2176,8 @@ namespace DicomStudyCount
         public static bool IsOurs(string iconPath)
         {
             return !string.IsNullOrEmpty(iconPath) &&
-                   iconPath.IndexOf(@"\DicomStudyCount\icons\", StringComparison.OrdinalIgnoreCase) >= 0;
+                   (iconPath.IndexOf(@"\explorer4dicoms\icons\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    iconPath.IndexOf(@"\DicomStudyCount\icons\", StringComparison.OrdinalIgnoreCase) >= 0);     // (the name of the suite before)
         }
 
         // Full path of the icon, created if it does not exist yet (or was lost)
