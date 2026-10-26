@@ -377,6 +377,11 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 1. Copy (or clone) the whole folder to a permanent place, for example
    `C:\Users\<you>\Tools\explorer4dicoms\`. The context menu points to that path, so run `-Install`
    again if you move it.
+   ```powershell
+   git clone https://github.com/ezacur/explorer4dicoms.git
+   ```
+   Installed before as *DicomStudyCount*: install this one the same way; it takes the place of the old
+   one (its menu, watcher, settings and data), and the folder of the old one can then be deleted.
 2. If it was downloaded as a zip, unblock its files:
    ```powershell
    Get-ChildItem -Recurse | Unblock-File
