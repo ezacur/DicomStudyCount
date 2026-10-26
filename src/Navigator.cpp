@@ -14,7 +14,7 @@ bool Navigator::Create(HWND parent)
     wc.hInstance = g_module;
     wc.hCursor = LoadCursor(nullptr, IDC_SIZEALL);
     wc.style = CS_DBLCLKS;
-    wc.lpszClassName = L"DicomStudyCountNavigator";
+    wc.lpszClassName = L"Explorer4DicomsNavigator";
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
     wnd = CreateWindowExW(WS_EX_CLIENTEDGE, wc.lpszClassName, L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, parent, nullptr, g_module, this);
     return wnd != nullptr;

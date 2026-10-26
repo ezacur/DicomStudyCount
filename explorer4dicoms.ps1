@@ -291,8 +291,8 @@ function Hide-CommentColumn([string]$root, [switch]$Parent) {
         try {
             $window = $windows.Item($i)
             $windowPath = $window.Document.Folder.Self.Path
-            if ([DicomStudyCount.Paths]::IsUnder($windowPath, $root) -or ($Parent -and $windowPath -eq $parentPath)) {
-                [void][DicomStudyCount.ExplorerColumns]::HideCommentColumn($window)
+            if ([Explorer4Dicoms.Paths]::IsUnder($windowPath, $root) -or ($Parent -and $windowPath -eq $parentPath)) {
+                [void][Explorer4Dicoms.ExplorerColumns]::HideCommentColumn($window)
             }
         }
         catch { }   # windows that are not file system folders (This PC, Home...)
@@ -310,7 +310,7 @@ function Stop-CountsOn([string]$root) {
             if ($_.CommandLine -notmatch '-Path\s+(.+?)\s+-WriteComments\b') { return }
             $p = $Matches[1].Trim().Trim('"').TrimEnd('\')
             if ($p -match '^[A-Za-z]:$') { $p += '\' }
-            if ([DicomStudyCount.Paths]::IsUnder($p, $root) -or [DicomStudyCount.Paths]::IsUnder($root, $p)) {
+            if ([Explorer4Dicoms.Paths]::IsUnder($p, $root) -or [Explorer4Dicoms.Paths]::IsUnder($root, $p)) {
                 Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
                 Write-Host "Stopped the count running on $p"
             }
@@ -333,9 +333,9 @@ function Switch-DicomColumns([string]$root) {
         catch { }   # windows that are not file system folders (This PC, Home...)
     }
     if (-not $targets) { Write-Host "No Explorer window open on $root"; return }
-    $show = -not [DicomStudyCount.ExplorerColumns]::AnyColumnShown($targets[0], [string[]]$dicomColumns)
+    $show = -not [Explorer4Dicoms.ExplorerColumns]::AnyColumnShown($targets[0], [string[]]$dicomColumns)
     foreach ($w in $targets) {
-        try { [DicomStudyCount.ExplorerColumns]::SetColumnsShown($w, [string[]]$dicomColumns, $show) } catch { }
+        try { [Explorer4Dicoms.ExplorerColumns]::SetColumnsShown($w, [string[]]$dicomColumns, $show) } catch { }
     }
     Write-Host ('DICOM columns {0} in {1} window(s)' -f $(if ($show) { 'shown' } else { 'hidden' }), $targets.Count)
 }
@@ -351,7 +351,7 @@ function Show-CommentColumn([string]$root) {
             $window = $windows.Item($i)
             $windowPath = $window.Document.Folder.Self.Path
             if ($windowPath -eq $root -or $windowPath -eq $parent -or $windowPath.StartsWith($root.TrimEnd('\') + '\', 'OrdinalIgnoreCase')) {
-                [void][DicomStudyCount.ExplorerColumns]::ShowCommentColumn($window)
+                [void][Explorer4Dicoms.ExplorerColumns]::ShowCommentColumn($window)
             }
         }
         catch { }   # windows that are not file system folders (This PC, Home...)
@@ -361,7 +361,7 @@ function Show-CommentColumn([string]$root) {
 # The C# part (DICOM reader, count, folder comments and icons, Explorer columns): bin\Explorer4Dicoms.dll,
 # built from src\Explorer4Dicoms\*.cs by tools\Build.ps1. Loaded from its bytes, so the file is never
 # locked: the folder can be updated while the background watcher runs.
-if (-not ('DicomStudyCount.Scanner' -as [type])) {
+if (-not ('Explorer4Dicoms.Scanner' -as [type])) {
     $assembly = Join-Path $PSScriptRoot 'bin\Explorer4Dicoms.dll'
     if (-not (Test-Path -LiteralPath $assembly)) { throw "Not found: $assembly (build it with tools\Build.ps1)" }
     Add-Type -AssemblyName System.Drawing
@@ -437,7 +437,7 @@ function Invoke-Quarantine([string]$root, $report) {
             foreach ($file in $files) {
                 if ($file -eq $keepFile) { continue }
                 if (-not $file.StartsWith($folder + '\', 'OrdinalIgnoreCase') -or
-                    -not [DicomStudyCount.FileCompare]::Identical($keepFile, $file)) { $skipped++; continue }
+                    -not [Explorer4Dicoms.FileCompare]::Identical($keepFile, $file)) { $skipped++; continue }
                 $dest = Join-Path $batch $file.Substring($folder.Length + 1)
                 try {
                     New-Item -ItemType Directory -Force ([IO.Path]::GetDirectoryName($dest)) | Out-Null
@@ -505,7 +505,7 @@ function Test-HasDicomComments([string]$dir) {
         foreach ($sub in [IO.Directory]::EnumerateDirectories($dir)) {
             if ($n++ -ge 500) { break }
             $ini = [IO.Path]::Combine($sub, 'desktop.ini')
-            if ([IO.File]::Exists($ini) -and [DicomStudyCount.Native]::ReadIni($ini, 'DicomStudyCount', 'Generated')) { return $true }
+            if ([IO.File]::Exists($ini) -and [Explorer4Dicoms.Native]::ReadIni($ini, 'DicomStudyCount', 'Generated')) { return $true }
         }
     }
     catch { }
@@ -520,7 +520,8 @@ if ($RestoreQuarantine) {
 
 if ($Watch) {
     $isFirst = $false
-    $mutex = New-Object Threading.Mutex($true, 'Local\DicomStudyCountWatcher', [ref]$isFirst)
+    # (the name of the suite before: a watcher started by an older copy is found too)
+    $mutex =New-Object Threading.Mutex($true, 'Local\DicomStudyCountWatcher', [ref]$isFirst)
     if (-not $isFirst) { return }     # another instance is already running
 
     $shell = New-Object -ComObject Shell.Application
@@ -539,9 +540,9 @@ if ($Watch) {
                     $seen[$key] = $true
                     if ($handled.ContainsKey($key)) { continue }
                     if ([IO.Path]::IsPathRooted($path) -and (Test-HasDicomComments $path)) {
-                        [void][DicomStudyCount.ExplorerColumns]::ShowCommentColumn($window)
+                        [void][Explorer4Dicoms.ExplorerColumns]::ShowCommentColumn($window)
                         # Folder icons lost (deleted cache, another PC): rebuilt from their names
-                        try { [DicomStudyCount.FolderIcons]::RepairChildren($path) } catch { }
+                        try { [Explorer4Dicoms.FolderIcons]::RepairChildren($path) } catch { }
                     }
                     $handled[$key] = $true
                 }
@@ -561,11 +562,11 @@ try {
     $Path = $Path.Trim().Trim('"')
     if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
     # Long form: the same folder through an 8.3 short name ("JOHNDO~1") must be the same location
-    $root = [DicomStudyCount.Paths]::Long((Resolve-Path -LiteralPath $Path).ProviderPath)
+    $root = [Explorer4Dicoms.Paths]::Long((Resolve-Path -LiteralPath $Path).ProviderPath)
 
     if ($ShowDuplicates) {
-        $copies = [DicomStudyCount.Duplicates]::Of($copiesDir, $root) | ForEach-Object { $_ -replace ' \(differs\)$', '' }
-        $shown = if ($copies) { [DicomStudyCount.Duplicates]::Show([string[]]$copies) } else { 0 }
+        $copies = [Explorer4Dicoms.Duplicates]::Of($copiesDir, $root) | ForEach-Object { $_ -replace ' \(differs\)$', '' }
+        $shown = if ($copies) { [Explorer4Dicoms.Duplicates]::Show([string[]]$copies) } else { 0 }
         if (-not $shown) {
             # Run from the context menu without a console: the answer goes in a message box
             Add-Type -AssemblyName System.Windows.Forms
@@ -592,7 +593,7 @@ try {
     }
 
     if ($Unblock) {
-        $r = [DicomStudyCount.Unblocker]::Run($root, [Environment]::ProcessorCount)
+        $r = [Explorer4Dicoms.Unblocker]::Run($root, [Environment]::ProcessorCount)
         Write-Host ("Unblocked {0:N0} DICOM files in {1}" -f $r[0], $root)
         if ($r[1]) { Write-Host ("Left marked: {0:N0} files that are not DICOM" -f $r[1]) }
         if ($r[2]) { Write-Host ("Could not unblock {0:N0} files" -f $r[2]) -ForegroundColor Yellow }
@@ -603,22 +604,22 @@ try {
         Stop-CountsOn $root
         # Comments, icons, folder type and the attributes added to the folders
         $cleared = 0
-        foreach ($ini in Get-DesktopIniFiles $root) { if ([DicomStudyCount.FolderComments]::Clear($ini.DirectoryName)) { $cleared++ } }
+        foreach ($ini in Get-DesktopIniFiles $root) { if ([Explorer4Dicoms.FolderComments]::Clear($ini.DirectoryName)) { $cleared++ } }
         # The count also added the column to the parent folder: removed there too, unless other
         # folders in it still have comments
         $parent = Split-Path -Path $root -Parent
         $parentToo = $parent -and -not (Test-HasDicomComments $parent)
         Hide-CommentColumn $root -Parent:$parentToo
-        $views = [DicomStudyCount.ViewBags]::RemoveCommentColumn($root, $true)
-        if ($parentToo) { $views += [DicomStudyCount.ViewBags]::RemoveCommentColumn($parent, $false) }
+        $views = [Explorer4Dicoms.ViewBags]::RemoveCommentColumn($root, $true)
+        if ($parentToo) { $views += [Explorer4Dicoms.ViewBags]::RemoveCommentColumn($parent, $false) }
         # Copies in other locations will no longer point here, and the reports of the counts made
         # inside the folder are deleted
-        $forgotten = [DicomStudyCount.CountedData]::ForgetIndex($indexDir, $root)
-        [void][DicomStudyCount.CountedData]::ForgetCopies($copiesDir, $root)
+        $forgotten = [Explorer4Dicoms.CountedData]::ForgetIndex($indexDir, $root)
+        [void][Explorer4Dicoms.CountedData]::ForgetCopies($copiesDir, $root)
         $reports = 0
         foreach ($file in Get-ChildItem -LiteralPath $reportDir -Filter '*.json' -ErrorAction SilentlyContinue) {
             try { $reportRoot = (Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json).Root } catch { continue }
-            if ($reportRoot -and [DicomStudyCount.Paths]::IsUnder($reportRoot, $root)) {
+            if ($reportRoot -and [Explorer4Dicoms.Paths]::IsUnder($reportRoot, $root)) {
                 Remove-Item -LiteralPath $file.FullName -Force
                 $reports++
             }
@@ -633,9 +634,9 @@ try {
 
     if ($WriteComments) { Show-CommentColumn $root }
 
-    $progress = New-Object DicomStudyCount.ScanProgress
+    $progress = New-Object Explorer4Dicoms.ScanProgress
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $task = [DicomStudyCount.Scanner]::StartScan($root, [Environment]::ProcessorCount, $progress, [bool]$WriteComments, $indexDir)
+    $task = [Explorer4Dicoms.Scanner]::StartScan($root, [Environment]::ProcessorCount, $progress, [bool]$WriteComments, $indexDir)
     $countingFitted = $false
     while (-not $task.Wait(200)) {
         Write-Progress -Activity "Reading DICOM in $root" `

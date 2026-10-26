@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DicomStudyCount
+namespace Explorer4Dicoms
 {
     // Folder comments via desktop.ini. Explorer shows the InfoTip in the Comments column, but it
     // only reads desktop.ini when the folder has the Read-only or System attribute.

@@ -20,13 +20,13 @@ bool DicomExplorer::Create(const std::wstring& folder, int show, bool report)
     wc.hInstance = g_module;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
-    wc.lpszClassName = L"DicomStudyCountExplorer";
+    wc.lpszClassName = L"Explorer4DicomsExplorer";
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
     WNDCLASSEXW pc = { sizeof(pc) };
     pc.lpfnWndProc = PopupProc;
     pc.hInstance = g_module;
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    pc.lpszClassName = L"DicomStudyCountThumb";
+    pc.lpszClassName = L"Explorer4DicomsThumb";
     pc.style = CS_DROPSHADOW;
     if (!RegisterClassExW(&pc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
     compact = ReadSetting(L"Compact", 1) != 0;
@@ -176,7 +176,7 @@ void DicomExplorer::CreateControls()
                       TVS_SHOWSELALWAYS | TVS_NOTOOLTIPS, 0);
     SetWindowSubclass(unusedTree, TreeProc, 1, reinterpret_cast<DWORD_PTR>(this));
     popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                            L"DicomStudyCountThumb", L"", WS_POPUP | WS_BORDER, 0, 0, 10, 10, wnd, nullptr, g_module, this);
+                            L"Explorer4DicomsThumb", L"", WS_POPUP | WS_BORDER, 0, 0, 10, 10, wnd, nullptr, g_module, this);
     if (popup) SetLayeredWindowAttributes(popup, 0, 255, LWA_ALPHA);
     worker = std::make_unique<ThumbWorker>(wnd, WM_THUMB);
     info = make(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER, 0);

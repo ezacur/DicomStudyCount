@@ -78,7 +78,7 @@ if ($hr -lt 0) { throw ('PSRegisterPropertySchema failed: 0x{0:X8}' -f $hr) }
 if ($hr -ne 0) { Write-Host ('Schema registered with warnings: 0x{0:X8}' -f $hr) }
 
 $k = $hklm.CreateSubKey("SOFTWARE\Classes\CLSID\$clsid")
-$k.SetValue('', 'DicomStudyCount: properties of DICOM files')
+$k.SetValue('', 'explorer4dicoms: properties of DICOM files')
 # IInitializeWithFile (the path is needed for the duplicates): the indexer must not isolate it
 $k.SetValue('DisableProcessIsolation', 1, 'DWord')
 $k = $hklm.CreateSubKey("SOFTWARE\Classes\CLSID\$clsid\InprocServer32")

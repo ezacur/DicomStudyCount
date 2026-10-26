@@ -38,6 +38,7 @@ $classes = 'Software\Classes'
 $sfa = 'Software\Classes\SystemFileAssociations'
 $state = 'Software\explorer4dicoms\IconHandler'      # what was registered, to undo only that
 $previewSettings = 'Software\explorer4dicoms\Preview'  # the split, and the tab of each folder
+# (the file types and the verb keep the name of the suite before: see $oldName in explorer4dicoms.ps1)
 $types = @(
     @{ Ext = '.'; ProgId = 'DicomStudyCount.NoExtension'; Name = 'File' },
     @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' },

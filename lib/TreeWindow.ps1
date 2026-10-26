@@ -5,7 +5,7 @@
 # it neither reads DICOM files nor writes anything.
 function Show-DicomTree([string]$root) {
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    [void][DicomStudyCount.Native]::SetProcessDPIAware()
+    [void][Explorer4Dicoms.Native]::SetProcessDPIAware()
     [Windows.Forms.Application]::EnableVisualStyles()
 
     $form = New-Object Windows.Forms.Form
@@ -29,7 +29,7 @@ function Show-DicomTree([string]$root) {
     $images = New-Object Windows.Forms.ImageList
     $images.ColorDepth = 'Depth32Bit'
     $images.ImageSize = New-Object Drawing.Size($script:iconSize, $script:iconSize)
-    try { $images.Images.Add('folder', [DicomStudyCount.FolderIcons]::SystemFolder($script:iconSize)) } catch { }
+    try { $images.Images.Add('folder', [Explorer4Dicoms.FolderIcons]::SystemFolder($script:iconSize)) } catch { }
     $tree.ImageList = $images
     $tree.ImageKey = 'folder'
     $tree.SelectedImageKey = 'folder'
@@ -260,11 +260,11 @@ function Show-DicomTree([string]$root) {
     function Get-FolderComment([string]$dir) {
         $ini = [IO.Path]::Combine($dir, 'desktop.ini')
         if (-not [IO.File]::Exists($ini)) { return '' }
-        $text = [DicomStudyCount.Native]::ReadIni($ini, '.ShellClassInfo', 'InfoTip')
+        $text = [Explorer4Dicoms.Native]::ReadIni($ini, '.ShellClassInfo', 'InfoTip')
         # Non-ASCII text (such as the warning sign) is also stored UTF-7 encoded in .ShellClassInfo.W,
         # valid only while the .ShellClassInfo.A copy matches the main text (same rule as Windows)
-        $unicode = [DicomStudyCount.Native]::ReadIni($ini, '.ShellClassInfo.W', 'InfoTip')
-        if ($unicode -and [DicomStudyCount.Native]::ReadIni($ini, '.ShellClassInfo.A', 'InfoTip') -eq $text) {
+        $unicode = [Explorer4Dicoms.Native]::ReadIni($ini, '.ShellClassInfo.W', 'InfoTip')
+        if ($unicode -and [Explorer4Dicoms.Native]::ReadIni($ini, '.ShellClassInfo.A', 'InfoTip') -eq $text) {
             return [Text.Encoding]::UTF7.GetString([Text.Encoding]::ASCII.GetBytes($unicode))
         }
         $text
@@ -274,9 +274,9 @@ function Show-DicomTree([string]$root) {
     function Set-NodeIcon($node) {
         $key = 'folder'
         try {
-            $icon = [DicomStudyCount.FolderIcons]::OfFolder($node.Tag.Path)
+            $icon = [Explorer4Dicoms.FolderIcons]::OfFolder($node.Tag.Path)
             if ($icon) {
-                if (-not $images.Images.ContainsKey($icon)) { $images.Images.Add($icon, [DicomStudyCount.FolderIcons]::Load($icon, $script:iconSize)) }
+                if (-not $images.Images.ContainsKey($icon)) { $images.Images.Add($icon, [Explorer4Dicoms.FolderIcons]::Load($icon, $script:iconSize)) }
                 $key = $icon
             }
         }

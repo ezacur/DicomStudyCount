@@ -1,7 +1,7 @@
 ﻿// explorer4dicoms, the C# part of explorer4dicoms.ps1 (bin\Explorer4Dicoms.dll, built by tools\Build.ps1 from
 // all of src\Explorer4Dicoms\): the folder icons in the colors of the studies they hold
 
-namespace DicomStudyCount
+namespace Explorer4Dicoms
 {
     using System;
     using System.Collections.Generic;

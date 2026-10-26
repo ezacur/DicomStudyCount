@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DicomStudyCount
+namespace Explorer4Dicoms
 {
     // Adds the Comments column to an Explorer window that is already open
     // (ShellWindows -> IShellBrowser -> IShellView -> IColumnManager)

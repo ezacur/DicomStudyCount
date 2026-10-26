@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DicomStudyCount
+namespace Explorer4Dicoms
 {
     public static class Scanner
     {

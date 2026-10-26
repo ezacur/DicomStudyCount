@@ -345,7 +345,7 @@ IFACEMETHODIMP IconHandler::SaveCompleted(LPCOLESTR) { return E_NOTIMPL; }
 
 IFACEMETHODIMP IconHandler::GetCurFile(LPOLESTR*) { return E_NOTIMPL; }
 
-// IExtractIconW: the location is a key ("DicomStudyCount|v1|<color>|<number>") that Explorer
+// IExtractIconW: the location is a key ("DicomStudyCount|v2|<color>|<number>") that Explorer
 // caches the drawn icon under, so every color and number is drawn only once
 IFACEMETHODIMP IconHandler::GetIconLocation(UINT flags, LPWSTR file, UINT cch, int* index, UINT* outFlags)
 {

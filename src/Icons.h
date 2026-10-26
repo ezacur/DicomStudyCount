@@ -26,6 +26,7 @@ HICON DrawIcon(int size, int color, const std::wstring& label);
 
 static const wchar_t ChainKey[] = L"Software\\explorer4dicoms\\Chain";
 
+// (the machine part keeps the name of the suite before: see $oldName in explorer4dicoms.ps1)
 static const wchar_t PropertyChainKey[] = L"SOFTWARE\\DicomStudyCount\\PropertyHandler\\Chain";
 
 std::wstring Previous(HKEY root, const wchar_t* base, const std::wstring& path, const wchar_t* name);

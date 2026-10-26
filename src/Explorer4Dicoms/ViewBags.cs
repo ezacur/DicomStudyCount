@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DicomStudyCount
+namespace Explorer4Dicoms
 {
     // Explorer remembers the view of every folder it has shown (Shell\Bags in the registry, found through
     // the item id lists of Shell\BagMRU), columns included: the Comments column added by a count stays

@@ -612,7 +612,7 @@ HRESULT PreviewHandler::CreateWindows()
         wc.lpfnWndProc = WndProc;
         wc.hInstance = g_module;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.lpszClassName = L"DicomStudyCountPreview";
+        wc.lpszClassName = L"Explorer4DicomsPreview";
         cls = RegisterClassExW(&wc);
         if (!cls && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
     }
@@ -628,7 +628,7 @@ HRESULT PreviewHandler::CreateWindows()
     if (!hosted) segments = ReadDword(Settings, L"Segmentations", 1) != 0;
     current = path;
     // Its (invisible) title is the summary line: for screen readers and tests
-    wnd = CreateWindowExW(0, L"DicomStudyCountPreview", view.summary.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+    wnd = CreateWindowExW(0, L"Explorer4DicomsPreview", view.summary.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                           bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
                           parent, nullptr, g_module, this);
     if (!wnd) return HRESULT_FROM_WIN32(GetLastError());

@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DicomStudyCount
+namespace Explorer4Dicoms
 {
     // "Show DICOM duplicates" on a file: its copies found by the counts, shown selected in Explorer
     public static class Duplicates
