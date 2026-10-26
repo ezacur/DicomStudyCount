@@ -6480,6 +6480,9 @@ private:
         void Set(std::vector<NavPlane> p, std::vector<char> h, int on, Picture picture, std::wstring text, std::wstring more, bool fit)
         {
             planes = std::move(p);
+            corners.clear();
+            hover = -1;
+            hoverText.clear();
             hot = std::move(h);
             textured = on;
             caption = std::move(text);
@@ -6519,6 +6522,11 @@ private:
 
         void Clear() { Set({}, {}, -1, Picture(), L"", L"", true); }
 
+        std::function<void(int)> hovered;           // the mouse went over a plane (its index in Set), or off them (-1)
+        static constexpr COLORREF HoverColor = RGB(0, 120, 215);
+
+        void SetHoverText(std::wstring text) { hoverText = std::move(text); if (wnd) InvalidateRect(wnd, nullptr, FALSE); }
+
     private:
         HWND wnd = nullptr;
         HBITMAP bitmap = nullptr;                   // the picture, for PlgBlt
@@ -6534,6 +6542,10 @@ private:
         POINT last = {}, down = {};                 // (where the mouse is, and where it was pressed)
         bool rotating = false, moving = false;
         bool shown = false;
+        std::vector<POINT> corners;                 // of the planes in the window, as last drawn (4 each)
+        int hover = -1;                             // the plane under the mouse
+        std::wstring hoverText;                     // what it is
+        bool tracking = false;                      // (of the mouse leaving)
 
         int Px(int n) const { const UINT dpi = GetDpiForWindow(wnd); return MulDiv(n, dpi ? dpi : 96, 96); }
 
@@ -6587,12 +6599,12 @@ private:
                         Drawn d = {};
                         double centre[3] = { b.c[0], b.c[1], b.c[2] };
                         centre[axis] += sign * b.half[axis];
-                        const int corners[4][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
+                        const int square[4][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
                         for (int c = 0; c < 4; c++)
                         {
                             double p[3] = { centre[0], centre[1], centre[2] };
-                            p[u] += corners[c][0] * b.half[u];
-                            p[v] += corners[c][1] * b.half[v];
+                            p[u] += square[c][0] * b.half[u];
+                            p[v] += square[c][1] * b.half[v];
                             d.side.p[c] = at(p);
                         }
                         memcpy(d.side.normal, n, sizeof(n));
@@ -6653,6 +6665,52 @@ private:
             InvalidateRect(wnd, nullptr, FALSE);
         }
 
+        // The plane whose outline is under a point (the nearest one, a few pixels away at most), or whose
+        // image is: -1 if none (or the figure is there)
+        int PlaneAt(POINT pt) const
+        {
+            if (SideAt(pt)) return -1;
+            const size_t n = (std::min)(planes.size(), corners.size() / 4);
+            double best = Px(5) + 0.5;
+            int found = -1;
+            for (size_t i = 0; i < n; i++)
+            {
+                const POINT* c = &corners[i * 4];
+                static const int edges[4][2] = { { 0, 1 }, { 1, 3 }, { 3, 2 }, { 2, 0 } };
+                for (const auto& e : edges)
+                {
+                    const double ax = c[e[0]].x, ay = c[e[0]].y, bx = c[e[1]].x - ax, by = c[e[1]].y - ay;
+                    const double len = bx * bx + by * by;
+                    double t = len > 0 ? ((pt.x - ax) * bx + (pt.y - ay) * by) / len : 0;
+                    t = t < 0 ? 0 : t > 1 ? 1 : t;
+                    const double d = std::hypot(pt.x - (ax + t * bx), pt.y - (ay + t * by));
+                    if (d < best) { best = d; found = static_cast<int>(i); }
+                }
+            }
+            if (found < 0 && bitmap && textured >= 0 && static_cast<size_t>(textured) < n)
+            {
+                // Inside the image (a parallelogram: the points by the two sides from its first corner)
+                const POINT* c = &corners[textured * 4];
+                const double ux = c[1].x - c[0].x, uy = c[1].y - c[0].y, vx = c[2].x - c[0].x, vy = c[2].y - c[0].y;
+                const double det = ux * vy - uy * vx, px = pt.x - c[0].x, py = pt.y - c[0].y;
+                if (std::fabs(det) > 1)
+                {
+                    const double a = (px * vy - py * vx) / det, b = (ux * py - uy * px) / det;
+                    if (a >= 0 && a <= 1 && b >= 0 && b <= 1) found = textured;
+                }
+            }
+            return found;
+        }
+
+        void Hover(int i)
+        {
+            if (i == hover) return;
+            hover = i;
+            if (i < 0) hoverText.clear();
+            InvalidateRect(wnd, nullptr, FALSE);
+            if (hovered) hovered(i);
+        }
+
         void Paint(HDC target)
         {
             RECT c;
@@ -6682,15 +6740,18 @@ private:
                 const double y = r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2];
                 return POINT{ static_cast<LONG>(std::lround(w / 2.0 + panX + x * scale)), static_cast<LONG>(std::lround(h / 2.0 + panY - y * scale)) };
             };
+            // Where the corners of the planes are (kept, for the mouse over them)
+            corners.resize(planes.size() * 4);
+            for (size_t i = 0; i < planes.size(); i++)
+                for (int k = 0; k < 4; k++) corners[i * 4 + k] = project(planes[i].p[k]);
             // The outlines, the others first, in one call for each color
-            auto outlines = [&](bool which, COLORREF color, int width) {
+            auto outlines = [&](int which, COLORREF color, int width) {
                 std::vector<POINT> points;
                 std::vector<DWORD> counts;
                 for (size_t i = 0; i < planes.size(); i++)
                 {
-                    if ((hot[i] != 0) != which) continue;
-                    const auto& q = planes[i].p;
-                    for (int k : { 0, 1, 3, 2, 0 }) points.push_back(project(q[k]));
+                    if (which == 2 ? static_cast<int>(i) != hover : (hot[i] != 0) != (which != 0)) continue;
+                    for (int k : { 0, 1, 3, 2, 0 }) points.push_back(corners[i * 4 + k]);
                     counts.push_back(5);
                 }
                 if (counts.empty()) return;
@@ -6700,20 +6761,21 @@ private:
                 SelectObject(dc, old);
                 DeleteObject(pen);
             };
-            outlines(false, RGB(200, 200, 200), 1);
+            outlines(0, RGB(200, 200, 200), 1);
             if (bitmap && textured >= 0 && textured < static_cast<int>(planes.size()))
             {
-                const auto& q = planes[textured].p;
-                POINT corners[3] = { project(q[0]), project(q[1]), project(q[2]) };
+                const POINT* at = &corners[textured * 4];
+                POINT to[3] = { at[0], at[1], at[2] };
                 HDC src = CreateCompatibleDC(dc);
                 HGDIOBJ old = SelectObject(src, bitmap);
                 SetStretchBltMode(dc, HALFTONE);
                 SetBrushOrgEx(dc, 0, 0, nullptr);
-                PlgBlt(dc, corners, src, 0, 0, texture.width, texture.height, nullptr, 0, 0);
+                PlgBlt(dc, to, src, 0, 0, texture.width, texture.height, nullptr, 0, 0);
                 SelectObject(src, old);
                 DeleteDC(src);
             }
-            outlines(true, RGB(220, 0, 0), Px(2));
+            outlines(1, RGB(220, 0, 0), Px(2));
+            outlines(2, HoverColor, Px(3));             // (the one under the mouse)
             // The patient, at the bottom left, turned as the planes are: a click on a side of it, the view
             // from that side
             Figure(dc, r, w, h);
@@ -6728,6 +6790,17 @@ private:
             InflateRect(&fill, Px(3), Px(1));
             FillRect(dc, &fill, GetSysColorBrush(COLOR_WINDOW));
             DrawTextW(dc, head.c_str(), -1, &top, DT_LEFT | DT_TOP | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (hover >= 0 && !hoverText.empty())
+            {
+                RECT under = { Px(8), fill.bottom + Px(2), w - Px(8), fill.bottom + Px(22) };
+                RECT back = under;
+                DrawTextW(dc, hoverText.c_str(), -1, &back, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT);
+                back.right = (std::min)(back.right, under.right);
+                InflateRect(&back, Px(3), Px(1));
+                FillRect(dc, &back, GetSysColorBrush(COLOR_WINDOW));
+                SetTextColor(dc, HoverColor);
+                DrawTextW(dc, hoverText.c_str(), -1, &under, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
             SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
             RECT bottom = { Px(16) + (std::max)(Px(48), (std::min)(Px(120), (std::min)(w, h) / 3)), h - Px(24), w - Px(8), h - Px(4) };
             DrawTextW(dc, L"drag: rotate   click the figure: from that side   right drag: move   wheel: zoom", -1, &bottom, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -6769,6 +6842,7 @@ private:
                 self->last = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 SetFocus(hwnd);
                 self->down = self->last;
+                self->Hover(-1);
                 SetCapture(hwnd);
                 return 0;
             case WM_MOUSEMOVE:
@@ -6784,6 +6858,18 @@ private:
                     else { self->panX += dx; self->panY += dy; }
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
+                else if (self)
+                {
+                    if (!self->tracking)
+                    {
+                        TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, hwnd, 0 };
+                        self->tracking = TrackMouseEvent(&t) != FALSE;
+                    }
+                    self->Hover(self->PlaneAt({ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }));
+                }
+                return 0;
+            case WM_MOUSELEAVE:
+                if (self) { self->tracking = false; self->Hover(-1); }
                 return 0;
             case WM_LBUTTONUP:
             case WM_RBUTTONUP:
@@ -6852,6 +6938,8 @@ private:
     std::vector<int> filePlane;                     // the plane of each file (-1: none, without a position)
     bool planesMade = false;
     int navigated = -1;                             // the planes the navigator shows: of this node (a study, mostly)
+    std::vector<int> navScene;                      // the plane of each one it draws
+    std::vector<int> lit;                           // the nodes of the plane under the mouse there, marked in the tree
     unsigned generation = 0;
     // An export or a report being written
     std::unique_ptr<ExportJob> job;
@@ -6958,6 +7046,7 @@ private:
         Button_SetCheck(compactBox, compact ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(identityBox, hideIdentity ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(hoverBox, hoverPreview ? BST_CHECKED : BST_UNCHECKED);
+        navigator.hovered = [this](int i) { Light(i); };
         if (navigator.Create(wnd) && ReadSetting(L"Navigator", 0)) { Button_SetCheck(navigatorBox, BST_CHECKED); navigator.Show(true); }
         SetWindowTheme(tree, L"Explorer", nullptr);
         TreeView_SetExtendedStyle(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
@@ -7147,6 +7236,8 @@ private:
         planesMade = false;
         navigated = -1;
         navigator.Clear();
+        navScene.clear();
+        lit.clear();
         nodes.clear();
         fileNode.clear();
         ListView_DeleteAllItems(info);
@@ -8028,8 +8119,10 @@ private:
         thin(around, most > mine.size() ? most - mine.size() : 0);
         std::vector<NavPlane> scene;
         std::vector<char> hot;
-        for (int p : around) { scene.push_back(navPlanes[p]); hot.push_back(0); }
-        for (int p : mine) { scene.push_back(navPlanes[p]); hot.push_back(1); }
+        Light(-1);
+        navScene.clear();
+        for (int p : around) { scene.push_back(navPlanes[p]); hot.push_back(0); navScene.push_back(p); }
+        for (int p : mine) { scene.push_back(navPlanes[p]); hot.push_back(1); navScene.push_back(p); }
         // One plane: its image (the first one, the chosen one if an image)
         Picture picture;
         int on = -1;
@@ -8059,6 +8152,37 @@ private:
         }
         navigator.Set(std::move(scene), std::move(hot), on, std::move(picture), nodes[n].text, more, context != navigated);
         navigated = context;
+    }
+
+    // The mouse over a plane of the navigator (-1: off them): the images of that plane marked in the tree,
+    // or the nearest node above them there (when their branch is closed)
+    void Light(int i)
+    {
+        if (lit.empty() && i < 0) return;
+        lit.clear();
+        if (i >= 0 && i < static_cast<int>(navScene.size()) && navigated > 0)
+        {
+            const int p = navScene[i];
+            size_t images = 0;
+            for (int f : nodes[navigated].files)
+            {
+                if (filePlane[f] != p) continue;
+                images++;
+                int x = fileNode[f];
+                while (x > 0 && !nodes[x].item) x = nodes[x].shownParent >= 0 ? nodes[x].shownParent : nodes[x].parent;
+                if (x > 0 && std::find(lit.begin(), lit.end(), x) == lit.end()) lit.push_back(x);
+            }
+            // What they are, in the navigator
+            std::wstring text;
+            if (!lit.empty())
+            {
+                text = nodes[lit[0]].text;
+                if (lit.size() > 1) text += L"   (and " + std::to_wstring(lit.size() - 1) + L" more)";
+                if (images > 1) text += L"   -   " + std::to_wstring(images) + L" images in this plane";
+            }
+            navigator.SetHoverText(text);
+        }
+        InvalidateRect(tree, nullptr, FALSE);
     }
 
     // The slider (or the cine) moved: an image chosen in the tree follows it
@@ -9605,6 +9729,7 @@ private:
                     {
                         cd->clrText = LevelColor(static_cast<int>(nodes[n].level));
                         if (Hit(n)) cd->clrTextBk = RGB(255, 236, 110);
+                        if (std::find(lit.begin(), lit.end(), n) != lit.end()) { cd->clrTextBk = RGB(200, 228, 255); cd->clrText = Navigator::HoverColor; }
                     }
                     if (nodes[n].level == Level::Series || nodes[n].level == Level::Patient)
                     {
