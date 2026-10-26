@@ -521,7 +521,7 @@ if ($RestoreQuarantine) {
 if ($Watch) {
     $isFirst = $false
     # (the name of the suite before: a watcher started by an older copy is found too)
-    $mutex =New-Object Threading.Mutex($true, 'Local\DicomStudyCountWatcher', [ref]$isFirst)
+    $mutex = New-Object Threading.Mutex($true, 'Local\DicomStudyCountWatcher', [ref]$isFirst)
     if (-not $isFirst) { return }     # another instance is already running
 
     $shell = New-Object -ComObject Shell.Application
