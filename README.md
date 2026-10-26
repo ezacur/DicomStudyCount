@@ -105,9 +105,10 @@ tree** opens the whole folder tree with one color per study.
   DICOMDIR is only read (DCMTK's DICOMDIR class is not used: it writes the file back when it finds
   something to correct).
   Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
-  JPEG 2000 pixel data, and the private PMSCT_RLE1 of Elscint / Philips CT (not deflated files, nor
-  floating point pixels). It uses DCMTK and OpenJPEG, inside the same DLL. Files without pixels (reports,
-  PDFs, presentation states) say so.
+  JPEG 2000 pixel data, deflated files and deflated image frames, the private PMSCT_RLE1 of Elscint /
+  Philips CT, floating point pixels (Parametric Maps: T1, T2, ADC... maps) and 1-bit ones
+  (segmentations, also when a frame does not start at a byte). It uses DCMTK, OpenJPEG and zlib, inside
+  the same DLL. Files without pixels (reports, PDFs, presentation states) say so.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
   usual low one: the low one cannot reach the Explorer window, and the *Columns* tab needs it.
 - **Hovering a DICOM file** shows its modality, series number and description, instance number,
@@ -122,6 +123,11 @@ tree** opens the whole folder tree with one color per study.
   x images per position) > **position** (the same ImagePositionPatient, in the order of their Z level)
   > **image** (InstanceNumber, trigger time, Z, file name). Every level in its color, with how many
   of what are under it.
+  - **Enhanced multi-frame files** (a whole volume, or cine, in one file) are taken apart: each frame
+    is an image of its own, with the position, orientation and trigger time of its functional groups
+    (`PerFrameFunctionalGroupsSequence`, or the shared ones), so they make orientations and positions
+    like separate files, and the checks, thumbnails and NIfTI see them as slices
+    (`CT Series 3 AX 512 x 512 x 2 (2 images (1 file))`). A file is counted once.
   - **People that share a PatientID** are told apart: some exports put the same placeholder in the
     PatientID of everyone (`9999`), and files without one all share the empty one. Within a PatientID,
     files whose birth date or name disagree are other people. The name is taken as its words, in
@@ -285,7 +291,7 @@ goes to `%LOCALAPPDATA%\DicomStudyCount\`, and the reports of the DICOM explorer
 | `bin\DicomStudyCount.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs |
 | `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
-| `third_party\` | DCMTK 3.7.0 and OpenJPEG 2.5.3 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
+| `third_party\` | DCMTK 3.7.0, OpenJPEG 2.5.3 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
 
 ## Installation
 

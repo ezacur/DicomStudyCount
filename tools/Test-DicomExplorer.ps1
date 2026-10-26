@@ -31,8 +31,9 @@ if ($Log -and ((Test-Path -LiteralPath $Log -PathType Container) -or $Log -notma
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $dcmtkInstall = Join-Path $root 'build\dcmtk-install'
 $openJpegInstall = Join-Path $root 'build\openjpeg-install'
-if (-not (Test-Path (Join-Path $dcmtkInstall 'lib\dcmdata.lib')) -or -not (Test-Path (Join-Path $openJpegInstall 'lib\openjp2.lib'))) {
-    throw 'DCMTK and OpenJPEG are not built yet: run .\tools\Build.ps1 -Cpp first'
+if (-not (Test-Path (Join-Path $dcmtkInstall 'lib\dcmdata.lib')) -or -not (Test-Path (Join-Path $openJpegInstall 'lib\openjp2.lib')) -or
+    -not (Test-Path (Join-Path $root 'build\zlib-install\lib\zlib_o.lib'))) {
+    throw 'DCMTK, OpenJPEG and zlib are not built yet: run .\tools\Build.ps1 -Cpp first'
 }
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = if (Test-Path $vswhere) { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath }
@@ -47,12 +48,14 @@ try {
     $lib = Join-Path $dcmtkInstall 'lib'
     $libs = ('dcmimage', 'dcmimgle', 'dcmjpeg', 'ijg8', 'ijg12', 'ijg16', 'dcmjpls', 'dcmtkcharls', 'dcmdata', 'oflog', 'ofstd' |
         ForEach-Object { '"{0}"' -f (Join-Path $lib "$_.lib") }) -join ' '
-    $libs += ' "{0}"' -f (Join-Path $openJpegInstall 'lib\openjp2.lib')
+    $zlibInstall = Join-Path $root 'build\zlib-install'
+    $libs += ' "{0}" "{1}"' -f (Join-Path $openJpegInstall 'lib\openjp2.lib'), (Join-Path $zlibInstall 'lib\zlib_o.lib')
     $openJpegInclude = (Get-ChildItem (Join-Path $openJpegInstall 'include') -Directory | Select-Object -First 1).FullName
     $exe = Join-Path $work 'ExplorerTest.exe'
     $cl = ('cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DOPJ_STATIC /external:W0 /external:I "{0}" /external:I "{1}"' +
-           ' "{2}" /Fo"{3}\\" /Fe"{4}" /link {5} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
-        (Join-Path $dcmtkInstall 'include'), $openJpegInclude, (Join-Path $root 'tools\ExplorerTest.cpp'), $work, $exe, $libs
+           ' /external:I "{6}" "{2}" /Fo"{3}\\" /Fe"{4}" /link {5} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
+        (Join-Path $dcmtkInstall 'include'), $openJpegInclude, (Join-Path $root 'tools\ExplorerTest.cpp'), $work, $exe, $libs,
+        (Join-Path $zlibInstall 'include')
     cmd /c "`"$vcvars`" >nul 2>nul && $cl 2>&1" | Where-Object { $_ -match 'error|warning' } | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "The test did not build ($LASTEXITCODE)" }
 

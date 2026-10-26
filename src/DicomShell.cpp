@@ -34,6 +34,7 @@
 #include "dcmtk/dcmjpls/djdecode.h"
 #include "dcmtk/oflog/oflog.h"
 #include "openjpeg.h"
+#include "zlib.h"
 #include <memory>
 #include <mutex>
 
@@ -2075,6 +2076,217 @@ static DcmDataset* DecodePmsct(DcmDataset* ds)
     return copy;
 }
 
+// The fragments of one frame of encapsulated pixel data (item 0 is the offset table): all of them for
+// a single frame; for more, one fragment a frame when there are as many, or else the offset table
+static bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<Uint8>& out)
+{
+    out.clear();
+    DcmElement* element = nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return false;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq || seq->card() < 2) return false;
+    const unsigned long fragments = seq->card() - 1;
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+    auto append = [&](unsigned long i) {
+        DcmPixelItem* item = nullptr;
+        Uint8* bytes = nullptr;
+        if (seq->getItem(item, i).bad() || !item || item->getUint8Array(bytes).bad() || !bytes) return false;
+        out.insert(out.end(), bytes, bytes + item->getLength());
+        return true;
+    };
+    if (!multiframe || frames == 1)
+    {
+        for (unsigned long i = 1; i <= fragments; i++) if (!append(i)) return false;
+        return !out.empty();
+    }
+    if (static_cast<long>(fragments) == frames) return append(static_cast<unsigned long>(frame) + 1);
+    // The offset table: where each frame starts, counted from the first fragment (8 bytes of header each)
+    DcmPixelItem* table = nullptr;
+    Uint8* offsets = nullptr;
+    if (seq->getItem(table, 0).bad() || !table || table->getLength() < static_cast<Uint32>(4 * frames) || table->getUint8Array(offsets).bad() || !offsets)
+        return false;
+    auto at = [&](int k) { Uint32 v; memcpy(&v, offsets + 4 * k, 4); return v; };
+    const Uint32 from = at(frame), to = frame + 1 < frames ? at(frame + 1) : 0xFFFFFFFF;
+    Uint32 position = 0;
+    for (unsigned long i = 1; i <= fragments; i++)
+    {
+        DcmPixelItem* item = nullptr;
+        if (seq->getItem(item, i).bad() || !item) return false;
+        if (position >= from && position < to && !append(i)) return false;
+        position += item->getLength() + 8;
+    }
+    return !out.empty();
+}
+
+// A copy of a dataset with one frame as native pixel data (Explicit VR Little Endian), as the decoders
+// below give it to DicomImage: 8 or 16 bits as stored, no other frames
+static DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 allocated)
+{
+    auto out = new DcmDataset(*ds);
+    out->findAndDeleteElement(DCM_PixelData);
+    out->findAndDeleteElement(DCM_FloatPixelData);
+    out->findAndDeleteElement(DCM_DoubleFloatPixelData);
+    if (allocated <= 8) out->putAndInsertUint8Array(DCM_PixelData, bytes.data(), static_cast<unsigned long>(bytes.size()));
+    else
+    {
+        std::vector<Uint16> words(bytes.size() / 2);
+        memcpy(words.data(), bytes.data(), words.size() * 2);
+        out->putAndInsertUint16Array(DCM_PixelData, words.data(), static_cast<unsigned long>(words.size()));
+    }
+    out->findAndDeleteElement(DCM_NumberOfFrames);
+    return out;
+}
+
+// Deflated image frames (1.2.840.10008.1.2.8.1): each frame compressed by deflate (raw, or with a zlib
+// header), which DCMTK reads the name of but has no codec for. 1-bit frames (segmentations) come out as
+// 8 bits, 0 or 255. Null if it cannot.
+static DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame)
+{
+    std::vector<Uint8> packed;
+    if (!FrameBytes(ds, multiframe, frame, packed)) return nullptr;
+    Uint16 rows = 0, columns = 0, allocated = 0, samples = 1;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    ds->findAndGetUint16(DCM_SamplesPerPixel, samples);
+    const size_t n = static_cast<size_t>(rows) * columns * (samples ? samples : 1);
+    if (n == 0 || (allocated != 1 && allocated != 8 && allocated != 16)) return nullptr;
+    const size_t size = allocated == 1 ? (n + 7) / 8 : n * allocated / 8;
+    std::vector<Uint8> plain(size);
+    // raw deflate first (-15), then with a zlib or gzip header (47)
+    bool ok = false;
+    for (int bits : { -15, 47 })
+    {
+        z_stream z = {};
+        if (inflateInit2(&z, bits) != Z_OK) continue;
+        z.next_in = packed.data();
+        z.avail_in = static_cast<uInt>(packed.size());
+        z.next_out = plain.data();
+        z.avail_out = static_cast<uInt>(plain.size());
+        const int r = inflate(&z, Z_FINISH);
+        ok = (r == Z_STREAM_END || r == Z_OK || r == Z_BUF_ERROR) && z.avail_out == 0;
+        inflateEnd(&z);
+        if (ok) break;
+    }
+    if (!ok) return nullptr;
+    if (allocated == 1)
+    {
+        // (bits from the lowest one of each byte, as DICOM packs them)
+        std::vector<Uint8> wide(n);
+        for (size_t i = 0; i < n; i++) wide[i] = (plain[i / 8] >> (i % 8)) & 1 ? 255 : 0;
+        DcmDataset* out = NativeCopy(ds, wide, 8);
+        out->putAndInsertUint16(DCM_BitsAllocated, 8);
+        out->putAndInsertUint16(DCM_BitsStored, 8);
+        out->putAndInsertUint16(DCM_HighBit, 7);
+        out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+        return out;
+    }
+    return NativeCopy(ds, plain, allocated);
+}
+
+// 1-bit pixels as they are (segmentations): a frame need not start at a byte, and DCMTK reads only the
+// frames that do. Its bits, from the lowest one of each byte, as 8 bits (0 or 255).
+static bool IsBitFrames(DcmDataset* ds, E_TransferSyntax xfer)
+{
+    Uint16 allocated = 0;
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    return allocated == 1 && !DcmXfer(xfer).isEncapsulated() && ds->tagExists(DCM_PixelData);
+}
+
+static DcmDataset* DecodeBitFrame(DcmDataset* ds, int frame)
+{
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    const size_t n = static_cast<size_t>(rows) * columns, first = static_cast<size_t>(frame) * n;
+    DcmElement* e = nullptr;
+    if (n == 0 || ds->findAndGetElement(DCM_PixelData, e).bad() || !e) return nullptr;
+    Uint8* bytes = nullptr;
+    Uint16* words = nullptr;                        // (OW: the same bytes, little endian)
+    if (e->getUint8Array(bytes).bad() || !bytes)
+    {
+        if (e->getUint16Array(words).bad() || !words) return nullptr;
+        bytes = reinterpret_cast<Uint8*>(words);
+    }
+    const unsigned long count = e->getLength();
+    if ((first + n + 7) / 8 > count) return nullptr;
+    std::vector<Uint8> wide(n);
+    for (size_t i = 0; i < n; i++) wide[i] = (bytes[(first + i) / 8] >> ((first + i) % 8)) & 1 ? 255 : 0;
+    DcmDataset* out = NativeCopy(ds, wide, 8);
+    out->putAndInsertUint16(DCM_BitsAllocated, 8);
+    out->putAndInsertUint16(DCM_BitsStored, 8);
+    out->putAndInsertUint16(DCM_HighBit, 7);
+    out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+    return out;
+}
+
+// Float pixel data (Parametric Maps: T1, T2, ADC... as decimal numbers, 7FE0,0008 or 7FE0,0009): the
+// values of a frame, which DCMTK cannot render
+static bool FloatFrame(DcmDataset* ds, int frame, std::vector<double>& values)
+{
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    const size_t n = static_cast<size_t>(rows) * columns, at = static_cast<size_t>(frame) * n;
+    if (n == 0) return false;
+    DcmElement* e = nullptr;
+    if (ds->findAndGetElement(DCM_FloatPixelData, e).good() && e)
+    {
+        Float32* f = nullptr;
+        if (e->getFloat32Array(f).bad() || !f || e->getLength() / 4 < at + n) return false;
+        values.assign(f + at, f + at + n);
+        return true;
+    }
+    if (ds->findAndGetElement(DCM_DoubleFloatPixelData, e).good() && e)
+    {
+        Float64* d = nullptr;
+        if (e->getFloat64Array(d).bad() || !d || e->getLength() / 8 < at + n) return false;
+        values.assign(d + at, d + at + n);
+        return true;
+    }
+    return false;
+}
+
+// For the preview: the frame as 16-bit values with a rescale back to the decimal ones, so DicomImage
+// shows them and their window is in their units
+static DcmDataset* DecodeFloatFrame(DcmDataset* ds, int frame)
+{
+    std::vector<double> values;
+    if (!FloatFrame(ds, frame, values)) return nullptr;
+    double lo = 0, hi = 0;
+    bool first = true;
+    for (double v : values)
+        if (std::isfinite(v)) { if (first) { lo = hi = v; first = false; } else { lo = (std::min)(lo, v); hi = (std::max)(hi, v); } }
+    const double slope = hi > lo ? (hi - lo) / 65535 : 1;
+    std::vector<Uint8> bytes(values.size() * 2);
+    for (size_t i = 0; i < values.size(); i++)
+    {
+        const double v = std::isfinite(values[i]) ? values[i] : lo;
+        const Uint16 s = static_cast<Uint16>(std::lround((v - lo) / slope));
+        memcpy(&bytes[2 * i], &s, 2);
+    }
+    DcmDataset* out = NativeCopy(ds, bytes, 16);
+    out->putAndInsertUint16(DCM_BitsAllocated, 16);
+    out->putAndInsertUint16(DCM_BitsStored, 16);
+    out->putAndInsertUint16(DCM_HighBit, 15);
+    out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+    out->putAndInsertUint16(DCM_SamplesPerPixel, 1);
+    out->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+    char text[64];
+    sprintf_s(text, "%.10g", slope);
+    out->putAndInsertString(DCM_RescaleSlope, text);
+    sprintf_s(text, "%.10g", lo);
+    out->putAndInsertString(DCM_RescaleIntercept, text);
+    return out;
+}
+
+static bool HasFloatPixels(DcmDataset* ds) { return ds->tagExists(DCM_FloatPixelData) || ds->tagExists(DCM_DoubleFloatPixelData); }
+
 // Why a file has no image to show: it has no pixels (a report, a PDF, a presentation state...), or
 // they are in a transfer syntax that is not known here. Empty if it may have one.
 static std::wstring NoImage(DcmFileFormat& ff)
@@ -2083,10 +2295,8 @@ static std::wstring NoImage(DcmFileFormat& ff)
     ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, syntax);
     if (IsPmsct(ff)) return std::wstring();
     if (!syntax.empty() && DcmXfer(syntax.c_str()).getXfer() == EXS_Unknown) return Compression(syntax.c_str()) + L" is not supported";
-    if (!ff.getDataset()->tagExists(DCM_PixelData))
+    if (!ff.getDataset()->tagExists(DCM_PixelData) && !HasFloatPixels(ff.getDataset()))
     {
-        if (ff.getDataset()->tagExists(DCM_FloatPixelData) || ff.getDataset()->tagExists(DCM_DoubleFloatPixelData))
-            return L"its pixels are floating point numbers, not supported here";
         OFString sop;
         ff.getDataset()->findAndGetOFString(DCM_SOPClassUID, sop);
         return L"it has no pixels (" + (sop.empty() ? std::wstring(L"no SOP class") : ObjectType(sop.c_str())) + L")";
@@ -2216,6 +2426,21 @@ static std::wstring ShowFrame(Rendered& r, int frame, bool keep)
         decoded.reset(DecodePmsct(ff.getDataset()));
         if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
     }
+    else if (IsBitFrames(ff.getDataset(), im->xfer))
+    {
+        decoded.reset(DecodeBitFrame(ff.getDataset(), frame));
+        if (!decoded) return L"its 1-bit pixels could not be read";
+    }
+    else if (im->xfer == EXS_DeflatedImageFrameCompression)
+    {
+        decoded.reset(DecodeDeflatedFrame(ff.getDataset(), r.frames > 1, frame));
+        if (!decoded) return L"its deflated image frames could not be decoded";
+    }
+    else if (HasFloatPixels(ff.getDataset()))
+    {
+        decoded.reset(DecodeFloatFrame(ff.getDataset(), frame));
+        if (!decoded) return L"its floating point pixels could not be read";
+    }
     im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
                                              decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData,
                                              decoded ? 0 : static_cast<unsigned long>(frame), 1);
@@ -2336,7 +2561,7 @@ static Rendered RenderDicom(const std::vector<char>& data, Render what = Render:
                     L", " + std::to_wstring(files) + L" files";
     }
     r.imaging = im;
-    if (ds->tagExists(DCM_PixelData) || IsPmsct(ff))
+    if (ds->tagExists(DCM_PixelData) || IsPmsct(ff) || HasFloatPixels(ds))
     {
         // Only the frame shown is decoded: a multi-frame file can be large
         const std::wstring why = ShowFrame(r, 0, false);
@@ -2884,13 +3109,16 @@ public:
         bounds = rc;
         return CreateWindows();
     }
-    void ShowFiles(const std::vector<std::wstring>& files, int index)
+    // (frames: of each file, which one of an enhanced multi-frame file it is; -1: the file as it is)
+    void ShowFiles(const std::vector<std::wstring>& files, int index, const std::vector<int>& frames = {})
     {
         StopPoster();
         Play(false);
         windowSet = false;
         zoom = 1;
         series = files;
+        seriesFrames = frames;
+        if (std::none_of(seriesFrames.begin(), seriesFrames.end(), [](int f) { return f >= 0; })) seriesFrames.clear();
         slice = -1;
         group = -1;
         if (index >= 0 && index < static_cast<int>(files.size()))
@@ -2943,6 +3171,7 @@ private:
     static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2;
     static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2, TimerPoster = 3;
     std::vector<PosterFrame> poster;                // hosted: the thumbnail shown before the files (none: empty)
+    std::vector<int> seriesFrames;                  // hosted: the frame of each file of `series` (empty: none)
     size_t posterFrame = 0;
 
     void PosterPixels()
@@ -3739,7 +3968,7 @@ private:
             left = playRect.right + Px(8);
 
             wchar_t where[96];
-            if (view.frames > 1 && series.size() > 1)
+            if (view.frames > 1 && series.size() > 1 && seriesFrames.empty())
                 swprintf_s(where, L"Frame %d / %d   File %d / %d", at + 1, n, slice + 1, static_cast<int>(series.size()));
             else if (!poster.empty()) swprintf_s(where, L"Thumbnail   %d files", n);
             else swprintf_s(where, view.frames > 1 ? L"Frame %d / %d" : L"Slice %d / %d", at + 1, n);
@@ -3769,11 +3998,12 @@ private:
     }
 
     // The slider of the image bar: the frames of a multi-frame file, or else the files of its series
-    int Count() const { return view.frames > 1 ? view.frames : static_cast<int>(series.size()); }
-    int Position() const { return view.frames > 1 ? view.frame : slice; }
+    // (the frames of enhanced files, as images of their own: the slider over them, as over files)
+    int Count() const { return view.frames > 1 && seriesFrames.empty() ? view.frames : static_cast<int>(series.size()); }
+    int Position() const { return view.frames > 1 && seriesFrames.empty() ? view.frame : slice; }
     void GoTo(int i)
     {
-        if (view.frames > 1) GoFrame(i);
+        if (view.frames > 1 && seriesFrames.empty()) GoFrame(i);
         else GoSlice(i);
     }
     void Step(int delta)
@@ -3801,12 +4031,27 @@ private:
     {
         if (i < 0 || i >= static_cast<int>(series.size()) || i == slice) return;
         StopPoster();
+        // Another frame of the enhanced file shown: only that frame, the file not read again
+        const int wanted = i < static_cast<int>(seriesFrames.size()) ? seriesFrames[i] : -1;
+        if (wanted >= 0 && slice >= 0 && series[i] == current && view.imaging && poster.empty())
+        {
+            const bool had = !view.pixels.empty();
+            std::wstring why;
+            try { why = ShowFrame(view, wanted, true); }
+            catch (...) { why = L"it cannot be shown"; }
+            view.frame = wanted;
+            slice = i;
+            if (hosted && moved) moved(i);
+            Shown(had);
+            return;
+        }
         Rendered next;
         try
         {
             std::vector<char> data;
             if (ReadPath(series[i], data)) next = RenderDicom(data, Render::Image);
             else next.summary = L"This file cannot be read";
+            if (wanted > 0 && next.imaging) ShowFrame(next, wanted, false);
         }
         catch (...) { next = Rendered(); next.summary = L"This file cannot be shown"; }
         Imaging* before = view.imaging.get();
@@ -4442,10 +4687,19 @@ struct Gathered
     double orientation[6] = {}, position[3] = {}, z = 0;
     bool oriented = false, placed = false, hasZ = false;
     unsigned rows = 0, columns = 0;
-    long frames = 1;
-    long long bytes = 0;
+    long frames = 1;                                // (a frame of an enhanced file: all of them in its first one, 0 in the rest)
+    int frame = -1;                                 // a frame of an enhanced multi-frame file (-1: the whole file)
+    long long bytes = 0;                            // (a frame: the size of the file in its first one, 0 in the rest)
     Attributes attributes;
 };
+
+// The value of a tag among the attributes (sorted by tag): put, or changed
+static void SetAttribute(Attributes& a, Uint32 tag, Uint32 id)
+{
+    auto it = std::lower_bound(a.begin(), a.end(), tag, [](const std::pair<Uint32, Uint32>& x, Uint32 t) { return x.first < t; });
+    if (it != a.end() && it->first == tag) it->second = id;
+    else a.insert(it, { tag, id });
+}
 
 // Who the patient of a file is, beyond its PatientID: its birth date (its digits) and the words of its
 // name, in capitals, without accents and in alphabetical order ("Garcia^Juan", "JUAN GARCIA" and "garcia,
@@ -4528,7 +4782,7 @@ enum class Found { Other, Dicom, Directory };
 
 // A file, if it is DICOM (a DICOMDIR is not one of the files): its header up to the pixels, by DCMTK.
 // Values of more than 4 KB are not read: their size stands for them.
-static Found GatherFile(const std::wstring& path, long long bytes, Gathered& g, ValuePool& pool)
+static Found GatherFile(const std::wstring& path, long long bytes, Gathered& g, std::vector<Gathered>& more, ValuePool& pool)
 {
     {
         HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -4606,6 +4860,56 @@ static Found GatherFile(const std::wstring& path, long long bytes, Gathered& g, 
             }
             g.attributes.emplace_back((static_cast<Uint32>(tag.getGTag()) << 16) | tag.getETag(), pool.Id(v));
         }
+    std::sort(g.attributes.begin(), g.attributes.end());
+
+    // Enhanced multi-frame (a volume, a cine, in one file): each frame an image of its own, with the
+    // position, orientation and trigger time of its functional groups (its own, or the shared ones)
+    DcmSequenceOfItems* perFrame = nullptr;
+    if (g.frames > 1 && ds->findAndGetSequence(DCM_PerFrameFunctionalGroupsSequence, perFrame).good() && perFrame &&
+        static_cast<long>(perFrame->card()) == g.frames)
+    {
+        DcmSequenceOfItems* sharedSeq = nullptr;
+        DcmItem* shared = ds->findAndGetSequence(DCM_SharedFunctionalGroupsSequence, sharedSeq).good() && sharedSeq && sharedSeq->card()
+                              ? sharedSeq->getItem(0) : nullptr;
+        auto inGroup = [](DcmItem* group, const DcmTagKey& sequence, const DcmTagKey& key) {
+            DcmSequenceOfItems* s = nullptr;
+            OFString v;
+            if (group && group->findAndGetSequence(sequence, s).good() && s && s->card()) s->getItem(0)->findAndGetOFStringArray(key, v);
+            return std::string(v.c_str(), v.length());
+        };
+        auto value = [&](DcmItem* item, const DcmTagKey& sequence, const DcmTagKey& key) {
+            const std::string v = inGroup(item, sequence, key);
+            return v.empty() ? inGroup(shared, sequence, key) : v;
+        };
+        const Gathered base = g;
+        const long total = g.frames;
+        more.reserve(static_cast<size_t>(total - 1));
+        for (long k = 0; k < total; k++)
+        {
+            if (k > 0) more.push_back(base);
+            Gathered& e = k == 0 ? g : more.back();
+            DcmItem* item = perFrame->getItem(static_cast<unsigned long>(k));
+            e.frame = static_cast<int>(k);
+            e.frames = k == 0 ? total : 0;
+            e.bytes = k == 0 ? bytes : 0;
+            const std::string ipp = value(item, DCM_PlanePositionSequence, DCM_ImagePositionPatient);
+            const std::string iop = value(item, DCM_PlaneOrientationSequence, DCM_ImageOrientationPatient);
+            const std::string delay = value(item, DCM_CardiacSynchronizationSequence, DCM_NominalCardiacTriggerDelayTime);
+            if (!ipp.empty()) e.positionText = ipp;
+            if (!iop.empty()) e.orientationText = iop;
+            if (!delay.empty()) e.trigger = delay;
+            e.oriented = Numbers(e.orientationText, e.orientation, 6);
+            e.placed = Numbers(e.positionText, e.position, 3);
+            Header fh;
+            fh.imageOrientation = e.orientationText;
+            fh.imagePosition = e.positionText;
+            e.hasZ = ZLevel(fh, e.z);
+            // (and among its attributes, where the full info shows them varying from frame to frame)
+            if (!ipp.empty()) SetAttribute(e.attributes, 0x00200032, pool.Id(Widen(ipp)));
+            if (!iop.empty()) SetAttribute(e.attributes, 0x00200037, pool.Id(Widen(iop)));
+            if (!delay.empty()) SetAttribute(e.attributes, 0x00181060, pool.Id(Widen(delay)));
+        }
+    }
     return Found::Dicom;
 }
 
@@ -4662,6 +4966,7 @@ static void Gather(Gathering* g)
     g->listing = false;
 
     std::vector<Gathered> read(items.size());
+    std::vector<std::vector<Gathered>> frames(items.size());     // (the frames of enhanced files after their first one)
     std::vector<Found> kinds(items.size(), Found::Other);
     std::atomic<size_t> next{ 0 };
     auto work = [&]() {
@@ -4669,7 +4974,7 @@ static void Gather(Gathering* g)
         {
             const size_t i = next++;
             if (i >= items.size() || g->cancel) break;
-            try { kinds[i] = GatherFile(items[i].path, items[i].bytes, read[i], g->pool); }
+            try { kinds[i] = GatherFile(items[i].path, items[i].bytes, read[i], frames[i], g->pool); }
             catch (...) { kinds[i] = Found::Other; }
             g->done++;
         }
@@ -4681,7 +4986,11 @@ static void Gather(Gathering* g)
     for (auto& w : workers) w.join();
     for (size_t i = 0; i < items.size(); i++)
     {
-        if (kinds[i] == Found::Dicom) g->files.push_back(std::move(read[i]));
+        if (kinds[i] == Found::Dicom) 
+        {
+            g->files.push_back(std::move(read[i]));
+            for (auto& f : frames[i]) g->files.push_back(std::move(f));
+        }
         else if (kinds[i] == Found::Directory) g->directories++;
         else g->others++;
     }
@@ -4811,6 +5120,7 @@ struct Slice
     double slope = 1, intercept = 0;               // the rescale of the file
     double center = 0, window = 0;                 // the first window of the header (width 0: none)
     double frameTime = 0;                          // a multi-frame file: ms from frame to frame (0: not known)
+    bool isFloat = false;                          // decimal values (Float Pixel Data), in their units
 };
 
 // The first number of a value ("40\400": 40)
@@ -4860,6 +5170,34 @@ static std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored
     {
         decoded.reset(DecodePmsct(ds));
         if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
+    }
+    else if (IsBitFrames(ds, xfer))
+    {
+        decoded.reset(DecodeBitFrame(ds, frame));
+        if (!decoded) return L"its 1-bit pixels could not be read";
+    }
+    else if (xfer == EXS_DeflatedImageFrameCompression)
+    {
+        decoded.reset(DecodeDeflatedFrame(ds, frames > 1, frame));
+        if (!decoded) return L"its deflated image frames could not be decoded";
+    }
+    else if (HasFloatPixels(ds))
+    {
+        // Decimal numbers: the values as they are, already in their units (no rescale to undo)
+        std::vector<double> values;
+        Uint16 rows = 0, columns = 0;
+        ds->findAndGetUint16(DCM_Rows, rows);
+        ds->findAndGetUint16(DCM_Columns, columns);
+        if (!FloatFrame(ds, frame, values)) return L"its floating point pixels could not be read";
+        s.width = columns;
+        s.height = rows;
+        s.values.resize(values.size());
+        for (size_t i = 0; i < values.size(); i++) s.values[i] = static_cast<float>(values[i]);
+        s.isFloat = true;
+        s.slope = 1;
+        s.intercept = 0;
+        s.bits = -32;
+        return std::wstring();
     }
     const unsigned long flags = CIF_UsePartialAccessToPixelData | (stored ? CIF_IgnoreModalityTransformation : 0);
     DicomImage image(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer, flags,
@@ -5144,9 +5482,16 @@ static Picture Cascade(const std::vector<Picture>& tiles, DWORD background)
 }
 
 // What a thumbnail or an export shows: positions (in their order), each one its images in time order
+// An image of a stack: its file, and its frame there (the frames of enhanced files are images of their own)
+struct FrameRef
+{
+    std::wstring path;
+    int frame = 0;
+};
+
 struct Stack
 {
-    std::vector<std::vector<std::wstring>> files;
+    std::vector<std::vector<FrameRef>> files;
     int frames = 1;                                 // one multi-frame file: its frames are the times
     double delay = 0;                               // ms from time to time (0: not known)
 };
@@ -5197,8 +5542,9 @@ static Thumb StackThumb(const Stack& st, int single, int tile, bool middle, cons
     }
     auto read = [&](int z, int t, Slice& s) {
         const auto& p = st.files[z];
-        if (multiframe) return DecodeSlice(p[0], t, false, s);
-        return DecodeSlice(p[(std::min)(t, static_cast<int>(p.size()) - 1)], 0, false, s);
+        if (multiframe) return DecodeSlice(p[0].path, t, false, s);
+        const FrameRef& r = p[(std::min)(t, static_cast<int>(p.size()) - 1)];
+        return DecodeSlice(r.path, r.frame, false, s);
     };
     // The box and the window from some of them: all the positions at the middle time, or a few times
     std::map<std::pair<int, int>, Slice> kept;
@@ -5532,11 +5878,11 @@ static std::wstring WritePictures(IWICImagingFactory* factory, const ExportUnit&
 {
     const Stack& st = u.stack;
     std::vector<std::pair<std::wstring, int>> order;         // (file, frame)
-    if (u.kind == ExportUnit::Png) order.push_back({ st.files[0][0], 0 });
+    if (u.kind == ExportUnit::Png) order.push_back({ st.files[0][0].path, st.files[0][0].frame });
     else if (st.frames > 1 && st.files.size() == 1 && st.files[0].size() == 1)
-        for (int k = 0; k < st.frames; k++) order.push_back({ st.files[0][0], k });
-    else if (u.overTime) for (const auto& f : st.files[0]) order.push_back({ f, 0 });
-    else for (const auto& p : st.files) order.push_back({ p[0], 0 });
+        for (int k = 0; k < st.frames; k++) order.push_back({ st.files[0][0].path, k });
+    else if (u.overTime) for (const auto& f : st.files[0]) order.push_back({ f.path, f.frame });
+    else for (const auto& p : st.files) order.push_back({ p[0].path, p[0].frame });
     Slice first;
     std::wstring why = DecodeSlice(order[0].first, order[0].second, false, first);
     if (!why.empty()) return why;
@@ -5598,12 +5944,12 @@ static std::wstring WriteNifti(const ExportUnit& u, const std::atomic<bool>& can
     const int Z = static_cast<int>(st.files.size());
     const bool multiframe = st.frames > 1 && Z == 1 && st.files[0].size() == 1;
     const int T = multiframe ? st.frames : static_cast<int>(st.files[0].size());
-    auto path = [&](int z, int t) { return multiframe ? st.files[0][0] : st.files[z][t]; };
+    auto path = [&](int z, int t) { return multiframe ? FrameRef{ st.files[0][0].path, t } : st.files[z][t]; };
     Slice first;
-    std::wstring why = DecodeSlice(path(0, 0), 0, true, first);
+    std::wstring why = DecodeSlice(path(0, 0).path, path(0, 0).frame, true, first);
     if (!why.empty()) return why;
     NiftiHeader hd;
-    const bool asFloat = first.mono && !u.sameRescale;
+    const bool asFloat = first.mono && (!u.sameRescale || first.isFloat);     // (decimal pixels: as they are)
     if (!first.mono) { hd.datatype = 128; hd.bitpix = 24; }
     else if (asFloat) { hd.datatype = 16; hd.bitpix = 32; }
     else
@@ -5693,7 +6039,7 @@ static std::wstring WriteNifti(const ExportUnit& u, const std::atomic<bool>& can
             if (cancel) { fclose(f); return L"stopped"; }
             Slice s;
             const Slice* use = &first;
-            if (t > 0 || z > 0) use = DecodeSlice(path(z, t), multiframe ? t : 0, true, s).empty() ? &s : nullptr;
+            if (t > 0 || z > 0) use = DecodeSlice(path(z, t).path, path(z, t).frame, true, s).empty() ? &s : nullptr;
             if (!use || use->width != first.width || use->height != first.height || use->mono != first.mono) { use = nullptr; unread++; }
             std::fill(bytes.begin(), bytes.end(), static_cast<BYTE>(0));
             for (size_t i = 0; use && i < n; i++)
@@ -6423,7 +6769,7 @@ private:
             if (n.level == Level::Series) { series++; if (!n.flags.empty()) troubled++; }
         }
         wchar_t text[400];
-        swprintf_s(text, L"%zu DICOM files: %ld patient%s, %ld stud%s, %ld series", data->files.size(), patients,
+        swprintf_s(text, L"%zu DICOM files: %ld patient%s, %ld stud%s, %ld series", nodes.empty() ? size_t(0) : FilesOf(0), patients,
                    patients == 1 ? L"" : L"s", studies, studies == 1 ? L"y" : L"ies", series);
         std::wstring s = text;
         if (data->others) s += L"   -   " + std::to_wstring(data->others) + L" other files";
@@ -6487,7 +6833,8 @@ private:
             const double s = atof(x.trigger.c_str()), t = atof(y.trigger.c_str());
             if (s != t) return s < t;
             if (x.time != y.time) return x.time < y.time;
-            return StrCmpLogicalW(x.path.c_str(), y.path.c_str()) < 0;
+            const int byName = StrCmpLogicalW(x.path.c_str(), y.path.c_str());
+            return byName ? byName < 0 : x.frame < y.frame;     // (the frames of a file in their order)
         });
         rank.assign(files.size(), 0);
         for (size_t i = 0; i < all.size(); i++) rank[all[i]] = static_cast<int>(i);
@@ -6609,7 +6956,10 @@ private:
         // The same SOP instance UID in more than one file (copies)
         std::unordered_map<Uint32, std::vector<int>> uids;
         for (size_t f = 0; f < files.size(); f++)
+        {
+            if (files[f].frame > 0) continue;       // (the frames of a file share its UID)
             if (const auto* a = Find(files[f].attributes, 0x00080018)) uids[a->second].push_back(static_cast<int>(f));
+        }
         for (const auto& [uid, same] : uids)
         {
             if (same.size() < 2) continue;
@@ -6629,6 +6979,7 @@ private:
             {
                 // Shorter than its pixels (uncompressed only: the size of compressed ones is not known)
                 const int f = node.files[0];
+                if (files[f].frame > 0) continue;              // (once a file: its first frame)
                 const std::wstring* ts = AttributeOf(f, 0x00020010);
                 std::wstring syntax = ts ? *ts : L"";
                 while (!syntax.empty() && (syntax.back() == L' ' || syntax.back() == 0)) syntax.pop_back();
@@ -6653,6 +7004,7 @@ private:
                 std::vector<long> numbers;
                 for (int f : node.files)
                 {
+                    if (files[f].frame > 0) continue;          // (the frames of a file share its number)
                     const std::string& s = files[f].instance;
                     if (s.empty()) { numbers.clear(); break; }
                     numbers.push_back(atol(s.c_str()));
@@ -6937,6 +7289,22 @@ private:
         }
     }
 
+    // The files of a node (the frames of an enhanced file are images of their own, but one file)
+    size_t FilesOf(int n) const
+    {
+        size_t k = 0;
+        for (int f : nodes[n].files) if (data->files[f].frame <= 0) k++;
+        return k;
+    }
+
+    // "24 files", or "120 images (1 file)" when frames of enhanced files are among them
+    std::wstring HowMany(int n) const
+    {
+        const size_t files = FilesOf(n), images = nodes[n].files.size();
+        const std::wstring f = std::to_wstring(files) + (files == 1 ? L" file" : L" files");
+        return files == images ? f : std::to_wstring(images) + L" images (" + f + L")";
+    }
+
     // The line of a node in the tree, and what the checks found in it
     std::wstring Label(int i) const
     {
@@ -6952,7 +7320,7 @@ private:
         if (n.files.empty()) return L"";
         const Gathered& g = data->files[n.files[0]];
         const size_t count = n.files.size();
-        auto files = [&](size_t k) { return std::to_wstring(k) + (k == 1 ? L" file" : L" files"); };
+        auto files = [&](size_t) { return HowMany(i); };
         wchar_t buffer[200];
         std::wstring s;
         auto add = [&](const std::wstring& part) { if (!part.empty()) s += (s.empty() ? L"" : L"   ") + part; };
@@ -6999,7 +7367,8 @@ private:
             if (!g.trigger.empty()) { swprintf_s(buffer, L"t %.1f ms", atof(g.trigger.c_str())); add(buffer); }
             const GatherNode& position = nodes[n.parent];
             if (g.hasZ && (compact || position.files.size() == 1)) { swprintf_s(buffer, L"Z %.2f", g.z); add(buffer); }
-            if (g.frames > 1) add(std::to_wstring(g.frames) + L" frames");
+            if (g.frame >= 0) add(L"frame " + std::to_wstring(g.frame + 1));     // (of an enhanced file)
+            else if (g.frames > 1) add(std::to_wstring(g.frames) + L" frames");
             add(g.path.substr(g.path.find_last_of(L'\\') + 1));     // (its folder: in the info of the node)
             return s;
         }
@@ -7143,17 +7512,22 @@ private:
         }
         sliderNode = under;
         std::vector<std::wstring> paths;
-        for (int f : nodes[under].files) paths.push_back(data->files[f].path);
+        std::vector<int> frames;                    // (of enhanced files: which frame each image is)
+        for (int f : nodes[under].files)
+        {
+            paths.push_back(data->files[f].path);
+            frames.push_back(data->files[f].frame);
+        }
         // Not an image: what the floating thumbnail shows (the middle slice, the mosaic, the cine...),
         // larger, until the slider goes to its files
         if (nodes[n].level != Level::Image)
         {
-            preview->ShowFiles(paths, -1);
+            preview->ShowFiles(paths, -1, frames);
             if (posters.count(n)) ShowPoster(n);
             else AskThumb(n, true);
             return;
         }
-        preview->ShowFiles(paths, index);
+        preview->ShowFiles(paths, index, frames);
     }
 
     void ShowPoster(int n)
@@ -7307,7 +7681,8 @@ private:
             row(L"Compression", Compression(Narrow(value(0x00020010))));
             swprintf_s(buffer, L"%u x %u", g.columns, g.rows);
             row(L"Columns x rows", buffer);
-            if (g.frames > 1) row(L"Frames", std::to_wstring(g.frames));
+            if (g.frame >= 0) row(L"Frame", std::to_wstring(g.frame + 1) + L" of the enhanced file");
+            else if (g.frames > 1) row(L"Frames", std::to_wstring(g.frames));
             row(L"Trigger time", g.trigger.empty() ? L"" : Widen(g.trigger) + L" ms");
             row(L"Z", g.hasZ ? std::to_wstring(g.z) + L" mm" : L"");
             row(L"Acquired", g.time.size() >= 8 ? DateTimeText(g.time.substr(0, 8), g.time.substr(8)) : L"");
@@ -7317,7 +7692,7 @@ private:
         }
         if (node.level != Level::Image)
         {
-            row(L"Files", std::to_wstring(node.files.size()) + (frames > static_cast<long>(node.files.size()) ? L"  (" + std::to_wstring(frames) + L" frames)" : L""));
+            row(L"Files", std::to_wstring(FilesOf(n)) + (frames > static_cast<long>(FilesOf(n)) ? L"  (" + std::to_wstring(frames) + L" frames)" : L""));
             std::wstring where = *folders.begin();
             if (where.size() > root.size() && _wcsnicmp(where.c_str(), root.c_str(), root.size()) == 0) where = L"." + where.substr(root.size());
             else if (where.size() == root.size()) where = L".";
@@ -7486,9 +7861,9 @@ private:
             }
             const GatherNode& node = nodes[k];
             std::wstring header = levels[static_cast<int>(node.level)];
-            if (node.level == Level::All) header = L"Common to all the " + std::to_wstring(node.files.size()) + L" files";
+            if (node.level == Level::All) header = L"Common to all the " + HowMany(k);
             else if (node.level == Level::Image) header += L":   " + node.text;
-            else header += L":   " + node.text + L"   -   common to its " + std::to_wstring(node.files.size()) + L" files";
+            else header += L":   " + node.text + L"   -   common to its " + HowMany(k);
             put(header, static_cast<int>(node.level), rows);
             if (c == 0 && node.files.size() > 1) put(L"Varies in the " + std::wstring(levels[static_cast<int>(node.level)]) +
                                                      L" (number of values: the first ones)", 100, Varying(k));
@@ -7588,7 +7963,8 @@ private:
     std::vector<std::wstring> PathsOf(int n) const
     {
         std::vector<std::wstring> paths;
-        for (int f : nodes[n].files) paths.push_back(data->files[f].path);
+        for (int f : nodes[n].files)
+            if (data->files[f].frame <= 0) paths.push_back(data->files[f].path);   // (an enhanced file once)
         return paths;
     }
 
@@ -7769,8 +8145,9 @@ private:
         Stack s;
         if (node.level == Level::Image)
         {
-            s.files = { { files[node.files[0]].path } };
-            s.frames = files[node.files[0]].frames;
+            const Gathered& g = files[node.files[0]];
+            s.files = { { { g.path, (std::max)(0, g.frame) } } };
+            s.frames = g.frame >= 0 ? 1 : g.frames;     // (a frame of an enhanced file: that one)
             return s;
         }
         std::vector<int> positions;
@@ -7783,11 +8160,11 @@ private:
         }
         for (int p : positions)
         {
-            std::vector<std::wstring> paths;
-            for (int f : nodes[p].files) paths.push_back(files[f].path);
+            std::vector<FrameRef> paths;
+            for (int f : nodes[p].files) paths.push_back({ files[f].path, (std::max)(0, files[f].frame) });
             s.files.push_back(std::move(paths));
         }
-        if (s.files.size() == 1 && s.files[0].size() == 1) s.frames = files[nodes[positions[0]].files[0]].frames;
+        if (s.files.size() == 1 && s.files[0].size() == 1 && files[nodes[positions[0]].files[0]].frame < 0) s.frames = files[nodes[positions[0]].files[0]].frames;
         // The time from image to image: the median step of the trigger times of the first position
         std::vector<double> t;
         for (int f : nodes[positions[0]].files) if (!files[f].trigger.empty()) t.push_back(atof(files[f].trigger.c_str()));
@@ -8446,7 +8823,7 @@ private:
             if (std::find(studyList.begin(), studyList.end(), s) == studyList.end()) studyList.push_back(s);
             if (std::find(patients.begin(), patients.end(), p) == patients.end()) patients.push_back(p);
             if (!nodes[r].flags.empty()) troubled++;
-            images += nodes[r].files.size();
+            images += FilesOf(r);
         }
         studies = studyList.size();
         SYSTEMTIME now;
@@ -8583,7 +8960,7 @@ private:
                 add(L"Accession ", first(s, 0x00080050));
                 add(L"Study ID ", first(s, 0x00200010));
                 add(L"", std::to_wstring(nodes[s].children.size()) + L" series");
-                add(L"", std::to_wstring(nodes[s].files.size()) + L" files");
+                add(L"", HowMany(s));
                 add(L"", mb(s) + L" MB");
                 line = Html(line) + L"<br><span class=\"where\">" + Html(where(s)) + L"</span>";
                 h += line + L"</div></summary>\n<div class=\"wrap\"><table>\n<thead><tr><th></th><th>Series</th><th>Modality</th><th>Description</th>"
@@ -8625,7 +9002,7 @@ private:
                     h += L"<td class=\"series\">" + Html(Widen(rg.seriesNumber)) + L"</td><td>" + Html(Widen(rg.modality)) + L"</td><td>" +
                          Html(Widen(rg.seriesDescription, rg.charset)) + L"<br><small>" + Html(DateTimeText(rg.seriesDate, rg.seriesTime)) + L"</small><br><small class=\"where\">" + Html(where(r)) + L"</small></td>";
                     h += L"<td>" + planes + L"</td><td>" + spacing + L"</td><td>" + zs + L"</td>";
-                    h += L"<td class=\"n\">" + std::to_wstring(nodes[r].files.size()) + L"</td><td class=\"n\">" + mb(r) + L"</td>";
+                    h += L"<td class=\"n\">" + std::to_wstring(FilesOf(r)) + L"</td><td class=\"n\">" + mb(r) + L"</td>";
                     h += L"<td class=\"warn\">" + (problems.empty() ? L"" : L"<ul>" + problems + L"</ul>") + L"</td></tr>\n";
                 }
                 h += L"</tbody></table></div></details>\n";

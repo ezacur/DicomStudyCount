@@ -109,6 +109,34 @@ struct ExplorerTest
             e.data->others, e.data->directories, e.data->offline, (t1 - t0) / 1000.0, (GetTickCount64() - t1) / 1000.0, pm.PeakWorkingSetSize / 1048576.0);
         Say(L"%ld patients, %ld studies, %ld series, %ld orientations; %ld series with problems\n", patients, studies, series, orientations, troubled);
         for (const auto& [k, c] : flags) Say(L"   problem  %-55s %ld\n", k.c_str(), c);
+        // Files of three kinds that need more than DCMTK: enhanced multi-frame (their frames apart), float
+        // pixels (Parametric Maps), deflated (the whole dataset, or the image frames): how many, and some
+        {
+            struct Kind { long files = 0, frames = 0; std::vector<std::wstring> examples; };
+            std::map<std::wstring, Kind> kinds;
+            for (size_t f = 0; f < e.data->files.size(); f++)
+            {
+                const Gathered& g = e.data->files[f];
+                if (g.frame > 0) continue;
+                const std::wstring* ts = e.AttributeOf(static_cast<int>(f), 0x00020010);
+                const std::wstring* sop = e.AttributeOf(static_cast<int>(f), 0x00080016);
+                std::wstring kind;
+                if (g.frame == 0) kind = L"enhanced multi-frame: " + (sop ? ObjectType(Narrow(*sop)) : L"?");
+                else if (DicomExplorer::Find(g.attributes, 0x7FE00008) || DicomExplorer::Find(g.attributes, 0x7FE00009)) kind = L"float pixels";
+                else if (ts && ts->find(L"1.2.840.10008.1.2.1.99") == 0) kind = L"deflated dataset";
+                else if (ts && ts->find(L"1.2.840.10008.1.2.8.1") == 0) kind = L"deflated image frames";
+                if (kind.empty()) continue;
+                Kind& k = kinds[kind];
+                k.files++;
+                k.frames += g.frame == 0 ? g.frames : 1;
+                if (k.examples.size() < 2) k.examples.push_back(g.path);
+            }
+            for (const auto& [kind, k] : kinds)
+            {
+                Say(L"   %s: %ld files, %ld frames\n", kind.c_str(), k.files, k.frames);
+                for (const auto& x : k.examples) Say(L"            e.g. %s\n", x.c_str());
+            }
+        }
         // The PatientIDs of several people: what tells them apart (never the names or dates themselves).
         // Only the name apart, with the same birth date, may be one person written two ways
         std::map<std::string, std::vector<int>> byId;
