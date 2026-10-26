@@ -2,7 +2,7 @@
 .SYNOPSIS
     Builds the two DLLs of bin\ from src\: only needed after changing the sources (the DLLs are in the
     repository, so a copy of the folder works without building anything).
-      bin\Explorer4Dicoms.dll   src\Explorer4Dicoms.cs   C# for .NET Framework 4 (Windows PowerShell 5.1)
+      bin\Explorer4Dicoms.dll   src\Explorer4Dicoms\     C# for .NET Framework 4 (Windows PowerShell 5.1)
       bin\DicomShell.dll        src\*.cpp, src\*.h       C++ icons, columns and preview (x64), it needs
                                                          the Visual Studio C++ build tools, DCMTK,
                                                          OpenJPEG and zlib (third_party), built once
@@ -110,7 +110,8 @@ if ($CSharp) {
     else {
         $target = Join-Path $bin 'Explorer4Dicoms.dll'
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N') + '.dll')
-        Add-Type -TypeDefinition ([IO.File]::ReadAllText((Join-Path $root 'src\Explorer4Dicoms.cs'))) -Language CSharp `
+        # (all the parts of src\Explorer4Dicoms\, compiled together)
+        Add-Type -Path (Get-ChildItem (Join-Path $root 'src\Explorer4Dicoms') -Filter *.cs).FullName `
             -ReferencedAssemblies System.Drawing -OutputAssembly $tmp -OutputType Library
         Move-Item -LiteralPath $tmp -Destination $target -Force
         Write-Host "Built $target"

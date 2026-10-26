@@ -23,7 +23,7 @@ std::wstring Widen(const std::string& s, const std::string& charset)
 
 // 6 case-sensitive characters (62 possible each) from the 64-bit FNV-1a of a UID: for the
 // StudyInstanceUID, the same as the study tags of the folder comments, FolderComments.StudyTag in
-// src\Explorer4Dicoms.cs
+// src\Explorer4Dicoms\FolderComments.cs
 std::wstring Hash6(const std::string& uid)
 {
     static const wchar_t Base62[] = L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
