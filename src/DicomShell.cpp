@@ -4908,6 +4908,8 @@ static Found GatherFile(const std::wstring& path, long long bytes, Gathered& g, 
             if (!ipp.empty()) SetAttribute(e.attributes, 0x00200032, pool.Id(Widen(ipp)));
             if (!iop.empty()) SetAttribute(e.attributes, 0x00200037, pool.Id(Widen(iop)));
             if (!delay.empty()) SetAttribute(e.attributes, 0x00181060, pool.Id(Widen(delay)));
+            const std::string spacing = value(item, DCM_PixelMeasuresSequence, DCM_PixelSpacing);
+            if (!spacing.empty()) SetAttribute(e.attributes, 0x00280030, pool.Id(Widen(spacing)));
         }
     }
     return Found::Dicom;
@@ -6437,13 +6439,403 @@ private:
     static constexpr UINT WM_GATHERED = WM_APP + 20, WM_THUMB = WM_APP + 21, WM_EXPORTED = WM_APP + 22;
     static constexpr UINT_PTR TimerProgress = 1, TimerFilter = 2, TimerFind = 3, TimerFollow = 4, TimerJob = 5;
     static constexpr UINT_PTR TimerFrame = 1;      // (of the floating thumbnail)
-    enum { IdPath = 100, IdBrowse, IdReload, IdReport, IdFind, IdCompact, IdIdentity, IdHover, IdFilter };
+    enum { IdPath = 100, IdBrowse, IdReload, IdReport, IdFind, IdCompact, IdIdentity, IdHover, IdFilter, IdNavigator };
     enum class Split { None, Tree, Top, Info };
     struct Row { Uint32 tag; std::wstring value; };     // of the full info
     static constexpr COLORREF ProblemColor = RGB(196, 90, 0);
 
+    // ----- the navigator (DCMexplorer_navigator.m): a window of its own with the images as planes where
+    // they are in the patient, in 3-D (orthographic); those of the node chosen in red, and the image itself
+    // on its plane when they are one plane. Drag: rotate; right drag: move; wheel: zoom; double click: again.
+
+    // An image in the patient (mm, DICOM's LPS): its corners, at the edges of its pixels
+    struct NavPlane { float p[4][3]; };             // top left, top right, bottom left, bottom right
+
+    class Navigator
+    {
+    public:
+        ~Navigator() { if (bitmap) DeleteObject(bitmap); if (font) DeleteObject(font); }
+
+        bool Create(HWND parent)
+        {
+            WNDCLASSEXW wc = { sizeof(wc) };
+            wc.lpfnWndProc = Proc;
+            wc.hInstance = g_module;
+            wc.hCursor = LoadCursor(nullptr, IDC_SIZEALL);
+            wc.style = CS_DBLCLKS;
+            wc.lpszClassName = L"DicomStudyCountNavigator";
+            if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+            wnd = CreateWindowExW(WS_EX_CLIENTEDGE, wc.lpszClassName, L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, parent, nullptr, g_module, this);
+            return wnd != nullptr;
+        }
+
+        bool Visible() const { return wnd && shown; }
+
+        void Show(bool on) { shown = on; if (wnd) ShowWindow(wnd, on ? SW_SHOWNA : SW_HIDE); }
+
+        void Move(const RECT& r) { if (wnd) MoveWindow(wnd, r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE); }
+
+        // What it draws: planes (hot: of the node chosen), and a picture on one of them (-1: none). Fit: the
+        // view moved to these planes (another study), its zoom and move undone; the rotation stays.
+        void Set(std::vector<NavPlane> p, std::vector<char> h, int on, Picture picture, std::wstring text, std::wstring more, bool fit)
+        {
+            planes = std::move(p);
+            hot = std::move(h);
+            textured = on;
+            caption = std::move(text);
+            detail = std::move(more);
+            if (bitmap) { DeleteObject(bitmap); bitmap = nullptr; }
+            texture = std::move(picture);
+            if (textured >= 0 && texture.width > 0)
+            {
+                BITMAPINFO bi = {};
+                bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+                bi.bmiHeader.biWidth = texture.width;
+                bi.bmiHeader.biHeight = -texture.height;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                void* bits = nullptr;
+                bitmap = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                if (bitmap && bits) memcpy(bits, texture.px.data(), texture.px.size() * sizeof(DWORD));
+            }
+            if (fit)
+            {
+                zoom = 1;
+                panX = panY = 0;
+                float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+                for (const auto& q : planes)
+                    for (const auto& c : q.p)
+                        for (int k = 0; k < 3; k++) { lo[k] = (std::min)(lo[k], c[k]); hi[k] = (std::max)(hi[k], c[k]); }
+                radius = 1;
+                if (!planes.empty())
+                {
+                    double d = 0;
+                    for (int k = 0; k < 3; k++) { center[k] = (lo[k] + hi[k]) / 2; d += (hi[k] - lo[k]) * (hi[k] - lo[k]); }
+                    radius = (std::max)(1.0, std::sqrt(d) / 2);
+                }
+            }
+            if (wnd) InvalidateRect(wnd, nullptr, FALSE);
+        }
+
+        void Clear() { Set({}, {}, -1, Picture(), L"", L"", true); }
+
+    private:
+        HWND wnd = nullptr;
+        HBITMAP bitmap = nullptr;                   // the picture, for PlgBlt
+        HFONT font = nullptr;
+        UINT fontDpi = 0;
+        std::vector<NavPlane> planes;
+        std::vector<char> hot;
+        int textured = -1;
+        Picture texture;
+        std::wstring caption, detail;
+        double center[3] = {}, radius = 1, zoom = 1, panX = 0, panY = 0;
+        double azimuth = -37.5, elevation = 30;     // (degrees, view(3) of MATLAB)
+        POINT last = {}, down = {};                 // (where the mouse is, and where it was pressed)
+        bool rotating = false, moving = false;
+        bool shown = false;
+
+        int Px(int n) const { const UINT dpi = GetDpiForWindow(wnd); return MulDiv(n, dpi ? dpi : 96, 96); }
+
+        // Where a point of the patient is in the window: viewmtx( az , el ) of MATLAB, its up up
+        void Axes(double r[3][3]) const
+        {
+            const double a = azimuth * 3.14159265358979 / 180, e = elevation * 3.14159265358979 / 180;
+            const double m[3][3] = { { cos(a), sin(a), 0 }, { -sin(e) * sin(a), sin(e) * cos(a), cos(e) }, { cos(e) * sin(a), -cos(e) * cos(a), sin(e) } };
+            memcpy(r, m, sizeof(m));
+        }
+
+        // The patient as blocks (LPS: x to its left, y to its back, z to its head), standing, its nose to the
+        // front: head, nose, body, arms, legs. Its sides seen from the view, the farther ones first; each
+        // one kept (where it is in the window, which way it faces) for the clicks.
+        struct Side { POINT p[4]; double normal[3]; };
+        std::vector<Side> figure;                   // as drawn: the last one on top
+
+        void Figure(HDC dc, const double r[3][3], int w, int h)
+        {
+            struct Block { double c[3], half[3]; COLORREF color; };
+            static const Block blocks[] = {
+                { { 0, 0, 8.1 }, { 1.0, 1.1, 1.2 }, RGB(236, 196, 164) },        // head
+                { { 0, -1.3, 7.9 }, { 0.22, 0.3, 0.35 }, RGB(214, 160, 128) },   // nose
+                { { 0, 0, 4.1 }, { 2.0, 1.0, 2.6 }, RGB(90, 140, 210) },         // body
+                { { 2.65, 0, 4.4 }, { 0.6, 0.6, 2.3 }, RGB(90, 140, 210) },      // left arm
+                { { -2.65, 0, 4.4 }, { 0.6, 0.6, 2.3 }, RGB(90, 140, 210) },     // right arm
+                { { 0.95, 0, -1.6 }, { 0.8, 0.8, 3.0 }, RGB(70, 80, 110) },      // left leg
+                { { -0.95, 0, -1.6 }, { 0.8, 0.8, 3.0 }, RGB(70, 80, 110) },     // right leg
+            };
+            const double middle = 2.2;              // (its height from -4.6 to 9.3)
+            // (14 high, and as much across when it lies: in a square of a third of the panel, at most 120 px)
+            const int size = (std::max)(Px(48), (std::min)(Px(120), (std::min)(w, h) / 3));
+            const double k = size / 14.0;
+            const POINT o = { Px(8) + size / 2, h - Px(8) - size / 2 };
+            auto at = [&](const double v[3]) {
+                const double p[3] = { v[0], v[1], v[2] - middle };
+                return POINT{ o.x + static_cast<LONG>(std::lround((r[0][0] * p[0] + r[0][1] * p[1] + r[0][2] * p[2]) * k)),
+                              o.y - static_cast<LONG>(std::lround((r[1][0] * p[0] + r[1][1] * p[1] + r[1][2] * p[2]) * k)) };
+            };
+            struct Drawn { Side side; double depth; COLORREF color; };
+            std::vector<Drawn> drawn;
+            for (const Block& b : blocks)
+                for (int axis = 0; axis < 3; axis++)
+                    for (int sign : { -1, 1 })
+                    {
+                        double n[3] = {};
+                        n[axis] = sign;
+                        const double facing = r[2][0] * n[0] + r[2][1] * n[1] + r[2][2] * n[2];
+                        if (facing <= 1e-6) continue;       // (its back)
+                        const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+                        Drawn d = {};
+                        double centre[3] = { b.c[0], b.c[1], b.c[2] };
+                        centre[axis] += sign * b.half[axis];
+                        const int corners[4][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
+                        for (int c = 0; c < 4; c++)
+                        {
+                            double p[3] = { centre[0], centre[1], centre[2] };
+                            p[u] += corners[c][0] * b.half[u];
+                            p[v] += corners[c][1] * b.half[v];
+                            d.side.p[c] = at(p);
+                        }
+                        memcpy(d.side.normal, n, sizeof(n));
+                        d.depth = r[2][0] * centre[0] + r[2][1] * centre[1] + r[2][2] * (centre[2] - middle);
+                        const double light = 0.55 + 0.45 * facing;
+                        d.color = RGB(static_cast<int>(GetRValue(b.color) * light), static_cast<int>(GetGValue(b.color) * light),
+                                      static_cast<int>(GetBValue(b.color) * light));
+                        drawn.push_back(d);
+                    }
+            std::sort(drawn.begin(), drawn.end(), [](const Drawn& a, const Drawn& b) { return a.depth < b.depth; });
+            figure.clear();
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            for (const Drawn& d : drawn)
+            {
+                HBRUSH brush = CreateSolidBrush(d.color);
+                HGDIOBJ old = SelectObject(dc, brush);
+                Polygon(dc, d.side.p, 4);
+                SelectObject(dc, old);
+                DeleteObject(brush);
+                figure.push_back(d.side);
+            }
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+            // Its left and its right, at its hands
+            SetTextColor(dc, RGB(150, 0, 0));
+            for (int s : { 1, -1 })
+            {
+                const double hand[3] = { s * 3.9, 0, 2.0 };
+                const POINT p = at(hand);
+                TextOutW(dc, p.x - Px(4), p.y - Px(8), s > 0 ? L"L" : L"R", 1);
+            }
+        }
+
+        // The side of the figure under a point of the window (nullptr: none)
+        const Side* SideAt(POINT pt) const
+        {
+            for (auto it = figure.rbegin(); it != figure.rend(); ++it)
+            {
+                bool in = false;
+                for (int i = 0, j = 3; i < 4; j = i++)
+                {
+                    const POINT& a = it->p[i];
+                    const POINT& b = it->p[j];
+                    if ((a.y > pt.y) != (b.y > pt.y) && pt.x < (b.x - a.x) * static_cast<double>(pt.y - a.y) / (b.y - a.y) + a.x) in = !in;
+                }
+                if (in) return &*it;
+            }
+            return nullptr;
+        }
+
+        // The view from where a side faces: from the front, from the left, from above...
+        void LookFrom(const double n[3])
+        {
+            elevation = std::asin((std::max)(-1.0, (std::min)(1.0, n[2]))) * 180 / 3.14159265358979;
+            if (std::fabs(n[2]) < 0.999) azimuth = std::atan2(n[0], -n[1]) * 180 / 3.14159265358979;
+            else azimuth = 0;
+            InvalidateRect(wnd, nullptr, FALSE);
+        }
+
+        void Paint(HDC target)
+        {
+            RECT c;
+            GetClientRect(wnd, &c);
+            const int w = c.right, h = c.bottom;
+            if (w <= 0 || h <= 0) return;
+            HDC dc = CreateCompatibleDC(target);
+            HBITMAP canvas = CreateCompatibleBitmap(target, w, h);
+            HGDIOBJ oldCanvas = SelectObject(dc, canvas);
+            FillRect(dc, &c, GetSysColorBrush(COLOR_WINDOW));
+            const UINT dpi = GetDpiForWindow(wnd) ? GetDpiForWindow(wnd) : 96;
+            if (!font || fontDpi != dpi)
+            {
+                if (font) DeleteObject(font);
+                fontDpi = dpi;
+                font = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+            }
+            HGDIOBJ oldFont = SelectObject(dc, font);
+            SetBkMode(dc, TRANSPARENT);
+            double r[3][3];
+            Axes(r);
+            const double scale = (std::min)(w, h) * 0.5 / radius * zoom;
+            auto project = [&](const float* p) {
+                const double v[3] = { p[0] - center[0], p[1] - center[1], p[2] - center[2] };
+                const double x = r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2];
+                const double y = r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2];
+                return POINT{ static_cast<LONG>(std::lround(w / 2.0 + panX + x * scale)), static_cast<LONG>(std::lround(h / 2.0 + panY - y * scale)) };
+            };
+            // The outlines, the others first, in one call for each color
+            auto outlines = [&](bool which, COLORREF color, int width) {
+                std::vector<POINT> points;
+                std::vector<DWORD> counts;
+                for (size_t i = 0; i < planes.size(); i++)
+                {
+                    if ((hot[i] != 0) != which) continue;
+                    const auto& q = planes[i].p;
+                    for (int k : { 0, 1, 3, 2, 0 }) points.push_back(project(q[k]));
+                    counts.push_back(5);
+                }
+                if (counts.empty()) return;
+                HPEN pen = CreatePen(PS_SOLID, width, color);
+                HGDIOBJ old = SelectObject(dc, pen);
+                PolyPolyline(dc, points.data(), counts.data(), static_cast<DWORD>(counts.size()));
+                SelectObject(dc, old);
+                DeleteObject(pen);
+            };
+            outlines(false, RGB(200, 200, 200), 1);
+            if (bitmap && textured >= 0 && textured < static_cast<int>(planes.size()))
+            {
+                const auto& q = planes[textured].p;
+                POINT corners[3] = { project(q[0]), project(q[1]), project(q[2]) };
+                HDC src = CreateCompatibleDC(dc);
+                HGDIOBJ old = SelectObject(src, bitmap);
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                PlgBlt(dc, corners, src, 0, 0, texture.width, texture.height, nullptr, 0, 0);
+                SelectObject(src, old);
+                DeleteDC(src);
+            }
+            outlines(true, RGB(220, 0, 0), Px(2));
+            // The patient, at the bottom left, turned as the planes are: a click on a side of it, the view
+            // from that side
+            Figure(dc, r, w, h);
+            // What it is, at the top; how to move it, at the bottom right
+            SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+            RECT top = { Px(8), Px(6), w - Px(8), Px(48) };
+            const std::wstring head = planes.empty() ? (caption.empty() ? L"Choose a node of the tree" : caption + L"\nNo image here has a position in the patient")
+                                                     : caption + (detail.empty() ? L"" : L"\n" + detail);
+            RECT fill = top;
+            DrawTextW(dc, head.c_str(), -1, &fill, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT);
+            fill.right = (std::min)(fill.right, top.right);
+            InflateRect(&fill, Px(3), Px(1));
+            FillRect(dc, &fill, GetSysColorBrush(COLOR_WINDOW));
+            DrawTextW(dc, head.c_str(), -1, &top, DT_LEFT | DT_TOP | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+            RECT bottom = { Px(16) + (std::max)(Px(48), (std::min)(Px(120), (std::min)(w, h) / 3)), h - Px(24), w - Px(8), h - Px(4) };
+            DrawTextW(dc, L"drag: rotate   click the figure: from that side   right drag: move   wheel: zoom", -1, &bottom, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS);
+            BitBlt(target, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, oldFont);
+            SelectObject(dc, oldCanvas);
+            DeleteObject(canvas);
+            DeleteDC(dc);
+        }
+
+        static LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+        {
+            auto self = reinterpret_cast<Navigator*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            switch (msg)
+            {
+            case WM_NCCREATE:
+                self = static_cast<Navigator*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+                self->wnd = hwnd;
+                break;
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps;
+                HDC dc = BeginPaint(hwnd, &ps);
+                if (self) self->Paint(dc);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_SIZE:
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            case WM_LBUTTONDOWN:
+            case WM_RBUTTONDOWN:
+                if (!self) break;
+                self->rotating = msg == WM_LBUTTONDOWN;
+                self->moving = msg == WM_RBUTTONDOWN;
+                self->last = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                SetFocus(hwnd);
+                self->down = self->last;
+                SetCapture(hwnd);
+                return 0;
+            case WM_MOUSEMOVE:
+                if (self && (self->rotating || self->moving))
+                {
+                    const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), dx = x - self->last.x, dy = y - self->last.y;
+                    self->last = { x, y };
+                    if (self->rotating)
+                    {
+                        self->azimuth = std::fmod(self->azimuth - dx * 0.5, 360.0);
+                        self->elevation = (std::max)(-90.0, (std::min)(90.0, self->elevation + dy * 0.5));
+                    }
+                    else { self->panX += dx; self->panY += dy; }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            case WM_LBUTTONUP:
+            case WM_RBUTTONUP:
+                if (self && (self->rotating || self->moving))
+                {
+                    ReleaseCapture();
+                    // A click (not a drag) on the figure: the view from that side of it
+                    const POINT up = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                    const Side* side = self->SideAt(self->down);
+                    if (msg == WM_LBUTTONUP && side && std::abs(up.x - self->down.x) + std::abs(up.y - self->down.y) <= self->Px(3))
+                    {
+                        self->LookFrom(side->normal);
+                    }
+                }
+                return 0;
+            case WM_SETCURSOR:
+                if (self && LOWORD(lp) == HTCLIENT)
+                {
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    ScreenToClient(hwnd, &pt);
+                    SetCursor(LoadCursor(nullptr, self->SideAt(pt) ? IDC_HAND : IDC_SIZEALL));
+                    return TRUE;
+                }
+                break;
+            case WM_CAPTURECHANGED:
+                if (self) self->rotating = self->moving = false;
+                return 0;
+            case WM_LBUTTONDBLCLK:
+                if (!self) break;
+                self->azimuth = -37.5;
+                self->elevation = 30;
+                self->zoom = 1;
+                self->panX = self->panY = 0;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            case WM_MOUSEWHEEL:
+                if (!self) break;
+                self->zoom = (std::max)(0.05, (std::min)(200.0, self->zoom * std::pow(1.15, GET_WHEEL_DELTA_WPARAM(wp) / 120.0)));
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            case WM_NCDESTROY:
+                if (self) self->wnd = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                break;
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    };
+
     HWND wnd = nullptr, pathBox = nullptr, browse = nullptr, reload = nullptr, reportButton = nullptr, findLabel = nullptr, findBox = nullptr;
-    HWND compactBox = nullptr, identityBox = nullptr, hoverBox = nullptr, tree = nullptr, info = nullptr, filterLabel = nullptr, filterBox = nullptr;
+    HWND compactBox = nullptr, identityBox = nullptr, hoverBox = nullptr, navigatorBox = nullptr, tree = nullptr, info = nullptr, filterLabel = nullptr, filterBox = nullptr;
     HWND full = nullptr, status = nullptr;
     int firstProblemRow = INT_MAX;                  // of the info: the rows of the problems, from this one
     // The floating thumbnail of the node under the mouse in the tree
@@ -6454,6 +6846,12 @@ private:
     std::unique_ptr<ThumbWorker> worker;
     std::unordered_map<int, std::shared_ptr<Thumb>> thumbs;     // by node, for this gathering
     std::unordered_map<int, std::shared_ptr<Thumb>> posters;    // the larger ones of the image panel
+    // The navigator, and the planes of the images: each one once (the images of a position over each other)
+    Navigator navigator;
+    std::vector<NavPlane> navPlanes;
+    std::vector<int> filePlane;                     // the plane of each file (-1: none, without a position)
+    bool planesMade = false;
+    int navigated = -1;                             // the planes the navigator shows: of this node (a study, mostly)
     unsigned generation = 0;
     // An export or a report being written
     std::unique_ptr<ExportJob> job;
@@ -6540,6 +6938,7 @@ private:
         findBox = make(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IdFind);
         compactBox = make(0, L"BUTTON", L"Compact", WS_TABSTOP | BS_AUTOCHECKBOX, IdCompact);
         hoverBox = make(0, L"BUTTON", L"Hover preview", WS_TABSTOP | BS_AUTOCHECKBOX, IdHover);
+        navigatorBox = make(0, L"BUTTON", L"Navigator", WS_TABSTOP | BS_AUTOCHECKBOX, IdNavigator);
         identityBox = make(0, L"BUTTON", L"Hide patient identity", WS_TABSTOP | BS_AUTOCHECKBOX, IdIdentity);
         // (no tooltips of its own: the floating thumbnail writes the line of the node)
         tree = make(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"", WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
@@ -6559,6 +6958,7 @@ private:
         Button_SetCheck(compactBox, compact ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(identityBox, hideIdentity ? BST_CHECKED : BST_UNCHECKED);
         Button_SetCheck(hoverBox, hoverPreview ? BST_CHECKED : BST_UNCHECKED);
+        if (navigator.Create(wnd) && ReadSetting(L"Navigator", 0)) { Button_SetCheck(navigatorBox, BST_CHECKED); navigator.Show(true); }
         SetWindowTheme(tree, L"Explorer", nullptr);
         TreeView_SetExtendedStyle(tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
         for (HWND list : { info, full })
@@ -6598,7 +6998,7 @@ private:
                            CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         boldFont = CreateFontW(points9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
-        for (HWND h : { pathBox, browse, reload, reportButton, findLabel, findBox, compactBox, hoverBox, identityBox, tree, info, filterLabel,
+        for (HWND h : { pathBox, browse, reload, reportButton, findLabel, findBox, compactBox, hoverBox, navigatorBox, identityBox, tree, info, filterLabel,
                         filterBox, full, status })
             if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         if (filterLabel) SendMessageW(filterLabel, WM_SETFONT, reinterpret_cast<WPARAM>(boldFont), TRUE);
@@ -6623,6 +7023,8 @@ private:
         right -= Px(150) + gap;
         put(hoverBox, right - Px(108), Px(108));
         right -= Px(108) + gap;
+        put(navigatorBox, right - Px(84), Px(84));
+        right -= Px(84) + gap;
         put(compactBox, right - Px(80), Px(80));
         right -= Px(80) + gap * 2;
         put(findBox, right - Px(200), Px(200));
@@ -6654,8 +7056,12 @@ private:
         topSplit = { x0, top + th, x1, top + th + gap };
         const int fy = top + th + gap;
         MoveWindow(filterLabel, x0, fy, Px(70), line, TRUE);
-        MoveWindow(filterBox, x0 + Px(70), fy, (std::min)(Px(420), x1 - x0 - Px(70)), line, TRUE);
-        MoveWindow(full, x0, fy + line + Px(4), x1 - x0, bottom - fy - line - Px(4), TRUE);
+        MoveWindow(filterBox, x0 + Px(70), fy, (std::min)(Px(420), (navigator.Visible() ? (x1 - x0 - gap) / 2 : x1 - x0) - Px(70)), line, TRUE);
+        // (the navigator, if shown, at the right of the full info: half of it each)
+        const bool navigating = navigator.Visible();
+        const int fw = navigating ? (x1 - x0 - gap) / 2 : x1 - x0;
+        MoveWindow(full, x0, fy + line + Px(4), fw, bottom - fy - line - Px(4), TRUE);
+        if (navigating) navigator.Move({ x0 + fw + gap, fy, x1, bottom });
         InvalidateRect(wnd, nullptr, TRUE);
     }
 
@@ -6736,6 +7142,11 @@ private:
         following = true;                           // (no selection events while the tree empties)
         TreeView_DeleteAllItems(tree);
         following = false;
+        navPlanes.clear();
+        filePlane.clear();
+        planesMade = false;
+        navigated = -1;
+        navigator.Clear();
         nodes.clear();
         fileNode.clear();
         ListView_DeleteAllItems(info);
@@ -7496,6 +7907,7 @@ private:
         selected = n;
         FillInfo(n);
         FillFull(n);
+        Navigate(n);
         if (!preview) return;
         // An image: the slider goes through those of the node above it in the tree; another node: its own
         int under = n, index = 0;
@@ -7541,6 +7953,112 @@ private:
         std::wstring caption = nodes[n].text;
         if (!t.caption.empty()) caption += L"   -   " + t.caption;
         preview->ShowPoster(std::move(frames), t.delay, caption);
+    }
+
+    // ----- the navigator
+
+    // The plane of each image that has a position, orientation, size and pixel spacing; the images in the
+    // same plane (of a position: its times, its copies) share it
+    void MakePlanes()
+    {
+        if (planesMade || !data) return;
+        planesMade = true;
+        const std::vector<Gathered>& files = data->files;
+        filePlane.assign(files.size(), -1);
+        std::vector<std::pair<std::array<int, 12>, int>> keyed;    // (corners in 1/100 mm: the same plane, the same key)
+        std::vector<NavPlane> each;
+        for (int f = 0; f < static_cast<int>(files.size()); f++)
+        {
+            const Gathered& g = files[f];
+            if (!g.oriented || !g.placed || !g.rows || !g.columns) continue;
+            const std::wstring* s = AttributeOf(f, 0x00280030);
+            double dy = 0, dx = 0;
+            if (!s || swscanf_s(s->c_str(), L"%lf\\%lf", &dy, &dx) != 2 || dy <= 0 || dx <= 0) continue;
+            // From the middle of the first pixel along its row (orientation 1..3) and its column (4..6)
+            NavPlane q;
+            const double u[2] = { -0.5, g.columns - 0.5 }, v[2] = { -0.5, g.rows - 0.5 };
+            std::array<int, 12> key;
+            for (int c = 0; c < 4; c++)
+                for (int k = 0; k < 3; k++)
+                {
+                    const double p = g.position[k] + u[c & 1] * dx * g.orientation[k] + v[c >> 1] * dy * g.orientation[3 + k];
+                    q.p[c][k] = static_cast<float>(p);
+                    key[c * 3 + k] = static_cast<int>(std::lround(p * 100));
+                }
+            keyed.push_back({ key, static_cast<int>(each.size()) });
+            each.push_back(q);
+            filePlane[f] = static_cast<int>(each.size()) - 1;
+        }
+        std::sort(keyed.begin(), keyed.end());
+        std::vector<int> to(each.size());
+        navPlanes.clear();
+        for (size_t i = 0; i < keyed.size(); i++)
+        {
+            if (i == 0 || keyed[i].first != keyed[i - 1].first) navPlanes.push_back(each[keyed[i].second]);
+            to[keyed[i].second] = static_cast<int>(navPlanes.size()) - 1;
+        }
+        for (int& p : filePlane) if (p >= 0) p = to[p];
+    }
+
+    // The navigator on a node: the planes of its study (the coordinates of the patient are of a study:
+    // another one has others), its own in red; on its plane its image, if it has one plane
+    void Navigate(int n)
+    {
+        if (!navigator.Visible() || !ready || n <= 0 || n >= static_cast<int>(nodes.size())) return;
+        MakePlanes();
+        int context = n;
+        while (context > 0 && nodes[context].level > Level::Study) context = nodes[context].parent;
+        if (context <= 0) context = n;
+        std::vector<int> mine, around;
+        std::vector<char> seen(navPlanes.size(), 0);
+        for (int f : nodes[n].files)
+            if (filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 1; mine.push_back(filePlane[f]); }
+        for (int f : nodes[context].files)
+            if (filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 2; around.push_back(filePlane[f]); }
+        // Too many to draw (a patient, everything): some of them, evenly
+        const size_t most = 40000;
+        auto thin = [](std::vector<int>& v, size_t keep) {
+            if (v.size() <= keep) return;
+            std::vector<int> some;
+            for (size_t i = 0; i < keep; i++) some.push_back(v[i * v.size() / keep]);
+            v.swap(some);
+        };
+        const size_t red = mine.size(), total = mine.size() + around.size();
+        thin(mine, most);
+        thin(around, most > mine.size() ? most - mine.size() : 0);
+        std::vector<NavPlane> scene;
+        std::vector<char> hot;
+        for (int p : around) { scene.push_back(navPlanes[p]); hot.push_back(0); }
+        for (int p : mine) { scene.push_back(navPlanes[p]); hot.push_back(1); }
+        // One plane: its image (the first one, the chosen one if an image)
+        Picture picture;
+        int on = -1;
+        if (mine.size() == 1)
+        {
+            const int f = nodes[n].files[0];
+            Slice s;
+            if (DecodeSlice(data->files[f].path, (std::max)(0, data->files[f].frame), false, s).empty() && s.width > 0 && s.height > 0)
+            {
+                const RECT box = { 0, 0, s.width, s.height };
+                double lo = 0, hi = 255;
+                if (s.mono) Percentiles({ s.values.data() }, s.width, box, 0.02, 0.98, lo, hi);
+                const int side = 512;
+                const double k = (std::max)(s.width, s.height) > side ? static_cast<double>(side) / (std::max)(s.width, s.height) : 1;
+                picture = Shrink(s, box, lo, hi, (std::max)(1, static_cast<int>(s.width * k)), (std::max)(1, static_cast<int>(s.height * k)));
+                on = static_cast<int>(scene.size()) - 1;
+            }
+        }
+        std::wstring more;
+        if (total)
+        {
+            wchar_t b[200];
+            if (context == n) swprintf_s(b, L"%zu plane%s", red, red == 1 ? L"" : L"s");
+            else swprintf_s(b, L"%zu plane%s in red, of %zu in its study", red, red == 1 ? L"" : L"s", total);
+            more = b;
+            if (total > most) more += L" (" + std::to_wstring(most) + L" of them drawn)";
+        }
+        navigator.Set(std::move(scene), std::move(hot), on, std::move(picture), nodes[n].text, more, context != navigated);
+        navigated = context;
     }
 
     // The slider (or the cine) moved: an image chosen in the tree follows it
@@ -9203,6 +9721,7 @@ private:
             {
                 self->FillInfo(self->selected);
                 self->FillFull(self->selected);
+                self->Navigate(self->selected);
             }
             return 0;
         case WM_COMMAND:
@@ -9217,6 +9736,15 @@ private:
                 WriteSetting(L"HoverPreview", self->hoverPreview ? 1 : 0);
                 if (!self->hoverPreview) self->HidePopup();
                 return 0;
+            case IdNavigator:
+            {
+                const bool on = Button_GetCheck(self->navigatorBox) == BST_CHECKED;
+                WriteSetting(L"Navigator", on ? 1 : 0);
+                self->navigator.Show(on);
+                self->Layout();
+                if (on && self->selected > 0) self->Navigate(self->selected);
+                return 0;
+            }
             case IdCompact:
                 self->compact = Button_GetCheck(self->compactBox) == BST_CHECKED;
                 WriteSetting(L"Compact", self->compact ? 1 : 0);
