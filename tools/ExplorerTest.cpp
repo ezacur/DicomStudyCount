@@ -1,12 +1,12 @@
 // Test of the DICOM explorer of bin\DicomShell.dll over a corpus, without its window (built and run by
-// tools\Test-DicomExplorer.ps1; DicomShell.cpp is compiled into it, DicomExplorer lets it in).
+// tools\Test-DicomExplorer.ps1, with the sources of src\; DicomExplorer lets it in).
 //   ExplorerTest <out folder> <sample> <log> <folder>...
 //       for each folder: the gathering, the tree, the checks, the middle thumbnail of every series, the
 //       report, and for a sample of orientations the floating thumbnail and the exports (PNG / GIF /
 //       NIfTI), each file written checked and deleted. The folders are only read.
 //   ExplorerTest --missing <log> <folder>...
 //       the series with instance numbers missing: which ones, their note, the geometry of the series
-#include "../src/DicomShell.cpp"
+#include "../src/Shell.h"
 #include <psapi.h>
 #include <set>
 #pragma comment(lib, "psapi.lib")

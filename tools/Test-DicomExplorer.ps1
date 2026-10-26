@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Tests the DICOM explorer of bin\DicomShell.dll over folders of DICOM files, without its window:
-    builds tools\ExplorerTest.cpp (with src\DicomShell.cpp inside it) and runs it. For each folder, the
+    builds tools\ExplorerTest.cpp (with the sources of src\) and runs it. For each folder, the
     gathering, the tree, the checks, the middle thumbnail of every series, the report, and for a sample
     of orientations the floating thumbnail and the exports (PNG, animated GIF, NIfTI), each file written
     checked (readable, its frames; a NIfTI, its size from its header) and deleted. The folders are only
@@ -52,9 +52,11 @@ try {
     $libs += ' "{0}" "{1}"' -f (Join-Path $openJpegInstall 'lib\openjp2.lib'), (Join-Path $zlibInstall 'lib\zlib_o.lib')
     $openJpegInclude = (Get-ChildItem (Join-Path $openJpegInstall 'include') -Directory | Select-Object -First 1).FullName
     $exe = Join-Path $work 'ExplorerTest.exe'
-    $cl = ('cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DOPJ_STATIC /external:W0 /external:I "{0}" /external:I "{1}"' +
-           ' /external:I "{6}" "{2}" /Fo"{3}\\" /Fe"{4}" /link {5} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
-        (Join-Path $dcmtkInstall 'include'), $openJpegInclude, (Join-Path $root 'tools\ExplorerTest.cpp'), $work, $exe, $libs,
+    $sources = ((@(Join-Path $root 'tools\ExplorerTest.cpp') + (Get-ChildItem (Join-Path $root 'src') -Filter *.cpp).FullName) |
+        ForEach-Object { '"{0}"' -f $_ }) -join ' '
+    $cl = ('cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DOPJ_STATIC /external:W0 /external:I "{0}" /external:I "{1}"' +
+           ' /external:I "{6}" {2} /Fo"{3}\\" /Fe"{4}" /link {5} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
+        (Join-Path $dcmtkInstall 'include'), $openJpegInclude, $sources, $work, $exe, $libs,
         (Join-Path $zlibInstall 'include')
     cmd /c "`"$vcvars`" >nul 2>nul && $cl 2>&1" | Where-Object { $_ -match 'error|warning' } | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "The test did not build ($LASTEXITCODE)" }

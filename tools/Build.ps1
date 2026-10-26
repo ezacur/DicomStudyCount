@@ -3,7 +3,7 @@
     Builds the two DLLs of bin\ from src\: only needed after changing the sources (the DLLs are in the
     repository, so a copy of the folder works without building anything).
       bin\Explorer4Dicoms.dll   src\Explorer4Dicoms.cs   C# for .NET Framework 4 (Windows PowerShell 5.1)
-      bin\DicomShell.dll        src\DicomShell.cpp       C++ icons, columns and preview (x64), it needs
+      bin\DicomShell.dll        src\*.cpp, src\*.h       C++ icons, columns and preview (x64), it needs
                                                          the Visual Studio C++ build tools, DCMTK,
                                                          OpenJPEG and zlib (third_party), built once
                                                          into build\
@@ -129,9 +129,11 @@ if ($Cpp) {
             ForEach-Object { '"{0}"' -f (Join-Path $lib "$_.lib") }) -join ' '
         $libs += ' "{0}" "{1}"' -f (Join-Path $openJpegInstall 'lib\openjp2.lib'), (Join-Path $zlibInstall 'lib\zlib_o.lib')
         $openJpegInclude = (Get-ChildItem (Join-Path $openJpegInstall 'include') -Directory | Select-Object -First 1).FullName
-        $cl = ('cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DOPJ_STATIC /external:W0 /external:I "{3}"' +
-               ' /external:I "{5}" /external:I "{6}" /LD "{0}" /Fo"{1}/" /Fe"{2}" /link {4} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
-            (Join-Path $root 'src\DicomShell.cpp'), $work, (Join-Path $work 'DicomShell.dll'), (Join-Path $dcmtkInstall 'include'), $libs,
+        # (all the parts of src\, at once: /MP)
+        $sources = (Get-ChildItem (Join-Path $root 'src') -Filter *.cpp | ForEach-Object { '"{0}"' -f $_.FullName }) -join ' '
+        $cl = ('cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DOPJ_STATIC /external:W0 /external:I "{3}"' +
+               ' /external:I "{5}" /external:I "{6}" /LD {0} /Fo"{1}/" /Fe"{2}" /link {4} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
+            $sources, $work, (Join-Path $work 'DicomShell.dll'), (Join-Path $dcmtkInstall 'include'), $libs,
             $openJpegInclude, (Join-Path $zlibInstall 'include')
         cmd /c "`"$vcvars`" >nul 2>nul && $cl 2>&1" | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { throw "C++ build failed ($LASTEXITCODE)" }

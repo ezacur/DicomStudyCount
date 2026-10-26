@@ -1,0 +1,1028 @@
+// The decoding of DICOM images with DCMTK (and OpenJPEG, deflated and float frames, Philips private CT), the overlay, the DICOMDIR
+#include "Shell.h"
+
+// ---------------------------------------------------------------------------------------------
+// Preview (Explorer's preview pane, Alt+P): three tabs (the DICOM columns of Explorer, to show or hide
+// them; the header with names; the header with tags) over the image, whose window drags with the
+// mouse. It runs in prevhost.exe, a process of its own (a crash there never takes Explorer down), at
+// medium integrity (DisableLowILProcessIsolation), to reach the Explorer window for its columns.
+// DCMTK reads the file from memory, decodes the pixels (uncompressed, JPEG baseline / extended /
+// lossless, JPEG-LS, RLE; JPEG 2000 with OpenJPEG) and renders them with the window of the header.
+
+void InitDcmtk()
+{
+    static std::once_flag once;
+    std::call_once(once, []() {
+        OFLog::configure(OFLogger::OFF_LOG_LEVEL);       // nobody to read its messages here
+        // JPEG baseline, extended, lossless. Lossy JPEG: the color space from the JPEG markers, not
+        // from the header (some devices store YCbCr and say RGB)
+        DJDecoderRegistration::registerCodecs(EDC_guessLossyOnly);
+        DJLSDecoderRegistration::registerCodecs();       // JPEG-LS (with the CharLS inside DCMTK)
+        DcmRLEDecoderRegistration::registerCodecs();     // RLE
+    });
+}
+
+// The pixels of the frame with the current window of its imaging
+void Rewindow(Rendered& r)
+{
+    Imaging* im = r.imaging.get();
+    if (!im || !im->image || r.width <= 0 || r.height <= 0) return;
+    const size_t n = static_cast<size_t>(r.width) * r.height;
+    r.pixels.resize(n);
+    if (im->width < 1) im->width = 1;
+    if (im->mono)
+    {
+        im->image->setWindow(im->center, im->width);
+        const Uint8* out = static_cast<const Uint8*>(im->image->getOutputData(8, 0, 0));
+        if (!out) return;
+        for (size_t i = 0; i < n; i++) r.pixels[i] = (static_cast<DWORD>(out[i]) << 16) | (out[i] << 8) | out[i];
+        return;
+    }
+    // Color: one table for the three channels
+    BYTE table[256];
+    const double from = im->center - im->width / 2;
+    for (int v = 0; v < 256; v++)
+    {
+        double x = (v - from) * 255.0 / im->width;
+        table[v] = static_cast<BYTE>(x < 0 ? 0 : x > 255 ? 255 : x + 0.5);
+    }
+    for (size_t i = 0; i < n && i < im->color.size(); i++)
+    {
+        DWORD c = im->color[i];
+        r.pixels[i] = (static_cast<DWORD>(table[(c >> 16) & 0xFF]) << 16) | (table[(c >> 8) & 0xFF] << 8) | table[c & 0xFF];
+    }
+}
+
+// The value of an element as one line: text and numbers in brackets, large binary values by size
+std::wstring ValueOf(DcmElement* e, const std::string& charset)
+{
+    const Uint32 length = e->getLength();
+    const DcmEVR vr = e->ident();
+    if (e->getTag() == DCM_PixelData) return L"(pixel data, " + std::to_wstring(length) + L" bytes)";
+    bool binary = vr == EVR_OB || vr == EVR_OW || vr == EVR_OF || vr == EVR_OD || vr == EVR_OL || vr == EVR_OV ||
+                  vr == EVR_UN || vr == EVR_ox;
+    if ((binary && length > 64) || length > 4096) return L"(" + std::to_wstring(length) + L" bytes)";
+    OFString v;
+    if (e->getOFStringArray(v).bad()) return L"(not readable)";
+    std::wstring w = Widen(std::string(v.c_str(), v.length()), charset);
+    for (auto& c : w) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+    if (w.size() > 200) w = w.substr(0, 200) + L"...";
+    return L"[" + w + L"]";
+}
+
+// One line per element; the items of a sequence indented under it
+static void Dump(DcmItem* item, const std::string& charset, int depth, std::wstring& tags, std::wstring& names)
+{
+    const std::wstring indent(static_cast<size_t>(depth) * 2, L' ');
+    for (unsigned long i = 0; i < item->card(); i++)
+    {
+        DcmElement* e = item->getElement(i);
+        if (!e) continue;
+        DcmTag tag = e->getTag();
+        wchar_t numbers[16];
+        swprintf_s(numbers, L"(%04X,%04X)", tag.getGTag(), tag.getETag());
+        std::wstring name = Widen(tag.getTagName());
+        if (name.empty() || name == Widen(DcmTag_ERROR_TagName)) name = numbers;    // not in the dictionary
+        if (name.size() < 32) name.resize(32, L' ');
+        const std::wstring vr = Widen(DcmVR(e->getVR()).getVRName());
+        if (e->ident() == EVR_SQ)
+        {
+            auto sq = static_cast<DcmSequenceOfItems*>(e);
+            std::wstring value = L"(" + std::to_wstring(sq->card()) + (sq->card() == 1 ? L" item)" : L" items)");
+            tags += indent + numbers + L" " + vr + L" " + value + L"\r\n";
+            names += indent + name + L" " + vr + L" " + value + L"\r\n";
+            for (unsigned long k = 0; k < sq->card(); k++)
+            {
+                std::wstring head = indent + L"  > item " + std::to_wstring(k + 1) + L"\r\n";
+                tags += head;
+                names += head;
+                Dump(sq->getItem(k), charset, depth + 2, tags, names);
+            }
+            continue;
+        }
+        const std::wstring value = ValueOf(e, charset);
+        tags += indent + numbers + L" " + vr + L" " + value + L"\r\n";
+        names += indent + name + L" " + vr + L" " + value + L"\r\n";
+    }
+}
+
+// The header twice: with the tags and with the dictionary names
+void DumpHeader(DcmFileFormat& ff, std::wstring& tags, std::wstring& names)
+{
+    OFString charset;
+    ff.getDataset()->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    const std::wstring meta = L"# File meta information\r\n", dataset = L"\r\n# Dataset\r\n";
+    tags = meta;
+    names = meta;
+    Dump(ff.getMetaInfo(), std::string(), 0, tags, names);
+    tags += dataset;
+    names += dataset;
+    Dump(ff.getDataset(), charset.c_str(), 0, tags, names);
+}
+
+// "20230405" and "101233.5" as "2023-04-05 10:12:33"
+std::wstring DateTimeText(const std::string& date, const std::string& time)
+{
+    std::string s;
+    if (date.size() >= 8) s = date.substr(0, 4) + "-" + date.substr(4, 2) + "-" + date.substr(6, 2);
+    if (time.size() >= 4)
+    {
+        if (!s.empty()) s += " ";
+        s += time.substr(0, 2) + ":" + time.substr(2, 2);
+        if (time.size() >= 6 && time[4] >= '0' && time[4] <= '9') s += ":" + time.substr(4, 2);
+    }
+    return Widen(s);
+}
+
+// The patient directions (DICOM: x to the left, y to the back, z to the head) of a direction of the
+// image: its main components, the largest first
+static std::wstring Direction(double x, double y, double z)
+{
+    struct Axis { double v; wchar_t plus, minus; } axes[3] = { { x, L'L', L'R' }, { y, L'P', L'A' }, { z, L'H', L'F' } };
+    std::sort(std::begin(axes), std::end(axes), [](const Axis& a, const Axis& b) { return std::fabs(a.v) > std::fabs(b.v); });
+    std::wstring s;
+    for (const Axis& a : axes) if (std::fabs(a.v) >= 0.25) s += a.v > 0 ? a.plus : a.minus;
+    return s;
+}
+
+// The overlay: what viewers write in the corners of the image, never who the patient is. The series
+// and the image at the top left, when and with what at the top right, where the slice is and its size
+// at the bottom left. The window and the zoom (bottom right) change, so the preview writes them.
+static void Annotate(Rendered& r, DcmDataset* ds)
+{
+    OFString cs;
+    ds->findAndGetOFString(DCM_SpecificCharacterSet, cs);
+    const std::string charset = cs.c_str();
+    auto get = [&](const DcmTagKey& key, bool deep = false) {
+        OFString v;
+        ds->findAndGetOFStringArray(key, v, deep);       // deep: in the functional groups of enhanced files
+        return std::string(v.c_str(), v.length());
+    };
+    auto add = [](std::wstring& corner, const std::wstring& line) {
+        if (!line.empty()) corner += (corner.empty() ? L"" : L"\n") + line;
+    };
+    wchar_t buffer[128];
+
+    std::wstring series = Widen(get(DCM_Modality));
+    const std::string number = get(DCM_SeriesNumber);
+    if (!number.empty()) series += (series.empty() ? L"Series " : L"  Series ") + Widen(number);
+    add(r.corners[0], series);
+    add(r.corners[0], Widen(get(DCM_SeriesDescription), charset));
+    const std::string instance = get(DCM_InstanceNumber);
+    if (!instance.empty()) add(r.corners[0], L"Image " + Widen(instance));
+
+    const std::string at = get(DCM_AcquisitionDateTime);
+    std::wstring when = at.size() >= 8 ? DateTimeText(at.substr(0, 8), at.substr(8)) : std::wstring();
+    if (when.empty()) when = DateTimeText(get(DCM_AcquisitionDate), get(DCM_AcquisitionTime));
+    if (when.empty()) when = DateTimeText(get(DCM_ContentDate), get(DCM_ContentTime));
+    if (when.empty()) when = DateTimeText(get(DCM_SeriesDate), get(DCM_SeriesTime));
+    if (when.empty()) when = DateTimeText(get(DCM_StudyDate), get(DCM_StudyTime));
+    add(r.corners[1], when);
+    std::wstring device = Widen(get(DCM_Manufacturer), charset);
+    const std::wstring model = Widen(get(DCM_ManufacturerModelName), charset);
+    if (!model.empty()) device += (device.empty() ? L"" : L" ") + model;
+    add(r.corners[1], device);
+    add(r.corners[1], Widen(get(DCM_ProtocolName), charset));
+
+    Header h;
+    h.imagePosition = get(DCM_ImagePositionPatient, true);
+    h.imageOrientation = get(DCM_ImageOrientationPatient, true);
+    double z = 0, thickness = 0, spacing[2] = {};
+    if (ZLevel(h, z) || Numbers(get(DCM_SliceLocation), &z, 1))
+    {
+        swprintf_s(buffer, L"Z %.1f mm", z);
+        add(r.corners[2], buffer);
+    }
+    if (Numbers(get(DCM_SliceThickness, true), &thickness, 1))
+    {
+        swprintf_s(buffer, L"Thickness %.3g mm", thickness);
+        add(r.corners[2], buffer);
+    }
+    if (Numbers(get(DCM_PixelSpacing, true), spacing, 2))
+    {
+        swprintf_s(buffer, L"Pixel %.3g x %.3g mm", spacing[0], spacing[1]);
+        add(r.corners[2], buffer);
+    }
+    if (r.width > 0)
+    {
+        swprintf_s(buffer, L"%d x %d", r.width, r.height);
+        add(r.corners[2], buffer);
+    }
+
+    // The rows go to the right along the first 3 numbers of ImageOrientationPatient, the columns down
+    // along the other 3
+    double o[6];
+    if (Numbers(h.imageOrientation, o, 6))
+    {
+        r.sides[0] = Direction(-o[0], -o[1], -o[2]);
+        r.sides[1] = Direction(-o[3], -o[4], -o[5]);
+        r.sides[2] = Direction(o[0], o[1], o[2]);
+        r.sides[3] = Direction(o[3], o[4], o[5]);
+    }
+}
+
+// JPEG 2000 (and High-Throughput JPEG 2000): DCMTK has no decoder for it, OpenJPEG decodes it
+bool IsJpeg2000(E_TransferSyntax x)
+{
+    return x == EXS_JPEG2000LosslessOnly || x == EXS_JPEG2000 || x == EXS_JPEG2000MulticomponentLosslessOnly ||
+           x == EXS_JPEG2000Multicomponent || x == EXS_HighThroughputJPEG2000LosslessOnly ||
+           x == EXS_HighThroughputJPEG2000withRPCLOptionsLosslessOnly || x == EXS_HighThroughputJPEG2000;
+}
+
+// OpenJPEG reads the codestream from memory
+struct MemoryStream { const Uint8* data; size_t size, at; };
+static OPJ_SIZE_T MemRead(void* buffer, OPJ_SIZE_T n, void* user)
+{
+    auto m = static_cast<MemoryStream*>(user);
+    if (m->at >= m->size) return static_cast<OPJ_SIZE_T>(-1);
+    size_t k = n < m->size - m->at ? n : m->size - m->at;
+    memcpy(buffer, m->data + m->at, k);
+    m->at += k;
+    return k;
+}
+static OPJ_OFF_T MemSkip(OPJ_OFF_T n, void* user)
+{
+    auto m = static_cast<MemoryStream*>(user);
+    if (n < 0) return -1;
+    size_t k = static_cast<size_t>(n) < m->size - m->at ? static_cast<size_t>(n) : m->size - m->at;
+    m->at += k;
+    return static_cast<OPJ_OFF_T>(k);
+}
+static OPJ_BOOL MemSeek(OPJ_OFF_T n, void* user)
+{
+    auto m = static_cast<MemoryStream*>(user);
+    if (n < 0 || static_cast<size_t>(n) > m->size) return OPJ_FALSE;
+    m->at = static_cast<size_t>(n);
+    return OPJ_TRUE;
+}
+
+// A frame of a JPEG 2000 dataset, decoded: a copy of the dataset with that frame as native pixel data
+// (Explicit VR Little Endian), which DicomImage renders as any other. Null if it cannot.
+DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
+{
+    DcmElement* element = nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return nullptr;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq) return nullptr;
+
+    // The fragments of the frame (item 0 is the offset table): all of them for a single frame; for more,
+    // a frame starts at each fragment that starts a codestream (SOC marker, or a JP2 signature box)
+    std::vector<Uint8> code;
+    int at = -1;                                    // the frame of the fragment
+    for (unsigned long i = 1; i < seq->card(); i++)
+    {
+        DcmPixelItem* item = nullptr;
+        Uint8* bytes = nullptr;
+        if (seq->getItem(item, i).bad() || !item || item->getUint8Array(bytes).bad() || !bytes) break;
+        const Uint32 n = item->getLength();
+        bool starts = n >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0x4F) || (n >= 8 && bytes[4] == 'j' && bytes[5] == 'P'));
+        if (multiframe)
+        {
+            if (at < 0 || starts) at++;
+            if (at > frame) break;
+            if (at < frame) continue;
+        }
+        code.insert(code.end(), bytes, bytes + n);
+    }
+    if (code.size() < 8) return nullptr;
+    bool jp2 = !(code[0] == 0xFF && code[1] == 0x4F);
+
+    MemoryStream mem = { code.data(), code.size(), 0 };
+    opj_stream_t* stream = opj_stream_default_create(OPJ_TRUE);
+    if (!stream) return nullptr;
+    opj_stream_set_read_function(stream, MemRead);
+    opj_stream_set_skip_function(stream, MemSkip);
+    opj_stream_set_seek_function(stream, MemSeek);
+    opj_stream_set_user_data(stream, &mem, nullptr);
+    opj_stream_set_user_data_length(stream, code.size());
+    opj_codec_t* codec = opj_create_decompress(jp2 ? OPJ_CODEC_JP2 : OPJ_CODEC_J2K);
+    opj_image_t* image = nullptr;
+    opj_dparameters_t options;
+    opj_set_default_decoder_parameters(&options);
+    bool ok = codec && opj_setup_decoder(codec, &options) && opj_read_header(stream, codec, &image) &&
+              opj_decode(codec, stream, image) && opj_end_decompress(codec, stream);
+    opj_stream_destroy(stream);
+    if (codec) opj_destroy_codec(codec);
+
+    DcmDataset* out = nullptr;
+    if (ok && image && image->numcomps >= 1)
+    {
+        const OPJ_UINT32 samples = image->numcomps >= 3 ? 3 : 1;
+        const opj_image_comp_t* c = image->comps;
+        const OPJ_UINT32 w = c[0].w, h = c[0].h, prec = c[0].prec, sgnd = c[0].sgnd;
+        bool same = w > 0 && h > 0 && prec >= 1 && prec <= 16;
+        for (OPJ_UINT32 k = 0; k < samples && same; k++)
+            same = c[k].w == w && c[k].h == h && c[k].prec == prec && c[k].sgnd == sgnd && c[k].data;
+        if (same)
+        {
+            out = new DcmDataset(*ds);
+            out->findAndDeleteElement(DCM_PixelData);
+            const size_t n = static_cast<size_t>(w) * h;
+            const bool bytes = prec <= 8 && !sgnd;
+            if (bytes)
+            {
+                std::vector<Uint8> v(n * samples);
+                for (size_t i = 0; i < n; i++)
+                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint8>(c[k].data[i]);
+                out->putAndInsertUint8Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
+            }
+            else
+            {
+                std::vector<Uint16> v(n * samples);
+                for (size_t i = 0; i < n; i++)
+                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint16>(c[k].data[i]);
+                out->putAndInsertUint16Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
+            }
+            out->putAndInsertUint16(DCM_SamplesPerPixel, static_cast<Uint16>(samples));
+            out->putAndInsertUint16(DCM_Rows, static_cast<Uint16>(h));
+            out->putAndInsertUint16(DCM_Columns, static_cast<Uint16>(w));
+            out->putAndInsertUint16(DCM_BitsAllocated, bytes ? 8 : 16);
+            out->putAndInsertUint16(DCM_BitsStored, static_cast<Uint16>(prec));
+            out->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(prec - 1));
+            out->putAndInsertUint16(DCM_PixelRepresentation, sgnd ? 1 : 0);
+            out->findAndDeleteElement(DCM_NumberOfFrames);
+            if (samples == 3)
+            {
+                // OpenJPEG undoes the color transform of the codestream: RGB
+                out->putAndInsertString(DCM_PhotometricInterpretation, "RGB");
+                out->putAndInsertUint16(DCM_PlanarConfiguration, 0);
+            }
+            else
+            {
+                OFString photometric;
+                out->findAndGetOFString(DCM_PhotometricInterpretation, photometric);
+                if (photometric != "MONOCHROME1") out->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+                out->findAndDeleteElement(DCM_PlanarConfiguration);
+            }
+        }
+    }
+    if (image) opj_image_destroy(image);
+    return out;
+}
+
+// Elscint / Philips PMSCT_RLE1 (transfer syntax 1.3.46.670589.33.1.4.1): some Elscint CT (later Picker,
+// Marconi, Philips) write the image into the private (07A1,100A), with the name of its codec in
+// (07A1,1011), and no (7FE0,0010). DCMTK has no decoder for it.
+static const char PmsctSyntax[] = "1.3.46.670589.33.1.4.1";
+
+bool IsPmsct(DcmFileFormat& ff)
+{
+    OFString syntax, codec;
+    ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, syntax);
+    ff.getDataset()->findAndGetOFString(DcmTagKey(0x07A1, 0x1011), codec);
+    // (some say so in their transfer syntax, others only by having no pixel data)
+    return codec == "PMSCT_RLE1" && (syntax == PmsctSyntax || !ff.getDataset()->tagExists(DCM_PixelData));
+}
+
+// Its pixels, as pmsct_decode.cpp (mTools) decodes them: a run-length pass (0xA5, count - 1, byte) and
+// then a delta pass (each byte a signed step from the value before; 0x5A, low, high: a value). A copy
+// of the dataset with them as native 16-bit pixel data; null if the stream is short or broken.
+DcmDataset* DecodePmsct(DcmDataset* ds)
+{
+    DcmElement* e = nullptr;
+    if (ds->findAndGetElement(DcmTagKey(0x07A1, 0x100A), e).bad() || !e) return nullptr;
+    const Uint32 length = e->getLength();
+    std::vector<Uint8> in(length);
+    Uint8* bytes = nullptr;
+    Uint16* words = nullptr;
+    if (e->getUint8Array(bytes).good() && bytes) memcpy(in.data(), bytes, length);
+    else if (e->getUint16Array(words).good() && words) memcpy(in.data(), words, length);
+    else return nullptr;
+    std::vector<Uint8> runs;
+    runs.reserve(static_cast<size_t>(length) * 2);
+    for (size_t i = 0; i < in.size(); i++)
+    {
+        if (in[i] != 0xA5) { runs.push_back(in[i]); continue; }
+        if (i + 2 >= in.size()) return nullptr;
+        runs.insert(runs.end(), static_cast<size_t>(in[i + 1]) + 1, in[i + 2]);
+        i += 2;
+    }
+    std::vector<Uint16> out;
+    out.reserve(runs.size());
+    Uint16 value = 0;
+    for (size_t i = 0; i < runs.size(); i++)
+    {
+        if (runs[i] == 0x5A)
+        {
+            if (i + 2 >= runs.size()) return nullptr;
+            value = static_cast<Uint16>(runs[i + 2] * 256 + runs[i + 1]);
+            i += 2;
+        }
+        else value = static_cast<Uint16>(static_cast<int>(static_cast<Sint8>(runs[i])) + value);
+        out.push_back(value);
+    }
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    const size_t n = static_cast<size_t>(rows) * columns;
+    if (n == 0 || out.size() < n) return nullptr;
+    auto copy = new DcmDataset(*ds);
+    copy->findAndDeleteElement(DcmTagKey(0x07A1, 0x100A));
+    copy->findAndDeleteElement(DCM_PixelData);
+    copy->putAndInsertUint16Array(DCM_PixelData, out.data(), static_cast<unsigned long>(n));
+    copy->putAndInsertUint16(DCM_BitsAllocated, 16);
+    Uint16 stored = 0;
+    if (copy->findAndGetUint16(DCM_BitsStored, stored).bad() || stored == 0 || stored > 16) copy->putAndInsertUint16(DCM_BitsStored, 16);
+    copy->findAndGetUint16(DCM_BitsStored, stored);
+    copy->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(stored - 1));
+    copy->putAndInsertUint16(DCM_SamplesPerPixel, 1);
+    OFString photometric;
+    if (copy->findAndGetOFString(DCM_PhotometricInterpretation, photometric).bad() || photometric.empty())
+        copy->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+    copy->findAndDeleteElement(DCM_NumberOfFrames);
+    return copy;
+}
+
+// The fragments of one frame of encapsulated pixel data (item 0 is the offset table): all of them for
+// a single frame; for more, one fragment a frame when there are as many, or else the offset table
+static bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<Uint8>& out)
+{
+    out.clear();
+    DcmElement* element = nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return false;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq || seq->card() < 2) return false;
+    const unsigned long fragments = seq->card() - 1;
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+    auto append = [&](unsigned long i) {
+        DcmPixelItem* item = nullptr;
+        Uint8* bytes = nullptr;
+        if (seq->getItem(item, i).bad() || !item || item->getUint8Array(bytes).bad() || !bytes) return false;
+        out.insert(out.end(), bytes, bytes + item->getLength());
+        return true;
+    };
+    if (!multiframe || frames == 1)
+    {
+        for (unsigned long i = 1; i <= fragments; i++) if (!append(i)) return false;
+        return !out.empty();
+    }
+    if (static_cast<long>(fragments) == frames) return append(static_cast<unsigned long>(frame) + 1);
+    // The offset table: where each frame starts, counted from the first fragment (8 bytes of header each)
+    DcmPixelItem* table = nullptr;
+    Uint8* offsets = nullptr;
+    if (seq->getItem(table, 0).bad() || !table || table->getLength() < static_cast<Uint32>(4 * frames) || table->getUint8Array(offsets).bad() || !offsets)
+        return false;
+    auto at = [&](int k) { Uint32 v; memcpy(&v, offsets + 4 * k, 4); return v; };
+    const Uint32 from = at(frame), to = frame + 1 < frames ? at(frame + 1) : 0xFFFFFFFF;
+    Uint32 position = 0;
+    for (unsigned long i = 1; i <= fragments; i++)
+    {
+        DcmPixelItem* item = nullptr;
+        if (seq->getItem(item, i).bad() || !item) return false;
+        if (position >= from && position < to && !append(i)) return false;
+        position += item->getLength() + 8;
+    }
+    return !out.empty();
+}
+
+// A copy of a dataset with one frame as native pixel data (Explicit VR Little Endian), as the decoders
+// below give it to DicomImage: 8 or 16 bits as stored, no other frames
+static DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 allocated)
+{
+    auto out = new DcmDataset(*ds);
+    out->findAndDeleteElement(DCM_PixelData);
+    out->findAndDeleteElement(DCM_FloatPixelData);
+    out->findAndDeleteElement(DCM_DoubleFloatPixelData);
+    if (allocated <= 8) out->putAndInsertUint8Array(DCM_PixelData, bytes.data(), static_cast<unsigned long>(bytes.size()));
+    else
+    {
+        std::vector<Uint16> words(bytes.size() / 2);
+        memcpy(words.data(), bytes.data(), words.size() * 2);
+        out->putAndInsertUint16Array(DCM_PixelData, words.data(), static_cast<unsigned long>(words.size()));
+    }
+    out->findAndDeleteElement(DCM_NumberOfFrames);
+    return out;
+}
+
+// Deflated image frames (1.2.840.10008.1.2.8.1): each frame compressed by deflate (raw, or with a zlib
+// header), which DCMTK reads the name of but has no codec for. 1-bit frames (segmentations) come out as
+// 8 bits, 0 or 255. Null if it cannot.
+DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame)
+{
+    std::vector<Uint8> packed;
+    if (!FrameBytes(ds, multiframe, frame, packed)) return nullptr;
+    Uint16 rows = 0, columns = 0, allocated = 0, samples = 1;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    ds->findAndGetUint16(DCM_SamplesPerPixel, samples);
+    const size_t n = static_cast<size_t>(rows) * columns * (samples ? samples : 1);
+    if (n == 0 || (allocated != 1 && allocated != 8 && allocated != 16)) return nullptr;
+    const size_t size = allocated == 1 ? (n + 7) / 8 : n * allocated / 8;
+    std::vector<Uint8> plain(size);
+    // raw deflate first (-15), then with a zlib or gzip header (47)
+    bool ok = false;
+    for (int bits : { -15, 47 })
+    {
+        z_stream z = {};
+        if (inflateInit2(&z, bits) != Z_OK) continue;
+        z.next_in = packed.data();
+        z.avail_in = static_cast<uInt>(packed.size());
+        z.next_out = plain.data();
+        z.avail_out = static_cast<uInt>(plain.size());
+        const int r = inflate(&z, Z_FINISH);
+        ok = (r == Z_STREAM_END || r == Z_OK || r == Z_BUF_ERROR) && z.avail_out == 0;
+        inflateEnd(&z);
+        if (ok) break;
+    }
+    if (!ok) return nullptr;
+    if (allocated == 1)
+    {
+        // (bits from the lowest one of each byte, as DICOM packs them)
+        std::vector<Uint8> wide(n);
+        for (size_t i = 0; i < n; i++) wide[i] = (plain[i / 8] >> (i % 8)) & 1 ? 255 : 0;
+        DcmDataset* out = NativeCopy(ds, wide, 8);
+        out->putAndInsertUint16(DCM_BitsAllocated, 8);
+        out->putAndInsertUint16(DCM_BitsStored, 8);
+        out->putAndInsertUint16(DCM_HighBit, 7);
+        out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+        return out;
+    }
+    return NativeCopy(ds, plain, allocated);
+}
+
+// 1-bit pixels as they are (segmentations): a frame need not start at a byte, and DCMTK reads only the
+// frames that do. Its bits, from the lowest one of each byte, as 8 bits (0 or 255).
+bool IsBitFrames(DcmDataset* ds, E_TransferSyntax xfer)
+{
+    Uint16 allocated = 0;
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    return allocated == 1 && !DcmXfer(xfer).isEncapsulated() && ds->tagExists(DCM_PixelData);
+}
+
+DcmDataset* DecodeBitFrame(DcmDataset* ds, int frame)
+{
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    const size_t n = static_cast<size_t>(rows) * columns, first = static_cast<size_t>(frame) * n;
+    DcmElement* e = nullptr;
+    if (n == 0 || ds->findAndGetElement(DCM_PixelData, e).bad() || !e) return nullptr;
+    Uint8* bytes = nullptr;
+    Uint16* words = nullptr;                        // (OW: the same bytes, little endian)
+    if (e->getUint8Array(bytes).bad() || !bytes)
+    {
+        if (e->getUint16Array(words).bad() || !words) return nullptr;
+        bytes = reinterpret_cast<Uint8*>(words);
+    }
+    const unsigned long count = e->getLength();
+    if ((first + n + 7) / 8 > count) return nullptr;
+    std::vector<Uint8> wide(n);
+    for (size_t i = 0; i < n; i++) wide[i] = (bytes[(first + i) / 8] >> ((first + i) % 8)) & 1 ? 255 : 0;
+    DcmDataset* out = NativeCopy(ds, wide, 8);
+    out->putAndInsertUint16(DCM_BitsAllocated, 8);
+    out->putAndInsertUint16(DCM_BitsStored, 8);
+    out->putAndInsertUint16(DCM_HighBit, 7);
+    out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+    return out;
+}
+
+// Float pixel data (Parametric Maps: T1, T2, ADC... as decimal numbers, 7FE0,0008 or 7FE0,0009): the
+// values of a frame, which DCMTK cannot render
+bool FloatFrame(DcmDataset* ds, int frame, std::vector<double>& values)
+{
+    Uint16 rows = 0, columns = 0;
+    ds->findAndGetUint16(DCM_Rows, rows);
+    ds->findAndGetUint16(DCM_Columns, columns);
+    const size_t n = static_cast<size_t>(rows) * columns, at = static_cast<size_t>(frame) * n;
+    if (n == 0) return false;
+    DcmElement* e = nullptr;
+    if (ds->findAndGetElement(DCM_FloatPixelData, e).good() && e)
+    {
+        Float32* f = nullptr;
+        if (e->getFloat32Array(f).bad() || !f || e->getLength() / 4 < at + n) return false;
+        values.assign(f + at, f + at + n);
+        return true;
+    }
+    if (ds->findAndGetElement(DCM_DoubleFloatPixelData, e).good() && e)
+    {
+        Float64* d = nullptr;
+        if (e->getFloat64Array(d).bad() || !d || e->getLength() / 8 < at + n) return false;
+        values.assign(d + at, d + at + n);
+        return true;
+    }
+    return false;
+}
+
+// For the preview: the frame as 16-bit values with a rescale back to the decimal ones, so DicomImage
+// shows them and their window is in their units
+static DcmDataset* DecodeFloatFrame(DcmDataset* ds, int frame)
+{
+    std::vector<double> values;
+    if (!FloatFrame(ds, frame, values)) return nullptr;
+    double lo = 0, hi = 0;
+    bool first = true;
+    for (double v : values)
+        if (std::isfinite(v)) { if (first) { lo = hi = v; first = false; } else { lo = (std::min)(lo, v); hi = (std::max)(hi, v); } }
+    const double slope = hi > lo ? (hi - lo) / 65535 : 1;
+    std::vector<Uint8> bytes(values.size() * 2);
+    for (size_t i = 0; i < values.size(); i++)
+    {
+        const double v = std::isfinite(values[i]) ? values[i] : lo;
+        const Uint16 s = static_cast<Uint16>(std::lround((v - lo) / slope));
+        memcpy(&bytes[2 * i], &s, 2);
+    }
+    DcmDataset* out = NativeCopy(ds, bytes, 16);
+    out->putAndInsertUint16(DCM_BitsAllocated, 16);
+    out->putAndInsertUint16(DCM_BitsStored, 16);
+    out->putAndInsertUint16(DCM_HighBit, 15);
+    out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+    out->putAndInsertUint16(DCM_SamplesPerPixel, 1);
+    out->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+    char text[64];
+    sprintf_s(text, "%.10g", slope);
+    out->putAndInsertString(DCM_RescaleSlope, text);
+    sprintf_s(text, "%.10g", lo);
+    out->putAndInsertString(DCM_RescaleIntercept, text);
+    return out;
+}
+
+bool HasFloatPixels(DcmDataset* ds) { return ds->tagExists(DCM_FloatPixelData) || ds->tagExists(DCM_DoubleFloatPixelData); }
+
+// Why a file has no image to show: it has no pixels (a report, a PDF, a presentation state...), or
+// they are in a transfer syntax that is not known here. Empty if it may have one.
+std::wstring NoImage(DcmFileFormat& ff)
+{
+    OFString syntax;
+    ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, syntax);
+    if (IsPmsct(ff)) return std::wstring();
+    if (!syntax.empty() && DcmXfer(syntax.c_str()).getXfer() == EXS_Unknown) return Compression(syntax.c_str()) + L" is not supported";
+    if (!ff.getDataset()->tagExists(DCM_PixelData) && !HasFloatPixels(ff.getDataset()))
+    {
+        OFString sop;
+        ff.getDataset()->findAndGetOFString(DCM_SOPClassUID, sop);
+        return L"it has no pixels (" + (sop.empty() ? std::wstring(L"no SOP class") : ObjectType(sop.c_str())) + L")";
+    }
+    return std::wstring();
+}
+
+// The records of a DICOMDIR, as a tree: each one points to the next one of its level and to the first
+// one under it by their offsets in the file, which DCMTK keeps for each record it reads. (Not by
+// DcmDicomDir, which writes the file back when it finds something to correct in it.) Never who the
+// patient is: the patient ID, not the name.
+static void ReadRecords(const std::unordered_map<Uint32, DcmItem*>& records, Uint32 offset, const std::string& charset,
+                        std::vector<DirNode>& out, int depth, std::unordered_set<Uint32>& seen)
+{
+    for (; offset != 0 && depth < 8; )
+    {
+        auto it = records.find(offset);
+        if (it == records.end() || !seen.insert(offset).second) return;
+        DcmItem* rec = it->second;
+        Uint32 next = 0, lower = 0;
+        Uint16 inUse = 0xFFFF;
+        rec->findAndGetUint32(DCM_OffsetOfTheNextDirectoryRecord, next);
+        rec->findAndGetUint32(DCM_OffsetOfReferencedLowerLevelDirectoryEntity, lower);
+        rec->findAndGetUint16(DCM_RecordInUseFlag, inUse);
+        offset = next;
+        if (inUse == 0) continue;                   // deleted
+        auto get = [&](const DcmTagKey& key) {
+            OFString v;
+            rec->findAndGetOFStringArray(key, v);
+            return std::string(v.c_str(), v.length());
+        };
+        DirNode n;
+        n.type = get(DCM_DirectoryRecordType);
+        n.file = Widen(get(DCM_ReferencedFileID));
+        n.number = atol(get(n.type == "SERIES" ? DCM_SeriesNumber : DCM_InstanceNumber).c_str());
+        std::wstring text;
+        auto add = [&](const std::wstring& s) { if (!s.empty()) text += (text.empty() ? L"" : L"   ") + s; };
+        if (n.type == "PATIENT")
+        {
+            const std::string id = get(DCM_PatientID);
+            add(id.empty() ? L"Patient" : L"Patient " + Widen(id, charset));
+        }
+        else if (n.type == "STUDY")
+        {
+            add(DateTimeText(get(DCM_StudyDate), get(DCM_StudyTime)));
+            add(Widen(get(DCM_StudyDescription), charset));
+            const std::string uid = get(DCM_StudyInstanceUID);
+            if (!uid.empty()) add(L"[" + Hash6(uid) + L"]");
+            if (text.empty()) text = L"Study";
+        }
+        else if (n.type == "SERIES")
+        {
+            add(Widen(get(DCM_Modality)));
+            const std::string number = get(DCM_SeriesNumber);
+            add(number.empty() ? L"Series" : L"Series " + Widen(number));
+            add(Widen(get(DCM_SeriesDescription), charset));
+        }
+        else
+        {
+            // IMAGE, SR DOCUMENT, PRESENTATION... by their number
+            std::string type = n.type.empty() ? "Record" : n.type;
+            for (size_t i = 1; i < type.size(); i++) if (type[i - 1] != ' ') type[i] = static_cast<char>(tolower(static_cast<unsigned char>(type[i])));
+            const std::string number = get(DCM_InstanceNumber);
+            add(Widen(type) + (number.empty() ? L"" : L" " + Widen(number)));
+        }
+        n.text = text;
+        ReadRecords(records, lower, charset, n.children, depth + 1, seen);
+        // How many there are under it; the images by their number
+        if (!n.children.empty())
+        {
+            const size_t k = n.children.size();
+            const wchar_t* what = n.type == "PATIENT" ? (k == 1 ? L"study" : L"studies") :
+                                  n.type == "STUDY" ? L"series" : (k == 1 ? L"file" : L"files");
+            n.text += L"   (" + std::to_wstring(k) + L" " + what + L")";
+            // The series of a study by their number, the files of a series by theirs
+            if (n.type == "STUDY" || std::all_of(n.children.begin(), n.children.end(), [](const DirNode& c) { return c.children.empty(); }))
+                std::stable_sort(n.children.begin(), n.children.end(), [](const DirNode& a, const DirNode& b) { return a.number < b.number; });
+        }
+        out.push_back(std::move(n));
+    }
+}
+
+static std::vector<DirNode> ReadDirectory(DcmDataset* ds)
+{
+    std::vector<DirNode> roots;
+    DcmSequenceOfItems* seq = nullptr;
+    if (ds->findAndGetSequence(DCM_DirectoryRecordSequence, seq).bad() || !seq) return roots;
+    std::unordered_map<Uint32, DcmItem*> records;
+    for (unsigned long i = 0; i < seq->card(); i++)
+    {
+        DcmItem* item = seq->getItem(i);
+        if (item && item->ident() == EVR_dirRecord) records[static_cast<DcmDirectoryRecord*>(item)->getFileOffset()] = item;
+    }
+    Uint32 first = 0;
+    ds->findAndGetUint32(DCM_OffsetOfTheFirstDirectoryRecordOfTheRootDirectoryEntity, first);
+    OFString charset;
+    ds->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    std::unordered_set<Uint32> seen;
+    ReadRecords(records, first, charset.c_str(), roots, 0, seen);
+    return roots;
+}
+
+// One frame of the file into the pixels, by a DicomImage of its own (a JPEG 2000 one decoded first by
+// OpenJPEG). Its window: the one of the header, or the range of the pixels; `keep`: the one in use, as
+// the frames change. An empty string if it is shown; if not, why (and no pixels).
+// The overlay planes of an image into a map of its size (0 nothing, k the plane k - 1): false if it has
+// none, or if reading them fails - files broken in odd ways make DCMTK read out of bounds here, and
+// then the image is shown without them (no C++ objects in this function: it is guarded as Windows does)
+static bool OverlayPlanes(DicomImage* image, Uint8* planes, int w, int h)
+{
+    bool any = false;
+    __try
+    {
+        for (unsigned int p = 0; p < image->getOverlayCount(0) && p < 16; p++)
+        {
+            unsigned int left = 0, top = 0, pw = 0, ph = 0;
+            EM_Overlay mode = EMO_Default;
+            const Uint8* bits = static_cast<const Uint8*>(image->getOverlayData(p, left, top, pw, ph, mode, 0, 8, 0xff, 0, 0));
+            if (!bits || pw > 65535 || ph > 65535) continue;
+            for (unsigned int y = 0; y < ph; y++)
+                for (unsigned int x = 0; x < pw; x++)
+                {
+                    const unsigned int px = left + x, py = top + y;
+                    if (bits[static_cast<size_t>(y) * pw + x] && px < static_cast<unsigned int>(w) && py < static_cast<unsigned int>(h))
+                    {
+                        planes[static_cast<size_t>(py) * w + px] = static_cast<Uint8>(p + 1);
+                        any = true;
+                    }
+                }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return any;
+}
+
+std::wstring ShowFrame(Rendered& r, int frame, bool keep)
+{
+    Imaging* im = r.imaging.get();
+    if (!im || !im->file) return L"no image";
+    const double center = im->center, width = im->width;
+    const bool mono = im->mono;
+    im->image.reset();
+    im->decoded.reset();
+    r.pixels.clear();
+    r.width = r.height = 0;
+    DcmFileFormat& ff = *im->file;
+    auto& decoded = im->decoded;
+    const std::wstring none = NoImage(ff);
+    if (!none.empty()) return none;
+    if (IsJpeg2000(im->xfer))
+    {
+        decoded.reset(DecodeJpeg2000(ff.getDataset(), r.frames > 1, frame));
+        if (!decoded) return L"its JPEG 2000 data could not be decoded";
+    }
+    else if (IsPmsct(ff))
+    {
+        decoded.reset(DecodePmsct(ff.getDataset()));
+        if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
+    }
+    else if (IsBitFrames(ff.getDataset(), im->xfer))
+    {
+        decoded.reset(DecodeBitFrame(ff.getDataset(), frame));
+        if (!decoded) return L"its 1-bit pixels could not be read";
+    }
+    else if (im->xfer == EXS_DeflatedImageFrameCompression)
+    {
+        decoded.reset(DecodeDeflatedFrame(ff.getDataset(), r.frames > 1, frame));
+        if (!decoded) return L"its deflated image frames could not be decoded";
+    }
+    else if (HasFloatPixels(ff.getDataset()))
+    {
+        decoded.reset(DecodeFloatFrame(ff.getDataset(), frame));
+        if (!decoded) return L"its floating point pixels could not be read";
+    }
+    im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
+                                             decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData,
+                                             decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    // (an ACR-NEMA file, without the attributes DICOM asks for - PhotometricInterpretation...: again, as
+    // DCMTK reads those)
+    if (im->image->getStatus() == EIS_MissingAttribute)
+        im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
+                                                 decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData | CIF_AcrNemaCompatibility,
+                                                 decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    DicomImage& image = *im->image;
+    if (image.getStatus() != EIS_Normal)
+    {
+        // Compressed with something there is no decoder for here (MPEG, HEVC...)
+        DcmXfer x(im->xfer);
+        bool decodable = !x.isEncapsulated() || im->xfer == EXS_RLELossless || im->xfer == EXS_JPEGLSLossless ||
+                         im->xfer == EXS_JPEGLSLossy || x.getJPEGProcess8Bit() != 0 || decoded;
+        std::wstring why = decodable ? Widen(DicomImage::getString(image.getStatus()))
+                                     : Compression(x.getXferID()) + L" is not supported";
+        im->image.reset();
+        decoded.reset();
+        return why;
+    }
+    r.frame = frame;
+    const int w = static_cast<int>(image.getWidth()), h = static_cast<int>(image.getHeight());
+    im->mono = image.isMonochrome() != 0;
+    if (im->mono)
+    {
+        // The window of the header, or the range of the pixels; the range bounds the dragging
+        if (image.getWindowCount() > 0) image.setWindow(0);
+        else image.setMinMaxWindow();
+        image.getMinMaxValues(im->low, im->high);
+        if (!image.getWindow(im->center, im->width) || im->width < 1)
+        {
+            im->center = (im->low + im->high) / 2;
+            im->width = im->high - im->low + 1;
+        }
+        im->center0 = im->center;
+        im->width0 = im->width;
+        if (keep && mono) { im->center = center; im->width = width; }
+    }
+    else
+    {
+        const Uint8* out = static_cast<const Uint8*>(image.getOutputData(8, 0, 0));
+        if (!out || w <= 0 || h <= 0)
+        {
+            im->image.reset();
+            decoded.reset();
+            return L"its pixels could not be rendered";
+        }
+        const size_t n = static_cast<size_t>(w) * h;
+        im->color.resize(n);
+        for (size_t i = 0; i < n; i++)
+            im->color[i] = (static_cast<DWORD>(out[3 * i]) << 16) | (out[3 * i + 1] << 8) | out[3 * i + 2];
+        im->center0 = 127.5;
+        im->width0 = 255;
+        if (!(keep && !mono)) { im->center = im->center0; im->width = im->width0; }
+    }
+    r.width = w;
+    r.height = h;
+    // The overlay planes (monochrome images only: DCMTK reads them with the pixels)
+    im->planes.clear();
+    if (im->mono && image.getOverlayCount(0) > 0)
+    {
+        im->planes.assign(static_cast<size_t>(w) * h, 0);
+        if (!OverlayPlanes(&image, im->planes.data(), w, h)) im->planes.clear();
+    }
+    Rewindow(r);
+    return std::wstring();
+}
+
+Rendered RenderDicom(const std::vector<char>& data, Render what)
+{
+    Rendered r;
+    InitDcmtk();
+    DcmInputBufferStream in;
+    in.setBuffer(data.data(), static_cast<offile_off_t>(data.size()));
+    in.setEos();
+    auto im = std::make_shared<Imaging>();
+    im->file = std::make_unique<DcmFileFormat>();
+    DcmFileFormat& ff = *im->file;
+    ff.transferInit();
+    OFCondition st = ff.read(in, EXS_Unknown, EGL_noChange, DCM_MaxReadLength);
+    ff.transferEnd();
+    if (st.bad())
+    {
+        // Deflated files: this DCMTK has no zlib (as the one of I3Dfileformat)
+        const char deflate[] = "1.2.840.10008.1.2.1.99";
+        bool deflated = std::search(data.begin(), data.begin() + (data.size() < 4096 ? data.size() : 4096),
+                                    deflate, deflate + sizeof(deflate) - 1) != data.begin() + (data.size() < 4096 ? data.size() : 4096);
+        r.summary = deflated ? L"Deflated DICOM: not shown by this preview" : L"Not readable as DICOM: " + Widen(st.text());
+        return r;
+    }
+    DcmDataset* ds = ff.getDataset();
+
+    OFString sopClass, tsUid;
+    ds->findAndGetOFString(DCM_SOPClassUID, sopClass);
+    im->xfer = ds->getOriginalXfer();
+    tsUid = DcmXfer(im->xfer).getXferID();
+    ff.getMetaInfo()->findAndGetOFString(DCM_TransferSyntaxUID, tsUid);      // (the one of the file: a private one too)
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+    r.frames = frames;
+    // The cine: FrameTime (ms), or the frame rate of the device
+    Float64 rate = 0;
+    if (ds->findAndGetFloat64(DCM_FrameTime, r.frameTime).bad() || !(r.frameTime > 0)) r.frameTime = 0;
+    if (r.frameTime == 0 && ds->findAndGetFloat64(DCM_RecommendedDisplayFrameRate, rate).good() && rate > 0) r.frameTime = 1000 / rate;
+    if (r.frameTime == 0 && ds->findAndGetFloat64(DCM_CineRate, rate).good() && rate > 0) r.frameTime = 1000 / rate;
+
+    OFString studyUid, seriesNumber;
+    ds->findAndGetOFString(DCM_StudyInstanceUID, studyUid);
+    ds->findAndGetOFString(DCM_SeriesNumber, seriesNumber);
+    r.studyUid = studyUid.c_str();
+    r.seriesNumber = seriesNumber.c_str();
+
+    if (what == Render::Everything) DumpHeader(ff, r.tags, r.names);
+
+    r.summary = sopClass.empty() ? L"DICOM" : ObjectType(sopClass.c_str());
+    if (what != Render::Thumbnail && ds->tagExists(DCM_DirectoryRecordSequence))
+    {
+        r.directory = ReadDirectory(ds);
+        size_t files = 0;
+        std::function<void(const std::vector<DirNode>&)> count = [&](const std::vector<DirNode>& nodes) {
+            for (auto& n : nodes) { if (!n.file.empty()) files++; count(n.children); }
+        };
+        count(r.directory);
+        r.summary = L"DICOMDIR  -  " + std::to_wstring(r.directory.size()) + (r.directory.size() == 1 ? L" patient" : L" patients") +
+                    L", " + std::to_wstring(files) + L" files";
+    }
+    r.imaging = im;
+    if (ds->tagExists(DCM_PixelData) || IsPmsct(ff) || HasFloatPixels(ds))
+    {
+        // Only the frame shown is decoded: a multi-frame file can be large
+        const std::wstring why = ShowFrame(r, 0, false);
+        if (why.empty())
+        {
+            r.summary += L"  -  " + std::to_wstring(r.width) + L" x " + std::to_wstring(r.height);
+            if (frames > 1) r.summary += L"  -  " + std::to_wstring(frames) + L" frames";
+        }
+        else r.summary += L"  -  image not shown: " + why;
+    }
+    else r.summary += L"  -  no image";
+    r.summary += L"  -  compression: " + Compression(tsUid.c_str());
+    if (what == Render::Thumbnail) r.imaging.reset();       // only its pixels
+    else Annotate(r, ds);
+    return r;
+}
+
+// The whole file in memory, up to 1 GB: the other files of the series
+bool ReadPath(const std::wstring& path, std::vector<char>& data)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {};
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart <= (1LL << 30);
+    if (ok)
+    {
+        data.resize(static_cast<size_t>(size.QuadPart));
+        size_t got = 0;
+        while (ok && got < data.size())
+        {
+            DWORD n = 0;
+            const DWORD want = static_cast<DWORD>((std::min)(data.size() - got, static_cast<size_t>(1) << 24));
+            ok = ReadFile(h, data.data() + got, want, &n, nullptr) && n > 0;
+            got += n;
+        }
+        data.resize(got);
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// The whole file in memory, up to 1 GB
+HRESULT ReadAll(IStream* stream, std::vector<char>& data)
+{
+    STATSTG stat = {};
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) stat.cbSize.QuadPart = 0;
+    if (stat.cbSize.QuadPart > (1ULL << 30)) return E_OUTOFMEMORY;
+    LARGE_INTEGER zero = {};
+    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    data.resize(static_cast<size_t>(stat.cbSize.QuadPart));
+    size_t got = 0;
+    while (true)
+    {
+        if (got == data.size()) data.resize(got + 1024 * 1024);
+        ULONG n = 0;
+        HRESULT hr = stream->Read(data.data() + got, static_cast<ULONG>(data.size() - got), &n);
+        if (FAILED(hr)) return hr;
+        got += n;
+        if (n == 0 || hr == S_FALSE) break;
+    }
+    data.resize(got);
+    return S_OK;
+}
