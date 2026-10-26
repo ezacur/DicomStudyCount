@@ -43,7 +43,6 @@ private:
     // The navigator, and the planes of the images: each one once (the images of a position over each other)
     Navigator navigator;
     std::vector<NavPlane> navPlanes;
-    std::vector<int> filePlane;                     // the plane of each file (-1: none, without a position)
     bool planesMade = false;
     int navigated = -1;                             // the planes the navigator shows: of this node (all, 0)
     int navPatient = -1;                            // and the patient of the node chosen (another one: framed again)
@@ -69,21 +68,17 @@ private:
     };
     static_assert(1 + 3 * (1 << Marks) <= 15, "the state images of a tree are 15 at most");
     std::vector<size_t> markCount[Marks];           // each node: how many of its images have each mark
-    std::vector<char> fileDerived;                  // each file: a derived image (ImageType DERIVED), not an original one
-    std::vector<Uint32> fileFrame;                  // and its frame of reference (an id of the pool, +1; 0: none)
     std::vector<size_t> derivedCount;               // each node: how many of its files are derived
     HFONT italicFont = nullptr, boldItalicFont = nullptr;
     int marked = -1;                                // the node under the mouse in the tree, its planes framed there
     bool markTracking = false;                      // (of the mouse leaving the tree)
     std::vector<int> lit;                           // the nodes of the plane under the mouse there, marked in the tree
-    std::vector<char> fileOn;                       // each file: drawn in the navigator (the check boxes of the tree)
-    std::vector<size_t> onCount;                    // each node: how many of its files are
+    std::vector<size_t> onCount;                    // each node: how many of its files are drawn in the navigator (FileState::on)
     // The unused tree, under the tree: the parts of it put aside (not drawn in the navigator). Both show the
     // same nodes: the tree those with files in use, the unused one those with files put aside.
     HWND unusedLabel = nullptr, unusedTree = nullptr;
     HWND hoverTree = nullptr;                       // the tree the mouse is over
-    std::vector<char> fileUnused;                   // each file: put aside
-    std::vector<size_t> usedCount;                  // each node: how many of its files are not
+    std::vector<size_t> usedCount;                  // each node: how many of its files are not put aside (FileState::unused)
     std::vector<HTREEITEM> unusedItem;              // each node: its item in the unused tree
     std::vector<char> unusedFilled;                 // its shown children are there
     std::vector<signed char> openMemory;            // each node: open (1) or not (0) when last in the tree (-1: never), for Compact
@@ -104,8 +99,18 @@ private:
     std::unique_ptr<Gathering> data;
     bool ready = false, compact = true, hideIdentity = true;
     std::vector<GatherNode> nodes;
-    std::vector<int> fileNode;                      // the image node of each file
-    std::vector<int> rank;                          // the place of each file in the order of the images
+    // Each file (of data->files): what the explorer knows of it, made with the tree (Build)
+    struct FileState
+    {
+        int node = -1;                              // its image node
+        int rank = 0;                               // its place in the order of the images
+        bool derived = false;                       // a derived image (ImageType DERIVED), not an original one
+        Uint32 frame = 0;                           // its frame of reference (an id of the pool, +1; 0: none)
+        bool on = true;                             // drawn in the navigator (the check boxes of the tree)
+        bool unused = false;                        // put aside (the unused tree)
+        int plane = -1;                             // its plane in the navigator (-1: none, without a position; or not made yet)
+    };
+    std::vector<FileState> fileState;
     int selected = -1;                              // the node chosen
     int sliderNode = -1;                            // the node whose files the slider goes through
     bool following = false;                         // the tree selection moves with the slider

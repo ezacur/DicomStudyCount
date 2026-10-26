@@ -19,18 +19,16 @@ void DicomExplorer::Build()
 {
     nodes.clear();
     const std::vector<Gathered>& files = data->files;
-    fileNode.assign(files.size(), -1);
+    fileState.assign(files.size(), FileState());
     // Derived or original (the first value of ImageType), and the frame of reference: volumes apart
-    fileDerived.assign(files.size(), 0);
-    fileFrame.assign(files.size(), 0);
     for (size_t f = 0; f < files.size(); f++)
     {
         if (const auto* a = Find(files[f].attributes, 0x00080008))
         {
             const std::wstring& t = data->pool.Text(a->second);
-            fileDerived[f] = t.size() >= 7 && _wcsnicmp(t.c_str(), L"DERIVED", 7) == 0;
+            fileState[f].derived = t.size() >= 7 && _wcsnicmp(t.c_str(), L"DERIVED", 7) == 0;
         }
-        if (const auto* a = Find(files[f].attributes, 0x00200052)) fileFrame[f] = a->second + 1;
+        if (const auto* a = Find(files[f].attributes, 0x00200052)) fileState[f].frame = a->second + 1;
     }
     // The images in their order first (instance number, trigger time, time, name): the groups below
     // a series come in the order of their first image
@@ -46,8 +44,7 @@ void DicomExplorer::Build()
         const int byName = StrCmpLogicalW(x.path.c_str(), y.path.c_str());
         return byName ? byName < 0 : x.frame < y.frame;     // (the frames of a file in their order)
     });
-    rank.assign(files.size(), 0);
-    for (size_t i = 0; i < all.size(); i++) rank[all[i]] = static_cast<int>(i);
+    for (size_t i = 0; i < all.size(); i++) fileState[all[i]].rank = static_cast<int>(i);
     const int top = Add(Level::All, -1, all);
     // The patients by their PatientID; the people that share one (9999, none), apart by who they are
     struct Patient { std::vector<int> files; std::wstring person; int sharing = 1; };
@@ -89,7 +86,7 @@ void DicomExplorer::Build()
         if (!nobody.empty()) { people.push_back(Person()); theirs.push_back(nobody); }
         for (size_t k = 0; k < theirs.size(); k++)
         {
-            std::sort(theirs[k].begin(), theirs[k].end(), [&](int a, int b) { return rank[a] < rank[b]; });
+            std::sort(theirs[k].begin(), theirs[k].end(), [&](int a, int b) { return fileState[a].rank < fileState[b].rank; });
             std::string key = people[k].birth + "|";
             for (wchar_t c : people[k].name) key += static_cast<char>(c < 128 ? c : '?');
             patients.push_back({ theirs[k], people[k].Empty() ? L"no name or birth date" : Hash6(key), static_cast<int>(theirs.size()) });
@@ -243,12 +240,12 @@ std::wstring DicomExplorer::Plain(int i) const
     case Level::Orientation:
     {
         add(Size(i));
-        if (!fileDerived.empty() && fileDerived[n.files[0]]) add(L"derived");
+        if (!fileState.empty() && fileState[n.files[0]].derived) add(L"derived");
         // (a series in more than one frame of reference: which one)
         bool others = false;
         for (int o : nodes[n.parent].children)
-            if (fileFrame[nodes[o].files[0]] != fileFrame[n.files[0]]) others = true;
-        if (others && fileFrame[n.files[0]]) add(L"[FoR " + Hash6(Narrow(data->pool.Text(fileFrame[n.files[0]] - 1))) + L"]");
+            if (fileState[nodes[o].files[0]].frame != fileState[n.files[0]].frame) others = true;
+        if (others && fileState[n.files[0]].frame) add(L"[FoR " + Hash6(Narrow(data->pool.Text(fileState[n.files[0]].frame - 1))) + L"]");
         add(L"(" + files(count) + L")");
         return s;
     }
@@ -402,11 +399,11 @@ void DicomExplorer::MoveUnused(int n, bool aside)
 {
     if (!ready || n <= 0 || n >= static_cast<int>(nodes.size())) return;
     HidePopup();
-    for (int f : nodes[n].files) fileUnused[f] = aside;
+    for (int f : nodes[n].files) fileState[f].unused = aside;
     for (size_t i = 0; i < nodes.size(); i++)
     {
         size_t k = 0;
-        for (int f : nodes[i].files) if (!fileUnused[f]) k++;
+        for (int f : nodes[i].files) if (!fileState[f].unused) k++;
         usedCount[i] = k;
     }
     Refill(false);
@@ -422,7 +419,7 @@ void DicomExplorer::UnusedLabel()
 {
     if (!unusedLabel) return;
     size_t k = 0;
-    for (char u : fileUnused) k += u;
+    for (const FileState& s : fileState) k += s.unused;
     SetWindowTextW(unusedLabel, k ? (L"Unused   (" + std::to_wstring(k) + (k == 1 ? L" image)" : L" images)")).c_str()
                                   : L"Unused   (middle click a node, or right-click it: Move to unused)");
 }
@@ -568,10 +565,10 @@ void DicomExplorer::Choose(int n)
     {
         paths.push_back(data->files[f].path);
         frames.push_back(data->files[f].frame);
-        int position = fileNode[f], s = -1;
+        int position = fileState[f].node, s = -1;
         while (position > 0 && nodes[position].level != Level::Position) position = nodes[position].parent;
-        if (position <= 0) position = fileNode[f];
-        for (int a = fileNode[f]; a > 0; a = nodes[a].parent) if (nodes[a].level == Level::Series) { s = a; break; }
+        if (position <= 0) position = fileState[f].node;
+        for (int a = fileState[f].node; a > 0; a = nodes[a].parent) if (nodes[a].level == Level::Series) { s = a; break; }
         time.push_back(position);
         space.push_back(bySeries && s > 0 ? s : position);
     }
@@ -584,9 +581,9 @@ void DicomExplorer::Choose(int n)
     if (nodes[n].level != Level::Image)
     {
         MakePlanes();
-        const int p0 = filePlane[nodes[under].files[0]];
+        const int p0 = fileState[nodes[under].files[0]].plane;
         bool one = p0 >= 0;
-        for (int f : nodes[under].files) if (filePlane[f] != p0) { one = false; break; }
+        for (int f : nodes[under].files) if (fileState[f].plane != p0) { one = false; break; }
         if (one)
         {
             preview->ShowFiles(paths, 0, frames, space, time, delay, places);

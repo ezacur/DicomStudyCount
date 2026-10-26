@@ -50,7 +50,7 @@ void DicomExplorer::Check()
         {
             std::wstring others;
             for (int g : same) if (g != f && others.size() < 200) others += (others.empty() ? L"" : L", ") + files[g].path;
-            Problem(fileNode[f], L"duplicate", L"The same SOP instance UID as " + others);
+            Problem(fileState[f].node, L"duplicate", L"The same SOP instance UID as " + others);
         }
     }
 
@@ -324,7 +324,7 @@ void DicomExplorer::AddSeries(int study, const std::vector<int>& rg)
         auto same = [&](const std::vector<int>& o) {
             const Gathered& h = files[o[0]];
             if (g.oriented != h.oriented || g.rows != h.rows || g.columns != h.columns) return false;
-            if (fileDerived[f] != fileDerived[o[0]] || fileFrame[f] != fileFrame[o[0]]) return false;
+            if (fileState[f].derived != fileState[o[0]].derived || fileState[f].frame != fileState[o[0]].frame) return false;
             for (int k = 0; k < 6 && g.oriented; k++) if (std::fabs(g.orientation[k] - h.orientation[k]) > 1e-4) return false;
             return true;
         };
@@ -366,9 +366,9 @@ void DicomExplorer::AddSeries(int study, const std::vector<int>& rg)
         for (auto& pg : positions)
         {
             // The images of a position in their order (instance number, trigger time...)
-            std::sort(pg.begin(), pg.end(), [&](int a, int b) { return rank[a] < rank[b]; });
+            std::sort(pg.begin(), pg.end(), [&](int a, int b) { return fileState[a].rank < fileState[b].rank; });
             const int z = Add(Level::Position, o, pg);
-            for (int f : pg) fileNode[f] = Add(Level::Image, z, { f });
+            for (int f : pg) fileState[f].node = Add(Level::Image, z, { f });
         }
     }
 }

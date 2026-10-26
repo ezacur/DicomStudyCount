@@ -10,7 +10,7 @@ void DicomExplorer::MakePlanes()
     if (planesMade || !data) return;
     planesMade = true;
     const std::vector<Gathered>& files = data->files;
-    filePlane.assign(files.size(), -1);
+    for (FileState& s : fileState) s.plane = -1;
     std::vector<std::pair<std::array<int, 12>, int>> keyed;    // (corners in 1/100 mm: the same plane, the same key)
     std::vector<NavPlane> each;
     for (int f = 0; f < static_cast<int>(files.size()); f++)
@@ -33,7 +33,7 @@ void DicomExplorer::MakePlanes()
             }
         keyed.push_back({ key, static_cast<int>(each.size()) });
         each.push_back(q);
-        filePlane[f] = static_cast<int>(each.size()) - 1;
+        fileState[f].plane = static_cast<int>(each.size()) - 1;
     }
     std::sort(keyed.begin(), keyed.end());
     std::vector<int> to(each.size());
@@ -43,7 +43,7 @@ void DicomExplorer::MakePlanes()
         if (i == 0 || keyed[i].first != keyed[i - 1].first) navPlanes.push_back(each[keyed[i].second]);
         to[keyed[i].second] = static_cast<int>(navPlanes.size()) - 1;
     }
-    for (int& p : filePlane) if (p >= 0) p = to[p];
+    for (FileState& s : fileState) if (s.plane >= 0) s.plane = to[s.plane];
 }
 
 // The navigator on a node: the planes of everything whose check box is on, of all the patients (each
@@ -59,9 +59,9 @@ void DicomExplorer::Navigate(int n)
     std::vector<int> mine, around;
     std::vector<char> seen(navPlanes.size(), 0);
     for (int f : nodes[n].files)
-        if (fileOn[f] && !fileUnused[f] && filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 1; mine.push_back(filePlane[f]); }
+        if (fileState[f].on && !fileState[f].unused && fileState[f].plane >= 0 && !seen[fileState[f].plane]) { seen[fileState[f].plane] = 1; mine.push_back(fileState[f].plane); }
     for (int f : nodes[context].files)
-        if (fileOn[f] && !fileUnused[f] && filePlane[f] >= 0 && !seen[filePlane[f]]) { seen[filePlane[f]] = 2; around.push_back(filePlane[f]); }
+        if (fileState[f].on && !fileState[f].unused && fileState[f].plane >= 0 && !seen[fileState[f].plane]) { seen[fileState[f].plane] = 2; around.push_back(fileState[f].plane); }
     // Too many to draw (a patient, everything): some of them, evenly
     const size_t most = 40000;
     auto thin = [](std::vector<int>& v, size_t keep) {
@@ -105,7 +105,7 @@ void DicomExplorer::Navigate(int n)
     {
         // (none drawn: none has a position, or their check boxes in the tree are off)
         for (int f : nodes[context].files)
-            if (filePlane[f] >= 0) { more = L"Its images are turned off (the check boxes of the tree)"; break; }
+            if (fileState[f].plane >= 0) { more = L"Its images are turned off (the check boxes of the tree)"; break; }
     }
     else
     {
@@ -219,7 +219,7 @@ void DicomExplorer::Toggle(int n)
 {
     if (!ready || n <= 0 || n >= static_cast<int>(nodes.size())) return;
     const bool on = onCount[n] < nodes[n].files.size();
-    for (int f : nodes[n].files) fileOn[f] = on;
+    for (int f : nodes[n].files) fileState[f].on = on;
     const long long delta = static_cast<long long>(on ? nodes[n].files.size() : 0) - static_cast<long long>(onCount[n]);
     std::vector<int> down = { n };
     while (!down.empty())
@@ -277,11 +277,11 @@ void DicomExplorer::Guides(int n)
         MakePlanes();
         const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
                                    a.row[0] * a.column[1] - a.row[1] * a.column[0] };
-        const int mine = currentFile < static_cast<int>(filePlane.size()) ? filePlane[currentFile] : -1;
+        const int mine = currentFile < static_cast<int>(fileState.size()) ? fileState[currentFile].plane : -1;
         std::vector<char> seen(navPlanes.size(), 0);
         for (int f : nodes[n].files)
         {
-            const int p = f < static_cast<int>(filePlane.size()) ? filePlane[f] : -1;
+            const int p = f < static_cast<int>(fileState.size()) ? fileState[f].plane : -1;
             if (p < 0 || p == mine || seen[p] || lines.size() >= 400) continue;
             seen[p] = 1;
             // Where its edges cross the plane of the image (from its corners: 0 1 / 2 3)
@@ -591,7 +591,7 @@ void DicomExplorer::Mark(HWND t, POINT pt)
     {
         std::vector<char> in(navPlanes.size(), 0);
         for (int f : nodes[n].files)
-            if (fileOn[f] && !fileUnused[f] && filePlane[f] >= 0) in[filePlane[f]] = 1;
+            if (fileState[f].on && !fileState[f].unused && fileState[f].plane >= 0) in[fileState[f].plane] = 1;
         for (size_t i = 0; i < navScene.size(); i++) if (in[navScene[i]]) which.push_back(static_cast<int>(i));
     }
     navigator.SetMarks(std::move(which));
@@ -606,12 +606,12 @@ void DicomExplorer::Pick(int i)
     long bestNumber = 0;
     for (int f : nodes[navigated].files)
     {
-        if (filePlane[f] != p || !fileOn[f] || fileUnused[f]) continue;
+        if (fileState[f].plane != p || !fileState[f].on || fileState[f].unused) continue;
         const long number = atol(data->files[f].instance.c_str());
-        if (best < 0 || number < bestNumber || (number == bestNumber && rank[f] < rank[best])) { best = f; bestNumber = number; }
+        if (best < 0 || number < bestNumber || (number == bestNumber && fileState[f].rank < fileState[best].rank)) { best = f; bestNumber = number; }
     }
     if (best < 0) return;
-    if (HTREEITEM item = ItemOf(fileNode[best]))
+    if (HTREEITEM item = ItemOf(fileState[best].node))
     {
         TreeView_SelectItem(tree, item);
         TreeView_EnsureVisible(tree, item);
@@ -631,9 +631,9 @@ void DicomExplorer::Light(int i)
         size_t images = 0;
         for (int f : nodes[navigated].files)
         {
-            if (filePlane[f] != p || !fileOn[f] || fileUnused[f]) continue;
+            if (fileState[f].plane != p || !fileState[f].on || fileState[f].unused) continue;
             images++;
-            int x = fileNode[f];
+            int x = fileState[f].node;
             while (x > 0 && !nodes[x].item) x = nodes[x].shownParent >= 0 ? nodes[x].shownParent : nodes[x].parent;
             if (x > 0 && std::find(lit.begin(), lit.end(), x) == lit.end()) lit.push_back(x);
         }
@@ -657,7 +657,7 @@ void DicomExplorer::Live(int i)
         i >= static_cast<int>(nodes[sliderNode].files.size()) || navSceneOf.empty())
         return;
     const int f = nodes[sliderNode].files[i];
-    const int p = f < static_cast<int>(filePlane.size()) ? filePlane[f] : -1;
+    const int p = f < static_cast<int>(fileState.size()) ? fileState[f].plane : -1;
     const int at = p >= 0 && p < static_cast<int>(navSceneOf.size()) ? navSceneOf[p] : -1;
     int w = 0, h = 0;
     const std::vector<DWORD>* px = at >= 0 ? preview->Pixels(w, h) : nullptr;
@@ -669,7 +669,7 @@ void DicomExplorer::Followed(int i)
 {
     if (sliderNode < 0 || selected < 0 || i < 0 || i >= static_cast<int>(nodes[sliderNode].files.size())) return;
     if (nodes[selected].level != Level::Image || nodes[selected].shownParent != sliderNode) return;
-    const int image = fileNode[nodes[sliderNode].files[i]];
+    const int image = fileState[nodes[sliderNode].files[i]].node;
     if (image == selected || image < 0 || !nodes[image].item) return;
     following = true;
     TreeView_SelectItem(tree, nodes[image].item);

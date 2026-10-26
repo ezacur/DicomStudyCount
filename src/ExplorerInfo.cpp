@@ -496,7 +496,7 @@ void DicomExplorer::FillPlot(int n)
 void DicomExplorer::PlotPicked(int i)
 {
     if (i < 0 || i >= static_cast<int>(plotFiles.size())) return;
-    const int image = fileNode[plotFiles[i]];
+    const int image = fileState[plotFiles[i]].node;
     if (HTREEITEM item = image > 0 ? ItemOf(image) : nullptr)
     {
         TreeView_SelectItem(tree, item);

@@ -421,14 +421,13 @@ void DicomExplorer::Clear()
     TreeView_DeleteAllItems(tree);
     TreeView_DeleteAllItems(unusedTree);
     following = false;
-    fileUnused.clear();
+    fileState.clear();
     usedCount.clear();
     unusedItem.clear();
     unusedFilled.clear();
     openMemory.clear();
     UnusedLabel();
     navPlanes.clear();
-    filePlane.clear();
     planesMade = false;
     navigated = -1;
     navPatient = -1;
@@ -437,10 +436,8 @@ void DicomExplorer::Clear()
     lit.clear();
     overlays.clear();
     for (std::vector<size_t>& c : markCount) c.clear();
-    fileOn.clear();
     onCount.clear();
     nodes.clear();
-    fileNode.clear();
     ListView_DeleteAllItems(info);
     ListView_DeleteAllItems(full);
     ListView_RemoveAllGroups(full);
@@ -462,7 +459,6 @@ void DicomExplorer::Finished()
     if (!data) return;
     if (data->thread.joinable()) data->thread.join();
     Build();
-    fileOn.assign(data->files.size(), 1);
     overlays.clear();
     for (size_t f = 0; f < data->files.size(); f++)
     {
@@ -481,10 +477,9 @@ void DicomExplorer::Finished()
     MarkSegmented();
     MarkOverlays();
     derivedCount.assign(nodes.size(), 0);
-    for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) derivedCount[i] += fileDerived[f];
+    for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) derivedCount[i] += fileState[f].derived;
     onCount.resize(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) onCount[i] = nodes[i].files.size();
-    fileUnused.assign(data->files.size(), 0);
     usedCount = onCount;
     unusedItem.assign(nodes.size(), nullptr);
     unusedFilled.assign(nodes.size(), 0);
