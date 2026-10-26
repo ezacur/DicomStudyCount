@@ -115,6 +115,16 @@ LRESULT CALLBACK PreviewHandler::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     case WM_SERIES:
         if (self && self->scan) self->Series();
         return 0;
+    case WM_SEGMENTS:
+        if (self && self->scan)
+        {
+            self->nearby = std::move(self->scan->segmentations);
+            self->scan.reset();
+            self->PaneSegments();
+            if (self->list) self->FillValues(self->current);
+            self->Layout();
+        }
+        return 0;
     case WM_TIMER:
         if (self && wp == TimerSettle)
         {
@@ -148,7 +158,7 @@ LRESULT CALLBACK PreviewHandler::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
             for (const RECT& r : self->tabRects) if (PtInRect(&r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
-            for (const RECT* r : { &self->playRect, &self->jumpRect, &self->trackRect, &self->spaceTrackRect, &self->overlayRect })
+            for (const RECT* r : { &self->playRect, &self->jumpRect, &self->trackRect, &self->spaceTrackRect, &self->overlayRect, &self->segmentsRect })
                 if (PtInRect(r, pt)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
             if (PtInRect(&self->splitArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZENS)); return TRUE; }
             if (self->view.imaging && PtInRect(&self->imageArea, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZEALL)); return TRUE; }
@@ -168,6 +178,7 @@ LRESULT CALLBACK PreviewHandler::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             {
                 self->SetOverlay(!self->overlay);
             }
+            else if (PtInRect(&self->segmentsRect, pt)) self->SetSegmentsShown(!self->segments);
             else if (PtInRect(&self->trackRect, pt))
             {
                 self->drag = Drag::Track;

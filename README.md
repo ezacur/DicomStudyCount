@@ -119,12 +119,18 @@ tree** opens the whole folder tree with one color per study.
   The *Overlay* check box of that bar (remembered) writes on the image what viewers show in its
   corners, never who the patient is: modality, series, description and image number; date and time,
   device and protocol; Z level, slice thickness, pixel spacing and size; the window and zoom; and the
-  patient directions at the sides (R/L, A/P, H/F, from ImageOrientationPatient). With it too, the
-  **overlay planes** of the image (groups 60xx: annotations, ROIs, CAD marks, labels the device or a
-  workstation drew), whether they come in their own OverlayData or hidden in the high bits of the
-  pixels, the first one in magenta and the others in colors of their own; the info of an image in the
-  DICOM explorer says which planes it has. A file broken in a way that makes reading its planes fail is
-  shown without them. ACR-NEMA files (the format before DICOM) without the attributes DICOM asks for
+  patient directions at the sides (R/L, A/P, H/F, from ImageOrientationPatient).
+
+  Its **segmentations** are drawn over it, with a *Segmentations* check box under *Overlay* (remembered,
+  only when the image has any): the DICOM SEG and RT Structure Sets of its study found in its folder, in
+  the folders in it and in the folders beside it (a study exported with a folder for each series) - the
+  masks of the SEG frames in its plane, faint inside and strong at the edge, in the color of each
+  segment, and the contours of the structure sets in its plane, in the color of each ROI - read in the
+  background, once while those folders do not change. The **overlay planes** of the image count as
+  segmentations too (groups 60xx: annotations, ROIs, CAD marks, labels the device or a workstation
+  drew), whether they come in their own OverlayData or hidden in the high bits of the pixels: the first
+  one in magenta and the others in colors of their own. A file broken in a way that makes reading its
+  planes fail is shown without them. ACR-NEMA files (the format before DICOM) without the attributes DICOM asks for
   are read as DCMTK reads them.
 
   A **DICOMDIR** opens on a *Directory* tab: its patients (by ID, never by name), studies, series (by
@@ -199,12 +205,11 @@ tree** opens the whole folder tree with one color per study.
     of the study of the image shown are drawn over it - the masks of the SEG frames in its plane, faint
     inside and strong at the edge, in the color of each segment; the contours of the structure sets in
     its plane, in the color of each ROI - and the contours, all of them, in the navigator. Read when an
-    image of their study is shown; the frames of a SEG are matched to the image by their planes. In the tree, the images
-    with a segmentation in their plane say `seg`, the nodes above them how many (`(97 segmented)`), and
-    their check boxes are green. A SEG or a structure set is seen only with the images in the folder
-    opened: open the folder of the whole study. The same with the **overlay planes**: the images that
-    have them say `overlay`, the nodes above them how many (`(62 with overlays)`), and their check
-    boxes are magenta (half green, half magenta when they have both). *Find* `overlay` goes to them.
+    image of their study is shown; the frames of a SEG are matched to the image by their planes. The
+    **overlay planes** of an image (60xx) are segmentations too: drawn with it, and named in its info. In
+    the tree, the images with a segmentation in their plane or overlay planes of their own say `seg`, the
+    nodes above them how many (`(97 segmented)`), and their check boxes are green. A SEG or a structure
+    set is seen only with the images in the folder opened: open the folder of the whole study.
   - **Series kind** (experimental): each series says what kind it looks to be, in the tree (`«cine short
     axis»`), in the info of the node, and as a column of the files in Explorer (below).
   - **Derived images** (ImageType DERIVED: reformats, maps, MIPs...) are in italic (and not in bold) in the tree, and a
@@ -330,6 +335,7 @@ tree** opens the whole folder tree with one color per study.
   | DICOM frame of reference | 6-character hash of the FrameOfReferenceUID |
   | DICOM trigger time | ms after the R wave (cine phase) |
   | DICOM series kind (experimental) | what kind of series the file is of, guessed from its description, protocol, sequence name, image type, inversion time, number of cardiac phases and plane: `localizer`, `cine short axis` / `cine 4-chamber` / `cine 2-chamber` / `cine 3-chamber`, `late enhancement`, `T1 mapping`, `T2 mapping`, `T2* mapping`, `perfusion`, `flow`, `angiography`, `diffusion`, `dynamic contrast`, `T2-weighted`, `segmentation`, `RT structures`, `screen capture`, `report`, for CT `CT angiography` and `calcium score`; empty when nothing says |
+  | DICOM segmentation | `seg` when the image has a segmentation: overlay planes of its own (60xx), or something of a DICOM SEG or RT Structure Set of its study in its plane, from its folder, the folders in it or those beside it (read once while they do not change; only when the column is shown) |
   | DICOM plane (experimental) | as `slicePlaneName` of DICOMstack: `AX`/`COR`/`SAG` only within 1e-3 rad of a cardinal plane, otherwise the nearest cardiac view `hla`/`vla`/`lvot`/`sa` (`tools\New-PlaneClouds.ps1` takes its reference orientations from DICOMstack.m) |
   | DICOM duplicated in | the other copies of the file found by the last count, in the counted folder or in other counted locations (`(differs)` when their bytes differ) |
 
@@ -380,7 +386,7 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 | `bin\Explorer4Dicoms.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
 | `bin\DicomStudyCount.propdesc` | the definition of those columns |
-| `src\` | the sources of the DLLs: `Explorer4Dicoms\` (those of `Explorer4Dicoms.dll`, a file for each part: the count, the DICOM reader, the folder comments and icons, the Explorer columns and views, the index), and those of `DicomShell.dll`, a file for each part - `Shell.h` (what they share), `DicomShell.cpp` (its COM factories and entry points), `HeaderReader`, `Icons`, `Properties`, `Decode`, `Preview` (its window and interfaces; `Preview*.cpp`, its parts: the tabs, the painting, the stepping, the mouse), `Thumbnails`, `Gather`, `Pixels`, `Export`, `Navigator`, `Plot`, and the DICOM explorer (`Explorer.h`, its class; `Explorer*.cpp`, its parts: the window, the tree, the checks, the navigator, the info, the floating thumbnail, the exports, the report) |
+| `src\` | the sources of the DLLs: `Explorer4Dicoms\` (those of `Explorer4Dicoms.dll`, a file for each part: the count, the DICOM reader, the folder comments and icons, the Explorer columns and views, the index), and those of `DicomShell.dll`, a file for each part - `Shell.h` (what they share), `DicomShell.cpp` (its COM factories and entry points), `HeaderReader`, `Icons`, `Properties`, `Decode`, `Segments` (the SEG and RT Structure Sets: read, found near a file, matched to the plane of an image), `Preview` (its window and interfaces; `Preview*.cpp`, its parts: the tabs, the painting, the stepping, the mouse), `Thumbnails`, `Gather`, `Pixels`, `Export`, `Navigator`, `Plot`, and the DICOM explorer (`Explorer.h`, its class; `Explorer*.cpp`, its parts: the window, the tree, the checks, the navigator, the info, the floating thumbnail, the exports, the report) |
 | `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
 | `third_party\` | DCMTK 3.7.0, OpenJPEG 2.5.3 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
 

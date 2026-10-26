@@ -13,6 +13,10 @@ struct SeriesScan
     UINT message = 0;
     volatile LONG cancel = 0;
     std::vector<std::wstring> files;                // written before the message, read after it
+    // And then the segmentations of its study near it (SEG, RT Structure Sets), posting `segmentsMessage`
+    std::string study;
+    UINT segmentsMessage = 0;
+    std::vector<std::shared_ptr<Segmentation>> segmentations;
 };
 
 class PreviewHandler : public IInitializeWithItem, public IPreviewHandler, public IPreviewHandlerVisuals,
@@ -90,9 +94,12 @@ public:
     std::function<void(bool, double, double)> pointed;     // the mouse over the image (column, row), or off it
     // Hosted: segmentations over the image: a mask of its size (0xAARRGGBB, its colors by alpha already, top
     // down; none: empty) and contours (in the coordinates of its pixels)
-    struct Outline { COLORREF color = 0; bool closed = true; std::vector<std::array<double, 2>> points; };
+    using Outline = SegOutline;
     void SetSegmentation(int width, int height, const std::vector<DWORD>& argb, std::vector<Outline> lines);
     void SetOverlay(bool on);
+    // The segmentations over the image (and its overlay planes) shown or not: hosted, as the explorer says;
+    // in Explorer, by the check box of its image bar (remembered)
+    void SetSegmentsShown(bool on);
     std::function<void(bool)> running;              // the cine or the jumps started (true) or stopped
     const std::vector<DWORD>* Pixels(int& width, int& height) const;
     std::function<void(int)> moved;
@@ -105,13 +112,15 @@ public:
 private:
     enum { TabColumns, TabHeader, TabTags, TabDirectory, TabCount };
     enum class Drag { None, Split, Window, Pan, Zoom, Track, TrackSpace };
-    static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2;
+    static constexpr UINT WM_READCOLUMNS = WM_APP + 1, WM_SERIES = WM_APP + 2, WM_SEGMENTS = WM_APP + 3;
     static constexpr UINT_PTR TimerCine = 1, TimerSettle = 2, TimerPoster = 3, TimerJump = 4;
     std::vector<PosterFrame> poster;                // hosted: the thumbnail shown before the files (none: empty)
     std::vector<std::array<double, 4>> guides;      // hosted: lines over the image (column, row to column, row)
-    HBITMAP maskBitmap = nullptr;                   // hosted: the segmentations over the image
+    HBITMAP maskBitmap = nullptr;                   // the segmentations over the image
     int maskWidth = 0, maskHeight = 0;
     std::vector<Outline> outlines;
+    bool segments = true;                           // shown (the segmentations, and the overlay planes)
+    std::vector<std::shared_ptr<Segmentation>> nearby;   // in Explorer: the segmentations of its study near the file
     bool crosshair = false, pointing = false;       // (and the mouse over it, tracked to its leaving)
     double crossColumn = 0, crossRow = 0;
     std::vector<int> seriesFrames;                  // hosted: the frame of each file of `series` (empty: none)
@@ -159,7 +168,7 @@ private:
     bool selecting = false;                         // the tree selection changes from the code
     RECT bounds = {};
     RECT tabArea = {}, tabRects[TabCount] = {}, contentArea = {}, splitArea = {}, imageArea = {}, statusArea = {};
-    RECT barArea = {}, playRect = {}, jumpRect = {}, trackRect = {}, spaceTrackRect = {}, overlayRect = {};
+    RECT barArea = {}, playRect = {}, jumpRect = {}, trackRect = {}, spaceTrackRect = {}, overlayRect = {}, segmentsRect = {};
     const wchar_t* spaceName = L"Slice";            // what the places are (planes, series; the files of a folder: slices)
     int tab = TabColumns;
     int split = 450;                                // the share of the top panel, in thousandths
@@ -235,6 +244,10 @@ private:
     void GoSlice(int i);
 
     void Shown(bool had);
+
+    bool HasSegments() const;
+
+    void PaneSegments();
 
     void Settle();
 

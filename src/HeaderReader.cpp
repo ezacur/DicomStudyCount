@@ -170,6 +170,7 @@ static Kind ReadDataset(Parser& p, File& f, Header& h, unsigned last)
         if (!p.Length(tag, vr, len)) break;
         if (tag == 0x00041220) return Kind::NotDicom;              // directory records: a DICOMDIR
         if (len == 0xFFFFFFFF) { if (!p.SkipSequence(vr)) break; continue; }
+        if ((tag >> 16) >= 0x6000 && (tag >> 16) <= 0x601E && !((tag >> 16) & 1) && (tag & 0xFFFF) == 0x0010) h.overlayPlanes = true;
         switch (tag)
         {
         case 0x00080016:                                           // SOPClassUID

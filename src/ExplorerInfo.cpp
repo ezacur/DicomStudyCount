@@ -129,7 +129,7 @@ void DicomExplorer::FillInfo(int n)
         {
             std::wstring planes;
             for (Uint32 group : OverlayGroupsOf(node.files[0])) { wchar_t b[8]; swprintf_s(b, L"%04X", group); planes += (planes.empty() ? L"" : L", ") + std::wstring(b); }
-            row(L"Overlay planes", planes);
+            if (!planes.empty()) row(L"Segmentation", L"overlay planes " + planes);
         }
         swprintf_s(buffer, L"%u x %u", g.columns, g.rows);
         row(L"Columns x rows", buffer);

@@ -226,6 +226,15 @@
       <displayInfo displayType="String" defaultColumnWidth="16" />
     </propertyDescription>
 
+    <!-- "seg" when the image has a segmentation: overlay planes of its own (60xx), or something of a SEG or
+         an RT Structure Set of its study in its plane, from its folder, the folders in it or those beside it -->
+    <propertyDescription name="DicomStudyCount.Segmentation" formatID="{ED9AB6BD-5610-4A64-B2CC-55EE8E18D329}" propID="31">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true" />
+      <labelInfo label="DICOM segmentation" />
+      <displayInfo displayType="String" defaultColumnWidth="6" />
+    </propertyDescription>
+
     <!-- Which kinds of identifying data the header holds, never their values: "YES: name, birth date,
          institution", "no", "de-identified" (PatientIdentityRemoved). It cannot see text burned into
          the pixels that the header does not declare, nor data hidden in private tags. -->

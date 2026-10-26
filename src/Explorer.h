@@ -53,18 +53,17 @@ private:
     Uint32 plotTag = 0;                             // (which one)
     std::vector<int> plotFiles;                     // (its files, in order)
     bool refLines = true;                           // reference lines: where the planes of the node under the mouse cut it
-    bool showSegments = true;                       // segmentations (SEG, RT Structure Sets) over the images
-    std::vector<Overlay> overlays;                  // those in the folder (read when an image of their study is shown)
+    bool showSegments = true;                       // segmentations (SEG, RT Structure Sets, overlay planes) over the images
+    std::vector<Segmentation> segmentations;        // the SEG and RT Structure Sets in the folder (read when an image of their study is shown)
     // The marks of the images in the tree, for what they have: on an image its word, on the nodes above it
     // how many of theirs have it; and their check boxes in a color of their own (the blue of the box made
     // of its channels: "from" says which one goes to red, green and blue; an empty box filled light). A
     // node with images of two marks: half its box of each. (The state images of a tree are 15 at most:
-    // 1 + 3 for each combination of the marks with a color - two of them)
-    enum TreeMark { Segmented, Overlaid, Marks };
+    // 1 + 3 for each combination of the marks with a color)
+    enum TreeMark { Segmented, Marks };
     struct MarkKind { const wchar_t* image; const wchar_t* counted; int from[3]; DWORD light; };   // (light: 0xRRGGBB)
     static constexpr MarkKind MarkKinds[Marks] = {
-        { L"seg", L"segmented", { 0, 2, 1 }, 0xAAE6AA },            // (green: the images with a segmentation in their plane)
-        { L"overlay", L"with overlays", { 2, 1, 2 }, 0xF0BEF0 },    // (magenta: those with overlay planes, 60xx, of their own)
+        { L"seg", L"segmented", { 0, 2, 1 }, 0xAAE6AA },            // (green: the images with a segmentation in their plane, or overlay planes, 60xx, of their own)
     };
     static_assert(1 + 3 * (1 << Marks) <= 15, "the state images of a tree are 15 at most");
     std::vector<size_t> markCount[Marks];           // each node: how many of its images have each mark
@@ -245,8 +244,8 @@ private:
 
     void Toggle(int n);
 
-    // The plane of a file: where its first pixel is, the directions of its rows and columns, its pixel spacing
-    struct Geometry { double origin[3], row[3], column[3], dx, dy; int columns, rows; };
+    // The plane of a file: where its first pixel is, the directions of its rows and columns, its pixel spacing, its thickness
+    using Geometry = ImagePlane;
     bool GeometryOf(int f, Geometry& g) const;
 
     void ShownFile(int i);
@@ -255,8 +254,6 @@ private:
 
     void MarkSegmented();
     void SetMark(TreeMark m, const std::vector<char>& with);
-
-    void MarkOverlays();
 
     void Segments();
 

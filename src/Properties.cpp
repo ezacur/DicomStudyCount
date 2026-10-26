@@ -531,6 +531,21 @@ IFACEMETHODIMP_(ULONG) PropertyHandler::Release()
     return r;
 }
 
+// The segmentation column: "seg" when the image has overlay planes of its own, or something of a segmentation of
+// its study near it (SEG, RT Structure Set) is in its plane. Only when it is asked for: it reads the folders around.
+static std::wstring SegmentationOf(const std::wstring& path)
+{
+    Header h;
+    if (ReadHeader(path.c_str(), h, UpToOverlays) != Kind::Dicom) return std::wstring();
+    if (h.overlayPlanes) return L"seg";
+    if (h.sopClass == SegSopClass || h.sopClass == RtStructSopClass) return std::wstring();
+    ImagePlane p;
+    if (!PlaneOf(h, p)) return std::wstring();
+    for (const auto& s : SegmentationsNear(path, h.studyUid))
+        if (SegmentsIn(*s, p)) return L"seg";
+    return std::wstring();
+}
+
 // IInitializeWithFile: the path is needed (not just a stream) for the duplicates of the file
 IFACEMETHODIMP PropertyHandler::Initialize(LPCWSTR path, DWORD mode)
 {
@@ -547,6 +562,7 @@ IFACEMETHODIMP PropertyHandler::Initialize(LPCWSTR path, DWORD mode)
             InitializePrevious(path, mode);
             return S_OK;
         }
+        file = path;
         if (!h.studyUid.empty()) Set(PKEY_StudyHash, Hash6(h.studyUid));
         if (!h.seriesUid.empty()) Set(PKEY_SeriesHash, Hash6(h.seriesUid));
         Set(PKEY_PatientID, Widen(h.patientId, h.charset));
@@ -603,6 +619,12 @@ IFACEMETHODIMP PropertyHandler::GetValue(REFPROPERTYKEY key, PROPVARIANT* value)
     if (previous) return previous->GetValue(key, value);
     if (!value) return E_POINTER;
     if (!cache) { PropVariantInit(value); return S_OK; }
+    if (key == PKEY_Segmentation && !segmentationRead && !file.empty())
+    {
+        segmentationRead = true;
+        try { Set(PKEY_Segmentation, SegmentationOf(file)); }
+        catch (...) {}
+    }
     return cache->GetValue(key, value);
 }
 

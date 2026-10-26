@@ -11,7 +11,8 @@ param(
     [string]$Dll,
     [int]$Width = 700,
     [int]$Height = 900,
-    [switch]$Dark          # the colors of Explorer in dark mode
+    [switch]$Dark,         # the colors of Explorer in dark mode
+    [int]$Settle = 500     # ms it paints before its picture (more: what it reads in the background, the segmentations)
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 has no $PSScriptRoot in parameter defaults
@@ -45,7 +46,7 @@ public static class PreviewTest {
     // Shows the file in the panel, lets it paint, saves a picture of it
     [ComImport, Guid("196bf9a5-b346-4ef0-aa1e-5dcdb76768b1"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IPreviewHandlerVisuals { void SetBackgroundColor(uint c); void SetFont(IntPtr f); void SetTextColor(uint c); }
-    public static void Show(string file, System.Windows.Forms.Control panel, string png, bool dark) {
+    public static void Show(string file, System.Windows.Forms.Control panel, string png, bool dark, int settle) {
         Guid i = typeof(IPreviewHandler).GUID; object o;
         f.CreateInstance(null, ref i, out o);
         IntPtr item; Guid itemId = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");    // IShellItem
@@ -57,7 +58,7 @@ public static class PreviewTest {
         if (dark) { ((IPreviewHandlerVisuals)o).SetBackgroundColor(0x202020); ((IPreviewHandlerVisuals)o).SetTextColor(0xFFFFFF); panel.BackColor = Color.FromArgb(32, 32, 32); }
         ph.SetWindow(panel.Handle, ref rc);
         ph.DoPreview();
-        for (int k = 0; k < 20; k++) { System.Windows.Forms.Application.DoEvents(); System.Threading.Thread.Sleep(25); }
+        for (int k = 0; k < settle / 25; k++) { System.Windows.Forms.Application.DoEvents(); System.Threading.Thread.Sleep(25); }
         using (var bmp = new Bitmap(panel.Width, panel.Height))
         using (var g = Graphics.FromImage(bmp)) {
             IntPtr dc = g.GetHdc(); PrintWindow(panel.Handle, dc, 0); g.ReleaseHdc(dc); bmp.Save(png);
@@ -81,7 +82,7 @@ $n = 0
 foreach ($file in $Files) {
     $n++
     $png = Join-Path $Out ('{0:D2}_{1}.png' -f $n, ([IO.Path]::GetFileName($file) -replace '[^\w.-]', '_'))
-    try { [PreviewTest]::Show($file, $panel, $png, $Dark); "ok    $file" }
+    try { [PreviewTest]::Show($file, $panel, $png, $Dark, $Settle); "ok    $file" }
     catch { "ERROR $file : $($_.Exception.Message)" }
 }
 $form.Close()

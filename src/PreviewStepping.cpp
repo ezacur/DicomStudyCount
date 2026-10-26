@@ -94,6 +94,7 @@ void PreviewHandler::GoSlice(int i)
 // After a frame or a slice: the image, its bar and the status line again (all, if the image came or went)
 void PreviewHandler::Shown(bool had)
 {
+    if (!hosted) PaneSegments();
     KeepView();
     if (had != !view.pixels.empty())
     {
@@ -103,6 +104,32 @@ void PreviewHandler::Shown(bool had)
     InvalidateRect(wnd, &imageArea, FALSE);
     InvalidateRect(wnd, &barArea, FALSE);
     InvalidateRect(wnd, &statusArea, FALSE);
+}
+
+// Something to show over the image: segmentations of its study near it, or overlay planes of its own
+bool PreviewHandler::HasSegments() const
+{
+    return !nearby.empty() || (view.imaging && !view.imaging->planes.empty());
+}
+
+// In Explorer: the segmentations near the file that are in the plane of the image shown (its frame), shown
+// or not (and its Segmentation column)
+void PreviewHandler::PaneSegments()
+{
+    std::vector<DWORD> argb;
+    std::vector<Outline> lines;
+    ImagePlane p;
+    DcmDataset* ds = view.imaging && view.imaging->file ? view.imaging->file->getDataset() : nullptr;
+    if (!nearby.empty() && ds && PlaneOf(ds, view.frame, p))
+    {
+        OFString sopClass;
+        ds->findAndGetOFString(DCM_SOPClassUID, sopClass);
+        const bool itself = sopClass == SegSopClass;          // (a SEG shown: not over itself)
+        std::vector<const Segmentation*> over;
+        for (const auto& s : nearby) if (!itself || s->rt) over.push_back(s.get());
+        SegmentsOver(over, p, argb, lines);
+    }
+    SetSegmentation(argb.empty() ? 0 : p.columns, argb.empty() ? 0 : p.rows, argb, std::move(lines));
 }
 
 // When the stepping stops: the header and the values of the columns of the file shown
@@ -128,8 +155,7 @@ void PreviewHandler::Settle()
 // The series has been read: where this file is in it
 void PreviewHandler::Series()
 {
-    std::vector<std::wstring> files = std::move(scan->files);
-    scan.reset();
+    std::vector<std::wstring> files = std::move(scan->files);      // (the scan goes on: the segmentations)
     for (size_t i = 0; i < files.size(); i++)
         if (CompareStringOrdinal(files[i].c_str(), -1, current.c_str(), -1, TRUE) == CSTR_EQUAL)
         {

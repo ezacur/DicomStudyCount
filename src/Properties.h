@@ -69,6 +69,8 @@ static const PROPERTYKEY PKEY_Plane = { FMTID_Dicom, 28 };
 
 static const PROPERTYKEY PKEY_SeriesKind = { FMTID_Dicom, 30 };
 
+static const PROPERTYKEY PKEY_Segmentation = { FMTID_Dicom, 31 };
+
 std::wstring ObjectType(const std::string& uid);
 
 std::wstring Compression(const std::string& ts);
@@ -104,6 +106,8 @@ private:
     LONG refs = 1;
     IPropertyStoreCache* cache = nullptr;
     IPropertyStore* previous = nullptr;             // the handler from before, for a file that is not DICOM
+    std::wstring file;                              // a DICOM file: its segmentation column, when it is asked for
+    bool segmentationRead = false;
 
     void InitializePrevious(LPCWSTR path, DWORD mode);
 

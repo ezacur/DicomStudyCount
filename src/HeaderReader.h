@@ -18,6 +18,7 @@ struct Header
     std::string patientName, birthDate, address, phone, otherNames, otherIds, motherName;
     std::string institution, institutionAddress, referring, performing, operators;
     std::string identityRemoved, burnedIn;
+    bool overlayPlanes = false;                         // (60xx,0010 OverlayRows: read up to UpToOverlays)
 };
 
 // Where the reading stops: the icons need the header up to SeriesNumber only, the columns up to
@@ -25,6 +26,9 @@ struct Header
 static const unsigned UpToSeriesNumber = 0x00200011;
 
 static const unsigned UpToBurnedIn = 0x00280301;
+
+// The segmentation column also looks for overlay planes (groups 6000 to 601E), before the pixels
+static const unsigned UpToOverlays = 0x601E0010;
 
 static const char DirectorySopClass[] = "1.2.840.10008.1.3.10";   // DICOMDIR
 

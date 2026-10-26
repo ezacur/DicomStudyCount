@@ -58,7 +58,7 @@ $previewDetails = 'prop:' + ((('StudyHash', 'SeriesHash', 'Modality', 'SeriesNum
     'System.Size', 'System.DateModified') -join ';')
 $fullDetails = 'prop:System.PropGroup.Description;' + (('StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber',
     'SeriesDescription', 'Protocol', 'Plane', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness',
-    'Frames', 'ImageType', 'ObjectType', 'Compression', 'Manufacturer', 'FrameOfReference', 'StudyDate', 'PatientID', 'SensitiveData',
+    'Frames', 'ImageType', 'ObjectType', 'Segmentation', 'Compression', 'Manufacturer', 'FrameOfReference', 'StudyDate', 'PatientID', 'SensitiveData',
     'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' | ForEach-Object { $d + $_ }) -join ';') +
     ';System.PropGroup.FileSystem;System.ItemNameDisplay;System.ItemTypeText;System.ItemFolderPathDisplay;System.Size;' +
     'System.DateCreated;System.DateModified;System.FileAttributes'

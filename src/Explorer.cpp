@@ -239,6 +239,7 @@ void DicomExplorer::CreateControls()
         preview->pointed = [this](bool on, double column, double row) { Pointed(on, column, row); };
         preview->Host(wnd, imageRect);
         Button_SetCheck(overlayBox, preview->Overlay() ? BST_CHECKED : BST_UNCHECKED);
+        preview->SetSegmentsShown(showSegments);
         preview->ShowFiles({}, -1);
     }
 }
@@ -434,7 +435,7 @@ void DicomExplorer::Clear()
     navigator.Clear();
     navScene.clear();
     lit.clear();
-    overlays.clear();
+    segmentations.clear();
     for (std::vector<size_t>& c : markCount) c.clear();
     onCount.clear();
     nodes.clear();
@@ -459,7 +460,7 @@ void DicomExplorer::Finished()
     if (!data) return;
     if (data->thread.joinable()) data->thread.join();
     Build();
-    overlays.clear();
+    segmentations.clear();
     for (size_t f = 0; f < data->files.size(); f++)
     {
         const Gathered& g = data->files[f];
@@ -468,14 +469,13 @@ void DicomExplorer::Finished()
         if (!c) continue;
         const bool seg = *c == Widen(SegSopClass), rt = *c == Widen(RtStructSopClass);
         if (!seg && !rt) continue;
-        Overlay o;
+        Segmentation o;
         o.path = g.path;
         o.rt = rt;
         o.study = g.study;
-        overlays.push_back(std::move(o));
+        segmentations.push_back(std::move(o));
     }
     MarkSegmented();
-    MarkOverlays();
     derivedCount.assign(nodes.size(), 0);
     for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) derivedCount[i] += fileState[f].derived;
     onCount.resize(nodes.size());

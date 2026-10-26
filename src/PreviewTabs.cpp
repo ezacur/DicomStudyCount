@@ -5,7 +5,7 @@
 // The DICOM columns, as the tab "Columns" of the preview lists them: the order of Properties > Details
 static const PROPERTYKEY* const g_columnKeys[] = {
     &PKEY_StudyHash, &PKEY_SeriesHash, &PKEY_Modality, &PKEY_SeriesNumber, &PKEY_InstanceNumber, &PKEY_SeriesDescription,
-    &PKEY_Protocol, &PKEY_Plane, &PKEY_SeriesKind, &PKEY_Acquired, &PKEY_TriggerTime, &PKEY_ZLevel, &PKEY_Rows, &PKEY_Columns,
+    &PKEY_Protocol, &PKEY_Plane, &PKEY_SeriesKind, &PKEY_Segmentation, &PKEY_Acquired, &PKEY_TriggerTime, &PKEY_ZLevel, &PKEY_Rows, &PKEY_Columns,
     &PKEY_PixelSpacing, &PKEY_SliceThickness, &PKEY_Frames, &PKEY_ImageType, &PKEY_ObjectType, &PKEY_Compression,
     &PKEY_Manufacturer, &PKEY_FrameOfReference, &PKEY_StudyDate, &PKEY_PatientID, &PKEY_SensitiveData,
     &PKEY_ImageOrientation, &PKEY_StudyUid, &PKEY_SeriesUid, &PKEY_DuplicatedIn };
@@ -246,7 +246,9 @@ void PreviewHandler::FillValues(const std::wstring& file)
         std::wstring value;
         PROPVARIANT v;
         PropVariantInit(&v);
-        if (values && SUCCEEDED(values->GetValue(key, &v)) && v.vt != VT_EMPTY)
+        if (&key == &PKEY_Segmentation)        // (as the image shows it: the folders around are read in the background)
+            value = maskBitmap || !outlines.empty() || (view.imaging && !view.imaging->planes.empty()) ? L"seg" : L"";
+        else if (values && SUCCEEDED(values->GetValue(key, &v)) && v.vt != VT_EMPTY)
         {
             PWSTR s = nullptr;
             if (SUCCEEDED(PSFormatForDisplayAlloc(key, v, PDFF_DEFAULT, &s)) || SUCCEEDED(PropVariantToStringAlloc(v, &s)))

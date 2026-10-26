@@ -1,4 +1,4 @@
-// Pixels for the explorer: the slices, the segmentations over them, the floating thumbnails and the mosaics
+// Pixels for the explorer: the slices, the floating thumbnails and the mosaics
 // (included by Shell.h, after the headers of the parts before it)
 #pragma once
 
@@ -20,38 +20,6 @@ struct Slice
 bool FirstNumber(const std::string& value, double& out);
 
 std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice& s);
-
-static const char* const SegSopClass = "1.2.840.10008.5.1.4.1.1.66.4";
-
-static const char* const RtStructSopClass = "1.2.840.10008.5.1.4.1.1.481.3";
-
-struct SegFrame
-{
-    double origin[3] = {}, row[3] = {}, column[3] = {}, dx = 1, dy = 1;
-    int columns = 0, rows = 0, segment = 1;
-    bool any = false;                               // (some of the mask is set)
-    std::vector<Uint8> mask;                        // 1: in the segment
-};
-
-struct Contour
-{
-    std::vector<std::array<double, 3>> points;      // in the patient (mm)
-    COLORREF color = 0;
-    bool closed = true;
-};
-
-struct Overlay
-{
-    std::wstring path;
-    bool rt = false, loaded = false, failed = false;
-    std::string study;
-    std::vector<SegFrame> frames;                   // a SEG
-    std::map<int, COLORREF> colors;                 // (of its segments)
-    double spacing = 0;                             // (between its frames along their normal: how near a plane must be)
-    std::vector<Contour> contours;                  // an RT Structure Set
-};
-
-void LoadOverlay(Overlay& o);
 
 // 8-bit pixels, 0xRRGGBB, top-down
 struct Picture

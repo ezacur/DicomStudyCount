@@ -124,7 +124,7 @@ void PreviewHandler::Paint(HDC dc)
             RestoreDC(dc, saved);
         }
         // The segmentations: their mask (its colors through) and their contours
-        if (hosted && poster.empty() && (maskBitmap || !outlines.empty()))
+        if (segments && poster.empty() && (maskBitmap || !outlines.empty()))
         {
             const int saved = SaveDC(dc);
             IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
@@ -186,8 +186,8 @@ void PreviewHandler::Paint(HDC dc)
             DeleteObject(dashed);
             RestoreDC(dc, saved);
         }
-        // The overlay planes of the image (with the overlay): magenta, the others in colors of their own
-        if (overlay && view.imaging && !view.imaging->planes.empty() && view.imaging->planes.size() == static_cast<size_t>(view.width) * view.height)
+        // The overlay planes of the image (segmentations too): magenta, the others in colors of their own
+        if (segments && poster.empty() && view.imaging && !view.imaging->planes.empty() && view.imaging->planes.size() == static_cast<size_t>(view.width) * view.height)
         {
             static const DWORD colors[4] = { 0xFFFF00FF, 0xFFFFD000, 0xFF00E0FF, 0xFF40FF40 };      // (0xAARRGGBB)
             std::vector<DWORD> argb(view.imaging->planes.size(), 0);
@@ -317,10 +317,10 @@ void PreviewHandler::PaintOverlay(HDC dc, const RECT& r)
 
 // The image bar, two rows: the times (play / pause, the frames of a multi-frame file or the images of a
 // position) with the check box of the overlay at the right; the places (the jumps through the planes
-// or the series, or the files of a folder). Each one gray when there is nothing to go through.
+// or the series, or the files of a folder) with that of the segmentations. Each one gray when there is nothing to go through.
 void PreviewHandler::PaintBar(HDC dc)
 {
-    playRect = jumpRect = trackRect = spaceTrackRect = overlayRect = {};
+    playRect = jumpRect = trackRect = spaceTrackRect = overlayRect = segmentsRect = {};
     if (barArea.bottom <= barArea.top) return;
     SelectObject(dc, uiFont ? uiFont : GetStockObject(DEFAULT_GUI_FONT));
     const int middle = (barArea.top + barArea.bottom) / 2;
@@ -330,31 +330,36 @@ void PreviewHandler::PaintBar(HDC dc)
     HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN)), oldBrush = SelectObject(dc, ink);
     SIZE ext = {};
 
-    // The overlay, at the right of the first row (hosted: the check box of the explorer)
+    // The overlay, at the right of the first row, and under it the segmentations when the image has any
+    // (hosted: the check boxes of the explorer)
     if (!hosted)
     {
-        const RECT& r = rows[0];
-        const int cy = (r.top + r.bottom) / 2, right = r.right - Px(6);
-        static const wchar_t label[] = L"Overlay";
-        GetTextExtentPoint32W(dc, label, ARRAYSIZE(label) - 1, &ext);
-        const int box = Px(13);
-        overlayRect = { right - ext.cx - Px(6) - box, r.top, right, r.bottom };
-        RECT square = { overlayRect.left, cy - box / 2, overlayRect.left + box, cy - box / 2 + box };
-        if (overlay)
-        {
-            FillRect(dc, &square, accent);
-            HPEN pen = CreatePen(PS_SOLID, Px(2), RGB(255, 255, 255));
-            SelectObject(dc, pen);
-            POINT check[3] = { { square.left + box * 22 / 100, cy }, { square.left + box * 42 / 100, cy + box * 22 / 100 },
-                               { square.left + box * 78 / 100, cy - box * 22 / 100 } };
-            Polyline(dc, check, 3);
-            SelectObject(dc, GetStockObject(NULL_PEN));
-            DeleteObject(pen);
-        }
-        else FrameRect(dc, &square, border);
-        ::SetTextColor(dc, textColor);
-        RECT text = { square.right + Px(6), r.top, right, r.bottom };
-        DrawTextW(dc, label, -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        static const wchar_t overlayLabel[] = L"Overlay", segmentsLabel[] = L"Segmentations";
+        SIZE wide = {};
+        GetTextExtentPoint32W(dc, segmentsLabel, ARRAYSIZE(segmentsLabel) - 1, &wide);
+        const int box = Px(13), right = barArea.right - Px(6), left = right - wide.cx - Px(6) - box;
+        auto check = [&](const RECT& r, const wchar_t* label, bool on, RECT& area) {
+            const int cy = (r.top + r.bottom) / 2;
+            area = { left, r.top, right, r.bottom };
+            RECT square = { left, cy - box / 2, left + box, cy - box / 2 + box };
+            if (on)
+            {
+                FillRect(dc, &square, accent);
+                HPEN pen = CreatePen(PS_SOLID, Px(2), RGB(255, 255, 255));
+                SelectObject(dc, pen);
+                POINT mark[3] = { { square.left + box * 22 / 100, cy }, { square.left + box * 42 / 100, cy + box * 22 / 100 },
+                                  { square.left + box * 78 / 100, cy - box * 22 / 100 } };
+                Polyline(dc, mark, 3);
+                SelectObject(dc, GetStockObject(NULL_PEN));
+                DeleteObject(pen);
+            }
+            else FrameRect(dc, &square, border);
+            ::SetTextColor(dc, textColor);
+            RECT text = { square.right + Px(6), r.top, right, r.bottom };
+            DrawTextW(dc, label, -1, &text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        };
+        check(rows[0], overlayLabel, overlay, overlayRect);
+        if (HasSegments()) check(rows[1], segmentsLabel, segments, segmentsRect);
     }
     const int rightEdge = hosted ? barArea.right - Px(6) : overlayRect.left - Px(14);
     const bool any = Count() > 0 && (Position() >= 0 || !poster.empty());

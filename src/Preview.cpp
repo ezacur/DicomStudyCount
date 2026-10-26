@@ -116,19 +116,27 @@ static DWORD WINAPI ScanSeries(void* param)
     {
         (*scan)->files = g_folderHeaders.SeriesOf((*scan)->path, (*scan)->folder, &(*scan)->cancel);
         if (!(*scan)->cancel) PostMessageW((*scan)->window, (*scan)->message, 0, 0);
+        if (!(*scan)->cancel && (*scan)->segmentsMessage && !(*scan)->study.empty())
+        {
+            (*scan)->segmentations = SegmentationsNear((*scan)->path, (*scan)->study);
+            if (!(*scan)->cancel && !(*scan)->segmentations.empty()) PostMessageW((*scan)->window, (*scan)->segmentsMessage, 0, 0);
+        }
     }
     catch (...) {}
     delete scan;
     FreeLibraryAndExitThread(g_module, 0);         // the reference StartSeriesScan took
 }
 
-static std::shared_ptr<SeriesScan> StartSeriesScan(const std::wstring& path, const std::wstring& folder, HWND window, UINT message)
+static std::shared_ptr<SeriesScan> StartSeriesScan(const std::wstring& path, const std::wstring& folder, const std::string& study, HWND window,
+                                                     UINT message, UINT segmentsMessage)
 {
     auto scan = std::make_shared<SeriesScan>();
     scan->path = path;
     scan->folder = folder;
     scan->window = window;
     scan->message = message;
+    scan->study = study;
+    scan->segmentsMessage = segmentsMessage;
     // The DLL stays loaded until the thread ends
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&ScanSeries), &self)) return nullptr;
@@ -268,6 +276,8 @@ IFACEMETHODIMP PreviewHandler::Unload()
     group = -1;
     series.clear();
     slice = -1;
+    nearby.clear();
+    SetSegmentation(0, 0, {}, {});
     current.clear();
     playing = jumping = stale = windowSet = plain = false;
     for (HFONT* f : { &font, &uiFont, &boldFont }) if (*f) { DeleteObject(*f); *f = nullptr; }
@@ -452,6 +462,18 @@ void PreviewHandler::SetOverlay(bool on)
     if (wnd) { InvalidateRect(wnd, &imageArea, FALSE); InvalidateRect(wnd, &barArea, FALSE); }
 }
 
+void PreviewHandler::SetSegmentsShown(bool on)
+{
+    if (on == segments) return;
+    segments = on;
+    if (!hosted)
+    {
+        DWORD value = segments ? 1 : 0;
+        RegSetKeyValueW(HKEY_CURRENT_USER, Settings, L"Segmentations", REG_DWORD, &value, sizeof(value));
+    }
+    if (wnd) { InvalidateRect(wnd, &imageArea, FALSE); InvalidateRect(wnd, &barArea, FALSE); }
+}
+
 // The image shown, as drawn (0xRRGGBB, top-down): none if there is no image
 const std::vector<DWORD>* PreviewHandler::Pixels(int& width, int& height) const
 {
@@ -603,6 +625,7 @@ HRESULT PreviewHandler::CreateWindows()
     if (!directory.empty()) tab = TabDirectory;
     split = static_cast<int>(ReadDword(Settings, L"Split", 450));
     overlay = ReadDword(Settings, L"Overlay", 1) != 0;
+    if (!hosted) segments = ReadDword(Settings, L"Segmentations", 1) != 0;
     current = path;
     // Its (invisible) title is the summary line: for screen readers and tests
     wnd = CreateWindowExW(0, L"DicomStudyCountPreview", view.summary.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
@@ -652,6 +675,6 @@ HRESULT PreviewHandler::CreateWindows()
     // Which columns Explorer shows: after DoPreview has returned, Explorer is not waiting for it
     if (list) PostMessageW(wnd, WM_READCOLUMNS, 0, 0);
     // The other files of its series, to step through them
-    if (!view.pixels.empty() && !path.empty()) scan = StartSeriesScan(path, folder, wnd, WM_SERIES);
+    if (!view.pixels.empty() && !path.empty()) scan = StartSeriesScan(path, folder, view.studyUid, wnd, WM_SERIES, WM_SEGMENTS);
     return S_OK;
 }

@@ -87,6 +87,7 @@ static const wchar_t KeyPrefix[] = L"DicomStudyCount|v2|";
 #include "Icons.h"
 #include "Properties.h"
 #include "Decode.h"
+#include "Segments.h"
 #include "Preview.h"
 #include "Thumbnails.h"
 #include "Gather.h"

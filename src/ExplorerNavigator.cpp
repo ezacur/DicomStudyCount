@@ -1,4 +1,4 @@
-// The DICOM explorer: the navigator of a node, the check boxes, the reference lines, the segmentations and overlays marked
+// The DICOM explorer: the navigator of a node, the check boxes, the reference lines, the segmentations marked
 #include "Shell.h"
 
 // ----- the navigator
@@ -248,6 +248,8 @@ bool DicomExplorer::GeometryOf(int f, Geometry& g) const
     g.dy = dy;
     g.columns = static_cast<int>(x.columns);
     g.rows = static_cast<int>(x.rows);
+    g.thickness = 0;
+    if (const std::wstring* t = AttributeOf(f, 0x00180050)) g.thickness = _wtof(t->c_str());
     return true;
 }
 
@@ -342,65 +344,24 @@ void DicomExplorer::Guides(int n)
 }
 
 // The images with a segmentation in their plane (a frame of a SEG with something in it, or a contour of a
-// structure set), marked in the tree; their segmentations read now (only when the folder has any)
+// structure set; their segmentations read now, only when the folder has any) or with overlay planes (60xx)
+// of their own, marked in the tree
 void DicomExplorer::MarkSegmented()
 {
-    markCount[Segmented].assign(nodes.size(), 0);
-    if (overlays.empty()) return;
-    for (Overlay& o : overlays) if (!o.loaded) LoadOverlay(o);
+    for (Segmentation& o : segmentations) if (!o.loaded) LoadSegmentation(o);
     std::vector<char> withSegments(data->files.size(), 0);
     const std::wstring segClass = Widen(SegSopClass);
     for (size_t f = 0; f < data->files.size(); f++)
     {
+        if (!OverlayGroupsOf(static_cast<int>(f)).empty()) { withSegments[f] = 1; continue; }
         Geometry a;
-        if (!GeometryOf(static_cast<int>(f), a)) continue;
+        if (segmentations.empty() || !GeometryOf(static_cast<int>(f), a)) continue;
         const std::wstring* own = AttributeOf(static_cast<int>(f), 0x00080016);
         if (own && *own == segClass) continue;
-        const Gathered& g = data->files[f];
-        const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
-                                   a.row[0] * a.column[1] - a.row[1] * a.column[0] };
-        double thickness = 0;
-        if (const std::wstring* t = AttributeOf(static_cast<int>(f), 0x00180050)) thickness = _wtof(t->c_str());
-        auto gapOf = [&](const double* p) { double d = 0; for (int k = 0; k < 3; k++) d += (p[k] - a.origin[k]) * normal[k]; return d; };
-        for (const Overlay& o : overlays)
-        {
-            if (o.failed || o.study != g.study) continue;
-            if (!o.rt)
-            {
-                const double tolerance = o.spacing > 0 ? o.spacing * 0.45 : 1.0;
-                for (const SegFrame& s : o.frames)
-                {
-                    if (!s.any) continue;
-                    const double fn[3] = { s.row[1] * s.column[2] - s.row[2] * s.column[1], s.row[2] * s.column[0] - s.row[0] * s.column[2],
-                                           s.row[0] * s.column[1] - s.row[1] * s.column[0] };
-                    if (std::fabs(fn[0] * normal[0] + fn[1] * normal[1] + fn[2] * normal[2]) < 0.999) continue;
-                    if (std::fabs(gapOf(s.origin)) <= tolerance) { withSegments[f] = 1; break; }
-                }
-            }
-            else
-            {
-                const double tolerance = thickness > 0 ? thickness * 0.5 : 1.0;
-                for (const Contour& c : o.contours)
-                {
-                    if (c.points.empty()) continue;
-                    bool in = true;
-                    for (size_t k = 0; k < c.points.size() && in; k += (std::max)(static_cast<size_t>(1), c.points.size() / 4))
-                        if (std::fabs(gapOf(c.points[k].data())) > tolerance) in = false;
-                    if (in) { withSegments[f] = 1; break; }
-                }
-            }
-            if (withSegments[f]) break;
-        }
+        for (const Segmentation& o : segmentations)
+            if (o.study == data->files[f].study && SegmentsIn(o, a)) { withSegments[f] = 1; break; }
     }
     SetMark(Segmented, withSegments);
-}
-
-// The images with overlay planes of their own, marked in the tree
-void DicomExplorer::MarkOverlays()
-{
-    std::vector<char> with(data->files.size(), 0);
-    for (size_t f = 0; f < data->files.size(); f++) with[f] = !OverlayGroupsOf(static_cast<int>(f)).empty();
-    SetMark(Overlaid, with);
 }
 
 // A mark on the images that have it (each file: 1 if it has it), and on the nodes above them how many:
@@ -414,117 +375,39 @@ void DicomExplorer::SetMark(TreeMark m, const std::vector<char>& with)
 }
 
 // The segmentations of the study of the image shown, over it (the masks of the SEG frames in its plane, the
-// contours of the structure sets in its plane) and in the navigator (all the contours)
+// contours of the structure sets in its plane; its overlay planes, by the preview) and in the navigator (all
+// the contours)
 void DicomExplorer::Segments()
 {
     std::vector<DWORD> argb;
-    std::vector<PreviewHandler::Outline> flat;
+    std::vector<SegOutline> flat;
     std::vector<Navigator::Line3> lines;
     Geometry a;
-    int width = 0, height = 0;
-    if (showSegments && !overlays.empty() && GeometryOf(currentFile, a))
+    if (preview) preview->SetSegmentsShown(showSegments);
+    if (showSegments && !segmentations.empty() && GeometryOf(currentFile, a))
     {
         const Gathered& shown = data->files[currentFile];
         const std::wstring* own = AttributeOf(currentFile, 0x00080016);
         const bool itself = own && (*own == Widen(SegSopClass));     // (a SEG shown: not over itself)
-        const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
-                                   a.row[0] * a.column[1] - a.row[1] * a.column[0] };
-        double thickness = 0;
-        if (const std::wstring* t = AttributeOf(currentFile, 0x00180050)) thickness = _wtof(t->c_str());
-        width = a.columns;
-        height = a.rows;
-        std::vector<int> label(static_cast<size_t>(width) * height, 0);
-        std::vector<COLORREF> palette(1, 0);
-        for (Overlay& o : overlays)
+        std::vector<const Segmentation*> over;
+        for (Segmentation& o : segmentations)
         {
             if (o.study != shown.study) continue;
-            if (!o.loaded) LoadOverlay(o);
-            if (o.failed) continue;
-            if (!o.rt && !itself)
+            if (!o.loaded) LoadSegmentation(o);
+            if (o.failed || (itself && !o.rt)) continue;
+            over.push_back(&o);
+            for (const Contour& c3 : o.contours)
             {
-                const double tolerance = o.spacing > 0 ? o.spacing * 0.45 : 1.0;
-                for (const SegFrame& f : o.frames)
-                {
-                    const double fn[3] = { f.row[1] * f.column[2] - f.row[2] * f.column[1], f.row[2] * f.column[0] - f.row[0] * f.column[2],
-                                           f.row[0] * f.column[1] - f.row[1] * f.column[0] };
-                    double dot = 0, gap = 0;
-                    for (int k = 0; k < 3; k++) { dot += fn[k] * normal[k]; gap += (f.origin[k] - a.origin[k]) * normal[k]; }
-                    if (std::fabs(dot) < 0.999 || std::fabs(gap) > tolerance) continue;
-                    auto it = o.colors.find(f.segment);
-                    palette.push_back(it != o.colors.end() ? it->second : Palette[(5 + f.segment) % PaletteSize]);
-                    const int id = static_cast<int>(palette.size()) - 1;
-                    // Each pixel of the image, where it is in the frame (its nearest pixel there)
-                    double u0 = 0, v0 = 0, uc = 0, vc = 0, ur = 0, vr = 0;
-                    for (int k = 0; k < 3; k++)
-                    {
-                        const double d = a.origin[k] - f.origin[k];
-                        u0 += d * f.row[k];
-                        v0 += d * f.column[k];
-                        uc += a.dx * a.row[k] * f.row[k];
-                        vc += a.dx * a.row[k] * f.column[k];
-                        ur += a.dy * a.column[k] * f.row[k];
-                        vr += a.dy * a.column[k] * f.column[k];
-                    }
-                    for (int r = 0; r < height; r++)
-                        for (int c = 0; c < width; c++)
-                        {
-                            const long u = std::lround((u0 + c * uc + r * ur) / f.dx), v = std::lround((v0 + c * vc + r * vr) / f.dy);
-                            if (u < 0 || v < 0 || u >= f.columns || v >= f.rows) continue;
-                            if (f.mask[static_cast<size_t>(v) * f.columns + u]) label[static_cast<size_t>(r) * width + c] = id;
-                        }
-                }
-            }
-            if (o.rt)
-            {
-                const double tolerance = thickness > 0 ? thickness * 0.5 : 1.0;
-                for (const Contour& c3 : o.contours)
-                {
-                    Navigator::Line3 l;
-                    l.color = c3.color;
-                    l.closed = c3.closed;
-                    for (const auto& p : c3.points) l.points.push_back({ static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]) });
-                    if (lines.size() < 5000) lines.push_back(std::move(l));
-                    // In the plane of the image: over it
-                    bool inPlane = true;
-                    PreviewHandler::Outline out;
-                    out.color = c3.color;
-                    out.closed = c3.closed;
-                    for (const auto& p : c3.points)
-                    {
-                        double gap = 0, u = 0, v = 0;
-                        for (int k = 0; k < 3; k++)
-                        {
-                            const double d = p[k] - a.origin[k];
-                            gap += d * normal[k];
-                            u += d * a.row[k];
-                            v += d * a.column[k];
-                        }
-                        if (std::fabs(gap) > tolerance) { inPlane = false; break; }
-                        out.points.push_back({ u / a.dx, v / a.dy });
-                    }
-                    if (inPlane && !out.points.empty()) flat.push_back(std::move(out));
-                }
+                Navigator::Line3 l;
+                l.color = c3.color;
+                l.closed = c3.closed;
+                for (const auto& p : c3.points) l.points.push_back({ static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]) });
+                if (lines.size() < 5000) lines.push_back(std::move(l));
             }
         }
-        // The mask: its color, faint inside and strong at its edge
-        if (palette.size() > 1)
-        {
-            argb.assign(label.size(), 0);
-            for (int r = 0; r < height; r++)
-                for (int c = 0; c < width; c++)
-                {
-                    const int id = label[static_cast<size_t>(r) * width + c];
-                    if (!id) continue;
-                    auto other = [&](int rr, int cc) { return rr < 0 || cc < 0 || rr >= height || cc >= width || label[static_cast<size_t>(rr) * width + cc] != id; };
-                    const bool edge = other(r - 1, c) || other(r + 1, c) || other(r, c - 1) || other(r, c + 1);
-                    const DWORD alpha = edge ? 235 : 80;
-                    const COLORREF col = palette[id];
-                    const DWORD R = GetRValue(col) * alpha / 255, G = GetGValue(col) * alpha / 255, B = GetBValue(col) * alpha / 255;
-                    argb[static_cast<size_t>(r) * width + c] = (alpha << 24) | (R << 16) | (G << 8) | B;
-                }
-        }
+        SegmentsOver(over, a, argb, flat);
     }
-    if (preview) preview->SetSegmentation(argb.empty() ? 0 : width, argb.empty() ? 0 : height, argb, std::move(flat));
+    if (preview) preview->SetSegmentation(argb.empty() ? 0 : a.columns, argb.empty() ? 0 : a.rows, argb, std::move(flat));
     navigator.SetContours(std::move(lines));
 }
 
