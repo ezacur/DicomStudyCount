@@ -128,8 +128,7 @@ void DicomExplorer::FillInfo(int n)
         row(L"Compression", Compression(Narrow(value(0x00020010))));
         {
             std::wstring planes;
-            for (Uint32 group = 0x6000; group <= 0x601E; group += 2)
-                if (AttributeOf(node.files[0], (group << 16) | 0x0010)) { wchar_t b[8]; swprintf_s(b, L"%04X", group); planes += (planes.empty() ? L"" : L", ") + std::wstring(b); }
+            for (Uint32 group : OverlayGroupsOf(node.files[0])) { wchar_t b[8]; swprintf_s(b, L"%04X", group); planes += (planes.empty() ? L"" : L", ") + std::wstring(b); }
             row(L"Overlay planes", planes);
         }
         swprintf_s(buffer, L"%u x %u", g.columns, g.rows);

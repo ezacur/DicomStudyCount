@@ -436,8 +436,7 @@ void DicomExplorer::Clear()
     navScene.clear();
     lit.clear();
     overlays.clear();
-    segmentedCount.clear();
-    overlayCount.clear();
+    for (std::vector<size_t>& c : markCount) c.clear();
     fileOn.clear();
     onCount.clear();
     nodes.clear();

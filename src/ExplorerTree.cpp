@@ -159,10 +159,10 @@ std::wstring DicomExplorer::HowMany(int n) const
 std::wstring DicomExplorer::Label(int i) const
 {
     std::wstring s = Plain(i);
-    if (i < static_cast<int>(segmentedCount.size()) && segmentedCount[i])
-        s += nodes[i].level == Level::Image ? std::wstring(L"   seg") : L"   (" + std::to_wstring(segmentedCount[i]) + L" segmented)";
-    if (i < static_cast<int>(overlayCount.size()) && overlayCount[i])
-        s += nodes[i].level == Level::Image ? std::wstring(L"   overlay") : L"   (" + std::to_wstring(overlayCount[i]) + L" with overlays)";
+    for (int m = 0; m < Marks; m++)
+        if (i < static_cast<int>(markCount[m].size()) && markCount[m][i])
+            s += nodes[i].level == Level::Image ? L"   " + std::wstring(MarkKinds[m].image)
+                                                : L"   (" + std::to_wstring(markCount[m][i]) + L" " + MarkKinds[m].counted + L")";
     const auto& flags = nodes[i].flags;
     for (size_t k = 0; k < flags.size(); k++) s += (k ? L", " : L"   \u26A0 ") + flags[k];
     return s;

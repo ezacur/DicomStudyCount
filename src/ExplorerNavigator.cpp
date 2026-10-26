@@ -122,30 +122,30 @@ void DicomExplorer::Navigate(int n)
 }
 
 // The check box of a node: 1 off, 2 on, 3 some of it on (its files drawn in the navigator, or not)
-// Its image in the tree: the same box in green when images under it have segmentations (4 to 6), in
-// magenta when they have overlay planes (7 to 9), half and half when both (10 to 12)
+// Its image in the tree: the same box in the colors of the marks of the images under it (MarkKinds): 3 more
+// for each combination of them (the bits of the marks it has)
 int DicomExplorer::StateOf(int n) const
 {
-    const bool segmented = n >= 0 && n < static_cast<int>(segmentedCount.size()) && segmentedCount[n] > 0;
-    const bool overlaid = n >= 0 && n < static_cast<int>(overlayCount.size()) && overlayCount[n] > 0;
-    return CheckOf(n) + 3 * ((segmented ? 1 : 0) + (overlaid ? 2 : 0));
+    int bits = 0;
+    for (int m = 0; m < Marks; m++)
+        if (n >= 0 && n < static_cast<int>(markCount[m].size()) && markCount[m][n] > 0) bits |= 1 << m;
+    return CheckOf(n) + 3 * bits;
 }
 
-// The images of the check boxes of the tree: off, on and partly on; plain, green (segmented), magenta
-// (overlay planes) and both
+// The images of the check boxes of the tree: off, on and partly on; plain, and in the colors of each
+// combination of the marks
 void DicomExplorer::CheckImages()
 {
     HIMAGELIST before = TreeView_GetImageList(tree, TVSIL_STATE);
     int size = 0, ignore = 0;
     if (!before || !ImageList_GetIconSize(before, &size, &ignore) || size <= 0) size = Px(16);
-    HIMAGELIST list = ImageList_Create(size, size, ILC_COLOR32, 13, 0);
+    const int images = 1 + 3 * (1 << Marks);
+    HIMAGELIST list = ImageList_Create(size, size, ILC_COLOR32, images, 0);
     if (!list) return;
     HTHEME theme = OpenThemeData(tree, L"BUTTON");
     HDC screen = GetDC(tree);
     const COLORREF back = GetSysColor(COLOR_WINDOW);
-    const DWORD tint = 0xAAE6AA;                // (light green, 0xRRGGBB as the bits of the DIB)
-    const DWORD pink = 0xF0BEF0;                // (light magenta)
-    for (int k = 0; k < 13; k++)
+    for (int k = 0; k < images; k++)
     {
         BITMAPINFO bi = {};
         bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
@@ -173,23 +173,23 @@ void DicomExplorer::CheckImages()
                 DrawThemeBackground(theme, dc, BP_CHECKBOX, kind == 0 ? CBS_UNCHECKEDNORMAL : kind == 1 ? CBS_CHECKEDNORMAL : CBS_MIXEDNORMAL, &box, nullptr);
             else
                 DrawFrameControl(dc, &box, DFC_BUTTON, DFCS_BUTTONCHECK | (kind == 1 ? DFCS_CHECKED : 0));
-            // Segmented: the box green (its blue green, an empty one light green inside); with overlay
-            // planes: magenta (its blue magenta, an empty one light magenta); both: its left half green,
-            // its right half magenta
-            const int marks = (k - 1) / 3;          // (0 plain, 1 segmented, 2 overlays, 3 both)
-            if (marks > 0)
+            // The marks: the box in their colors (its blue, and an empty one light inside), a band of it
+            // for each one, from the left
+            std::vector<int> marks;
+            for (int m = 0; m < Marks; m++) if (((k - 1) / 3) & (1 << m)) marks.push_back(m);
+            if (!marks.empty())
             {
                 GdiFlush();
                 DWORD* px = static_cast<DWORD*>(bits);
-                const int middle = (box.left + box.right) / 2;
+                const int width = box.right - box.left;
                 for (int y = box.top + 1; y < box.bottom - 1; y++)
                     for (int x = box.left + 1; x < box.right - 1; x++)
                     {
-                        const bool green = marks == 1 || (marks == 3 && x < middle);
+                        const MarkKind& mark = MarkKinds[marks[(std::min)(marks.size() - 1, static_cast<size_t>((x - box.left) * static_cast<int>(marks.size()) / width))]];
                         DWORD& p = px[static_cast<size_t>(y) * size + x];
-                        const int r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
-                        if (b > r + 30 && b > g) p = green ? (r << 16) | (b << 8) | g : (b << 16) | (g << 8) | b;     // (blue: green, magenta)
-                        else if (r > 200 && g > 200 && b > 200 && kind == 0) p = green ? tint : pink;     // (an empty box: light)
+                        const int c[3] = { static_cast<int>((p >> 16) & 0xFF), static_cast<int>((p >> 8) & 0xFF), static_cast<int>(p & 0xFF) };
+                        if (c[2] > c[0] + 30 && c[2] > c[1]) p = (c[mark.from[0]] << 16) | (c[mark.from[1]] << 8) | c[mark.from[2]];
+                        else if (c[0] > 200 && c[1] > 200 && c[2] > 200 && kind == 0) p = mark.light;
                     }
             }
         }
@@ -345,7 +345,7 @@ void DicomExplorer::Guides(int n)
 // structure set), marked in the tree; their segmentations read now (only when the folder has any)
 void DicomExplorer::MarkSegmented()
 {
-    segmentedCount.assign(nodes.size(), 0);
+    markCount[Segmented].assign(nodes.size(), 0);
     if (overlays.empty()) return;
     for (Overlay& o : overlays) if (!o.loaded) LoadOverlay(o);
     std::vector<char> withSegments(data->files.size(), 0);
@@ -392,22 +392,25 @@ void DicomExplorer::MarkSegmented()
             if (withSegments[f]) break;
         }
     }
-    for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) segmentedCount[i] += withSegments[f];
-    for (size_t i = 0; i < nodes.size(); i++) if (segmentedCount[i]) nodes[i].text = Label(static_cast<int>(i));
+    SetMark(Segmented, withSegments);
 }
 
-// The images with overlay planes (an OverlayRows, 60xx,0010, in their header), marked in the tree
+// The images with overlay planes of their own, marked in the tree
 void DicomExplorer::MarkOverlays()
 {
-    overlayCount.assign(nodes.size(), 0);
     std::vector<char> with(data->files.size(), 0);
-    bool any = false;
-    for (size_t f = 0; f < data->files.size(); f++)
-        for (Uint32 group = 0x6000; group <= 0x601E && !with[f]; group += 2)
-            if (Find(data->files[f].attributes, (group << 16) | 0x0010)) { with[f] = 1; any = true; }
-    if (!any) return;
-    for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) overlayCount[i] += with[f];
-    for (size_t i = 0; i < nodes.size(); i++) if (overlayCount[i]) nodes[i].text = Label(static_cast<int>(i));
+    for (size_t f = 0; f < data->files.size(); f++) with[f] = !OverlayGroupsOf(static_cast<int>(f)).empty();
+    SetMark(Overlaid, with);
+}
+
+// A mark on the images that have it (each file: 1 if it has it), and on the nodes above them how many:
+// counted, and their lines in the tree again
+void DicomExplorer::SetMark(TreeMark m, const std::vector<char>& with)
+{
+    std::vector<size_t>& count = markCount[m];
+    count.assign(nodes.size(), 0);
+    for (size_t i = 0; i < nodes.size(); i++) for (int f : nodes[i].files) count[i] += with[f];
+    for (size_t i = 0; i < nodes.size(); i++) if (count[i]) nodes[i].text = Label(static_cast<int>(i));
 }
 
 // The segmentations of the study of the image shown, over it (the masks of the SEG frames in its plane, the

@@ -16,6 +16,15 @@ const std::wstring* DicomExplorer::AttributeOf(int f, Uint32 tag) const
     return a ? &data->pool.Text(a->second) : nullptr;
 }
 
+// The groups of the overlay planes of a file (6000, 6002...: those with an OverlayRows, 60xx,0010)
+std::vector<Uint32> DicomExplorer::OverlayGroupsOf(int f) const
+{
+    std::vector<Uint32> groups;
+    for (Uint32 group = 0x6000; group <= 0x601E; group += 2)
+        if (AttributeOf(f, (group << 16) | 0x0010)) groups.push_back(group);
+    return groups;
+}
+
 // Each orientation: gaps in its positions, spacings that are not regular, positions off the line of the
 // normal, positions with another number of images, images without position, pixel spacings that vary.
 // Each series: instance numbers missing. Each file: the same SOP instance UID as another one, shorter

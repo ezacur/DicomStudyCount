@@ -56,8 +56,19 @@ private:
     bool refLines = true;                           // reference lines: where the planes of the node under the mouse cut it
     bool showSegments = true;                       // segmentations (SEG, RT Structure Sets) over the images
     std::vector<Overlay> overlays;                  // those in the folder (read when an image of their study is shown)
-    std::vector<size_t> segmentedCount;             // each node: how many of its images have a segmentation in their plane
-    std::vector<size_t> overlayCount;               // and how many have overlay planes (60xx) of their own
+    // The marks of the images in the tree, for what they have: on an image its word, on the nodes above it
+    // how many of theirs have it; and their check boxes in a color of their own (the blue of the box made
+    // of its channels: "from" says which one goes to red, green and blue; an empty box filled light). A
+    // node with images of two marks: half its box of each. (The state images of a tree are 15 at most:
+    // 1 + 3 for each combination of the marks with a color - two of them)
+    enum TreeMark { Segmented, Overlaid, Marks };
+    struct MarkKind { const wchar_t* image; const wchar_t* counted; int from[3]; DWORD light; };   // (light: 0xRRGGBB)
+    static constexpr MarkKind MarkKinds[Marks] = {
+        { L"seg", L"segmented", { 0, 2, 1 }, 0xAAE6AA },            // (green: the images with a segmentation in their plane)
+        { L"overlay", L"with overlays", { 2, 1, 2 }, 0xF0BEF0 },    // (magenta: those with overlay planes, 60xx, of their own)
+    };
+    static_assert(1 + 3 * (1 << Marks) <= 15, "the state images of a tree are 15 at most");
+    std::vector<size_t> markCount[Marks];           // each node: how many of its images have each mark
     std::vector<char> fileDerived;                  // each file: a derived image (ImageType DERIVED), not an original one
     std::vector<Uint32> fileFrame;                  // and its frame of reference (an id of the pool, +1; 0: none)
     std::vector<size_t> derivedCount;               // each node: how many of its files are derived
@@ -163,6 +174,7 @@ private:
     void Problem(int n, const std::wstring& flag, const std::wstring& text);
 
     const std::wstring* AttributeOf(int f, Uint32 tag) const;
+    std::vector<Uint32> OverlayGroupsOf(int f) const;
 
     void Check();
 
@@ -237,6 +249,7 @@ private:
     void Guides(int n);
 
     void MarkSegmented();
+    void SetMark(TreeMark m, const std::vector<char>& with);
 
     void MarkOverlays();
 
