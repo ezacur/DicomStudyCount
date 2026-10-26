@@ -6523,7 +6523,7 @@ private:
         void Clear() { Set({}, {}, -1, Picture(), L"", L"", true); }
 
         std::function<void(int)> hovered;           // the mouse went over a plane (its index in Set), or off them (-1)
-        static constexpr COLORREF HoverColor = RGB(0, 120, 215);
+        static constexpr COLORREF HoverColor = RGB(0, 0, 0);
 
         void SetHoverText(std::wstring text) { hoverText = std::move(text); if (wnd) InvalidateRect(wnd, nullptr, FALSE); }
 
@@ -9734,12 +9734,29 @@ private:
                     {
                         cd->clrText = LevelColor(static_cast<int>(nodes[n].level));
                         if (Hit(n)) cd->clrTextBk = RGB(255, 236, 110);
-                        if (std::find(lit.begin(), lit.end(), n) != lit.end()) { cd->clrTextBk = RGB(200, 228, 255); cd->clrText = Navigator::HoverColor; }
                     }
+                    // (the nodes of the plane under the mouse in the navigator: a black frame around them, after)
+                    const LRESULT post = std::find(lit.begin(), lit.end(), n) != lit.end() ? CDRF_NOTIFYPOSTPAINT : 0;
                     if (nodes[n].level == Level::Series || nodes[n].level == Level::Patient)
                     {
                         SelectObject(cd->nmcd.hdc, boldFont);
-                        return CDRF_NEWFONT;
+                        return CDRF_NEWFONT | post;
+                    }
+                    return CDRF_DODEFAULT | post;
+                }
+                if (cd->nmcd.dwDrawStage == CDDS_ITEMPOSTPAINT)
+                {
+                    RECT r;
+                    if (TreeView_GetItemRect(tree, reinterpret_cast<HTREEITEM>(cd->nmcd.dwItemSpec), &r, TRUE))
+                    {
+                        InflateRect(&r, Px(2), 0);
+                        HPEN pen = CreatePen(PS_INSIDEFRAME, Px(2), RGB(0, 0, 0));
+                        HGDIOBJ oldPen = SelectObject(cd->nmcd.hdc, pen);
+                        HGDIOBJ oldBrush = SelectObject(cd->nmcd.hdc, GetStockObject(NULL_BRUSH));
+                        Rectangle(cd->nmcd.hdc, r.left, r.top, r.right, r.bottom);
+                        SelectObject(cd->nmcd.hdc, oldBrush);
+                        SelectObject(cd->nmcd.hdc, oldPen);
+                        DeleteObject(pen);
                     }
                 }
                 return CDRF_DODEFAULT;

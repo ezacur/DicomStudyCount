@@ -161,8 +161,9 @@ tree** opens the whole folder tree with one color per study.
     the right of the full info, the images as planes where they are in the patient, in 3-D. Those of
     the chosen node in red, the rest of its study in gray (the coordinates of the patient are those of
     a study), the images of one position as one plane; when the node is one plane, its image is drawn
-    on it. The mouse over a plane (its outline, or the image drawn on it) marks it in blue, and in the
-    tree the images in it (or, in a closed branch, the node that holds them), and says which they are.
+    on it. The mouse over a plane (its outline, or the image drawn on it) outlines it in black, frames
+    in black in the tree the images in it (or, in a closed branch, the node that holds them), and says
+    which they are.
     A small figure of the patient turns with them (`L` and `R` at its hands); a click on a side
     of it looks from that side (its face: from the front, its head: from above...). Drag to rotate,
     right-drag up and down (or the wheel) to zoom, Shift+drag (or the middle button) to move, double click
