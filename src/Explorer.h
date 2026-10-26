@@ -245,8 +245,7 @@ private:
     void Toggle(int n);
 
     // The plane of a file: where its first pixel is, the directions of its rows and columns, its pixel spacing, its thickness
-    using Geometry = ImagePlane;
-    bool GeometryOf(int f, Geometry& g) const;
+    bool PlaneOfFile(int f, ImagePlane& g) const;
 
     void ShownFile(int i);
 

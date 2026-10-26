@@ -8,10 +8,29 @@ static const char* const SegSopClass = "1.2.840.10008.5.1.4.1.1.66.4";
 
 static const char* const RtStructSopClass = "1.2.840.10008.5.1.4.1.1.481.3";
 
-struct SegFrame
+// The plane of an image: its first pixel and the directions of its rows and columns (mm, of the patient),
+// its pixel spacing, its size, and its thickness (0: not known)
+struct ImagePlane
 {
     double origin[3] = {}, row[3] = {}, column[3] = {}, dx = 1, dy = 1;
-    int columns = 0, rows = 0, segment = 1;
+    int columns = 0, rows = 0;
+    double thickness = 0;
+};
+
+// The plane from its orientation (6 numbers), its position (3), its pixel spacing (between rows, between
+// columns), its size and its thickness; false without a size or a spacing
+bool PlaneFrom(const double* orientation, const double* position, double dy, double dx, int columns, int rows,
+               double thickness, ImagePlane& p);
+
+bool PlaneOf(const Header& h, ImagePlane& p);
+
+// A frame of a file: its own attributes, or else those of its functional groups (enhanced files)
+bool PlaneOf(DcmDataset* ds, int frame, ImagePlane& p);
+
+struct SegFrame
+{
+    ImagePlane plane;
+    int segment = 1;
     bool any = false;                               // (some of the mask is set)
     std::vector<Uint8> mask;                        // 1: in the segment
 };
@@ -35,20 +54,6 @@ struct Segmentation
 };
 
 void LoadSegmentation(Segmentation& o);
-
-
-// The plane of an image: its first pixel and the directions of its rows and columns (mm, of the patient),
-// its pixel spacing, its size, and its thickness (0: not known)
-struct ImagePlane
-{
-    double origin[3] = {}, row[3] = {}, column[3] = {}, dx = 1, dy = 1;
-    int columns = 0, rows = 0;
-    double thickness = 0;
-};
-
-bool PlaneOf(const Header& h, ImagePlane& p);
-
-bool PlaneOf(DcmDataset* ds, int frame, ImagePlane& p);
 
 // Something of a segmentation in the plane: a frame of a SEG with something in it, a contour of a structure set
 bool SegmentsIn(const Segmentation& s, const ImagePlane& p);

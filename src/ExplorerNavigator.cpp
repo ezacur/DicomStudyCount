@@ -15,19 +15,16 @@ void DicomExplorer::MakePlanes()
     std::vector<NavPlane> each;
     for (int f = 0; f < static_cast<int>(files.size()); f++)
     {
-        const Gathered& g = files[f];
-        if (!g.oriented || !g.placed || !g.rows || !g.columns) continue;
-        const std::wstring* s = AttributeOf(f, 0x00280030);
-        double dy = 0, dx = 0;
-        if (!s || swscanf_s(s->c_str(), L"%lf\\%lf", &dy, &dx) != 2 || dy <= 0 || dx <= 0) continue;
-        // From the middle of the first pixel along its row (orientation 1..3) and its column (4..6)
+        ImagePlane a;
+        if (!PlaneOfFile(f, a)) continue;
+        // From the middle of the first pixel along its row and its column
         NavPlane q;
-        const double u[2] = { -0.5, g.columns - 0.5 }, v[2] = { -0.5, g.rows - 0.5 };
+        const double u[2] = { -0.5, a.columns - 0.5 }, v[2] = { -0.5, a.rows - 0.5 };
         std::array<int, 12> key;
         for (int c = 0; c < 4; c++)
             for (int k = 0; k < 3; k++)
             {
-                const double p = g.position[k] + u[c & 1] * dx * g.orientation[k] + v[c >> 1] * dy * g.orientation[3 + k];
+                const double p = a.origin[k] + u[c & 1] * a.dx * a.row[k] + v[c >> 1] * a.dy * a.column[k];
                 q.p[c][k] = static_cast<float>(p);
                 key[c * 3 + k] = static_cast<int>(std::lround(p * 100));
             }
@@ -235,22 +232,17 @@ void DicomExplorer::Toggle(int n)
     if (selected > 0) Navigate(selected);
 }
 
-bool DicomExplorer::GeometryOf(int f, Geometry& g) const
+bool DicomExplorer::PlaneOfFile(int f, ImagePlane& g) const
 {
     if (f < 0 || f >= static_cast<int>(data->files.size())) return false;
     const Gathered& x = data->files[f];
-    if (!x.oriented || !x.placed || !x.rows || !x.columns) return false;
+    if (!x.oriented || !x.placed) return false;
     const std::wstring* s = AttributeOf(f, 0x00280030);
+    const std::wstring* t = AttributeOf(f, 0x00180050);
     double dy = 0, dx = 0;
-    if (!s || swscanf_s(s->c_str(), L"%lf\\%lf", &dy, &dx) != 2 || dy <= 0 || dx <= 0) return false;
-    for (int k = 0; k < 3; k++) { g.origin[k] = x.position[k]; g.row[k] = x.orientation[k]; g.column[k] = x.orientation[3 + k]; }
-    g.dx = dx;
-    g.dy = dy;
-    g.columns = static_cast<int>(x.columns);
-    g.rows = static_cast<int>(x.rows);
-    g.thickness = 0;
-    if (const std::wstring* t = AttributeOf(f, 0x00180050)) g.thickness = _wtof(t->c_str());
-    return true;
+    if (!s || swscanf_s(s->c_str(), L"%lf\\%lf", &dy, &dx) != 2) return false;
+    return PlaneFrom(x.orientation, x.position, dy, dx, static_cast<int>(x.columns), static_cast<int>(x.rows),
+                     t ? _wtof(t->c_str()) : 0, g);
 }
 
 // The file the image panel shows now (the slider moved): the reference lines on it again
@@ -273,8 +265,8 @@ void DicomExplorer::Guides(int n)
 {
     std::vector<std::array<double, 4>> flat;
     std::vector<std::array<float, 6>> lines;
-    Geometry a;
-    if (refLines && n > 0 && n < static_cast<int>(nodes.size()) && GeometryOf(currentFile, a))
+    ImagePlane a;
+    if (refLines && n > 0 && n < static_cast<int>(nodes.size()) && PlaneOfFile(currentFile, a))
     {
         MakePlanes();
         const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
@@ -354,8 +346,8 @@ void DicomExplorer::MarkSegmented()
     for (size_t f = 0; f < data->files.size(); f++)
     {
         if (!OverlayGroupsOf(static_cast<int>(f)).empty()) { withSegments[f] = 1; continue; }
-        Geometry a;
-        if (segmentations.empty() || !GeometryOf(static_cast<int>(f), a)) continue;
+        ImagePlane a;
+        if (segmentations.empty() || !PlaneOfFile(static_cast<int>(f), a)) continue;
         const std::wstring* own = AttributeOf(static_cast<int>(f), 0x00080016);
         if (own && *own == segClass) continue;
         for (const Segmentation& o : segmentations)
@@ -382,9 +374,9 @@ void DicomExplorer::Segments()
     std::vector<DWORD> argb;
     std::vector<SegOutline> flat;
     std::vector<Navigator::Line3> lines;
-    Geometry a;
+    ImagePlane a;
     if (preview) preview->SetSegmentsShown(showSegments);
-    if (showSegments && !segmentations.empty() && GeometryOf(currentFile, a))
+    if (showSegments && !segmentations.empty() && PlaneOfFile(currentFile, a))
     {
         const Gathered& shown = data->files[currentFile];
         const std::wstring* own = AttributeOf(currentFile, 0x00080016);
@@ -414,8 +406,8 @@ void DicomExplorer::Segments()
 // The mouse over the image: the point of the patient there, in the navigator
 void DicomExplorer::Pointed(bool on, double column, double row)
 {
-    Geometry a;
-    if (!on || !GeometryOf(currentFile, a)) { navigator.SetPoint(false); return; }
+    ImagePlane a;
+    if (!on || !PlaneOfFile(currentFile, a)) { navigator.SetPoint(false); return; }
     double p[3];
     for (int k = 0; k < 3; k++) p[k] = a.origin[k] + column * a.dx * a.row[k] + row * a.dy * a.column[k];
     navigator.SetPoint(true, p);
@@ -425,9 +417,9 @@ void DicomExplorer::Pointed(bool on, double column, double row)
 // crosshair there on the image (and the point in the navigator)
 void DicomExplorer::Aimed(bool on, const double* from, const double* toward)
 {
-    Geometry a;
+    ImagePlane a;
     if (!preview) return;
-    if (!on || !GeometryOf(currentFile, a)) { preview->SetCrosshair(false); navigator.SetPoint(false); return; }
+    if (!on || !PlaneOfFile(currentFile, a)) { preview->SetCrosshair(false); navigator.SetPoint(false); return; }
     const double normal[3] = { a.row[1] * a.column[2] - a.row[2] * a.column[1], a.row[2] * a.column[0] - a.row[0] * a.column[2],
                                a.row[0] * a.column[1] - a.row[1] * a.column[0] };
     double along = 0, gap = 0;
