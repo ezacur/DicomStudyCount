@@ -1,0 +1,23 @@
+DCMTK 3.7.1 -- a SUBSET, copied VERBATIM, do not edit (code of others, as it came).
+
+source : https://github.com/DCMTK/dcmtk (the official repository, by OFFIS), tag
+         DCMTK-3.7.1 (annotated tag 18061c05e391d6200948d0f7c3f38187ebb4346f)
+commit : 108acdae424d6999b2e398243938d8c563315ecf  (2026-10-15T11:24:29+02:00)
+         cloned 2026-10-27 with  git clone --depth 1 --branch DCMTK-3.7.1
+         (on Windows, core.autocrlf true: the text files with CRLF, as the
+         3.7.0 copy before it)
+copied : the top-level CMakeLists.txt, CMake/, config/, doxygen/, COPYRIGHT, CREDITS,
+         CHANGES, FAQ, HISTORY (the install step copies them),
+         README, VERSION, ANNOUNCE and the modules ofstd oflog oficonv dcmdata dcmimgle
+         dcmimage dcmjpeg dcmjpls, each COMPLETE (their CMakeLists add apps/ and
+         tests/; oficonv, the conversion of the character sets of DICOM text,
+         added 2026-10-27). Left out: every other module -- dcmapps (the new 'dcmtk' proxy tool),
+         the network, TLS, SR, RT ... -- and docs/ (old announcements).
+licence: BSD-style (COPYRIGHT), with the IJG (libijg*), CharLS (dcmjpls/
+         libcharls) and Citrus Project (oficonv, from the iconv of FreeBSD)
+         notices inside.
+
+Built by tools\Build.ps1 into build\dcmtk-install: DCMTK_MODULES restricted to
+the eight above, DCMTK_DEFAULT_DICT=builtin (no dictionary file at run time),
+static, /MT, with zlib (deflated datasets) and oficonv with its tables built
+in (DCMTK_ENABLE_BUILTIN_OFICONV_DATA: no data files at run time).

@@ -1,0 +1,67 @@
+/*!
+
+\page modern_cxx_support Modern C++ Support in DCMTK
+
+Starting from release 3.7.1, DCMTK requires compilation with C++11 support enabled.
+Later C++ standards can be enabled using the <kbd>CMAKE_CXX_STANDARD</kbd>
+setting. DCMTK's INSTALL file describes the available C++ standard versions that
+are known to work for the given DCMTK version.
+
+<h1> C++11 STL Classes </h1>
+
+While some features like move semantics are automatically enabled in legacy code
+when compiling with C++11 enabled, modern C++ STL classes like std::unique_ptr
+must be used explicitly.
+
+DCMTK comes with some wrapper classes for some of STL features that in
+previous releases were not required to be provided by the compiled.
+Each wrapper class either directly maps to the respective C++ feature
+or otherwise implements a fallback solution that works with a C++98 compiler.
+For example, the following C++11 STL classes are implemented that way:
+
+\li std::unique_ptr (OFunique_ptr in DCMTK)
+\li std::shared_ptr (OFshared_ptr in DCMTK)
+\li std::numeric_limits (OFnumeric_limits in DCMTK)
+\li std::tuple (OFtuple in DCMTK)
+\li std::error_code (OFerror_code in DCMTK)
+
+Enabling the flag <kbd>DCMTK_ENABLE_STL</kbd> will ensure that whenever possible
+(i.e. supported correctly by the compiler) the STL version of a class is
+preferred over the fallback implementation. Starting with DCMTK 3.7.1,
+this is the default.
+
+Explicitly setting the flag <kbd>DCMTK_ENABLE_STL</kbd> to "OFF" will
+enable DCMTK's own, now deprecated, implementations.
+
+There are several other flags in order to fine-tune this behavior:
+
+\li DCMTK_ENABLE_STL_MEMORY: Can be used to enable std::unique_ptr and related
+classes.
+\li DCMTK_ENABLE_STL_MAP: Can be used to enable stl::map.
+\li DCMTK_ENABLE_STL_...: There are further flags for specific STL features.
+They can be easily identified by their prefix.
+
+Per default, those flags are set to "INFERRED", meaning that they take over the
+setting of <kbd>DCMTK_ENABLE_STL</kbd>. However, if you just want to enable or
+disable certain features (i.e. deviate from <kbd>DCMTK_ENABLE_STL</kbd>), you
+can set each of them explicitly to "ON" or "OFF".
+
+<h1>GNU Autoconf</h1>
+
+When using the GNU Autoconf toolchain, there are switches that enable or disable
+STL features, comparable to the CMake configuration described above:
+
+@verbatim
+--enable-stl            use C++ STL (default)
+--disable-stl           do not use C++ STL
+--enable-stl-vector     use C++ STL vector
+--disable-stl-vector    do not use C++ STL vector
+--enable-stl-algorithm  use C++ STL algorithm
+--disable-stl-algorithm do not use C++ STL algorithm
+....
+@endverbatim
+
+Support for setting C++ versions later than C++11 is not yet available in
+DCMTK's Autoconf settings.
+
+*/
