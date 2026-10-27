@@ -6,16 +6,16 @@ Code of others, copied verbatim: do not edit. Only needed to build `bin\DicomShe
 | Folder | What | Used for |
 |---|---|---|
 | `dcmtk-3.7.1` | DCMTK 3.7.1 (OFFIS), a subset of 8 modules: ofstd, oflog, oficonv (character sets, its tables built in), dcmdata, dcmimgle, dcmimage, dcmjpeg (with the IJG JPEG libraries) and dcmjpls (with its own CharLS) | the preview of DICOM files: decoding the pixel data (uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE), rendering it, the names of the header attributes, and its text in any of the character sets of DICOM |
-| `openjpeg-2.5.3` | OpenJPEG 2.5.3 (uclouvain), only its library `openjp2` and the CMake files it needs | decoding JPEG 2000 and High-Throughput JPEG 2000 pixel data, which DCMTK cannot |
+| `openjpeg-2.5.4` | OpenJPEG 2.5.4 (uclouvain), only its library `openjp2` and the CMake files it needs | decoding JPEG 2000 and High-Throughput JPEG 2000 pixel data, which DCMTK cannot |
 | `libjxl-0.12.0` | libjxl 0.12.0 (the JPEG XL project), with the Highway, Brotli and skcms it builds with; only its decoder (`jxl_dec`) is built | decoding JPEG XL pixel data (lossless, recompressed JPEG, lossy), which DCMTK cannot |
 | `zlib-1.3.1` | zlib 1.3.1 (Jean-loup Gailly and Mark Adler), its library and the CMake files it needs | DCMTK reading deflated datasets, and the deflated image frames DicomShell decodes itself |
 
-`openjpeg-2.5.3` comes from the release tarball `https://github.com/uclouvain/openjpeg/archive/refs/tags/v2.5.3.tar.gz`
-(SHA-256 `368fe0468228e767433c9ebdea82ad9d801a3ad1e4234421f352c8b06e7aa707`, downloaded 2026-10-24),
+`openjpeg-2.5.4` comes from the release tarball `https://github.com/uclouvain/openjpeg/archive/refs/tags/v2.5.4.tar.gz`
+(SHA-256 `a695fbe19c0165f295a8531b1e4e855cd94d0875d2f88ec4b61080677e27188a`, downloaded 2026-10-27),
 with only these parts of it, unchanged: the top-level files (`CMakeLists.txt`, `LICENSE`, `*.md`,
 `CTestConfig.cmake`), `cmake\`, `src\CMakeLists.txt`, `src\lib\CMakeLists.txt`, `src\lib\openjp2\` and
 `wrapping\CMakeLists.txt`. Left out: the command-line tools and their libraries (`src\bin`,
-`thirdparty`), JPIP, Java, tests and documentation. Licence: BSD 2-clause (`openjpeg-2.5.3\LICENSE`).
+`thirdparty`), JPIP, Java, tests and documentation. Licence: BSD 2-clause (`openjpeg-2.5.4\LICENSE`).
 
 `zlib-1.3.1` comes from the release tarball `https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz`
 (SHA-256 `9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23`, the published one, downloaded

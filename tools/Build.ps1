@@ -93,13 +93,26 @@ if ($Dcmtk -or ($Cpp -and (-not (Test-Path (Join-Path $dcmtkInstall 'lib\dcmdata
     Write-Host "Built DCMTK into $dcmtkInstall"
 }
 
-# OpenJPEG from third_party\openjpeg-2.5.3, for JPEG 2000: only its library (openjp2), static, /MT
-if ($OpenJpeg -or ($Cpp -and -not (Test-Path (Join-Path $openJpegInstall 'lib\openjp2.lib')))) {
+# OpenJPEG from third_party\openjpeg-*, for JPEG 2000: only its library (openjp2), static, /MT. Built
+# again when the one there is of another version (then from scratch, as DCMTK)
+$openJpegSource = (Get-ChildItem (Join-Path $root 'third_party') -Directory -Filter 'openjpeg-*' | Select-Object -First 1).FullName
+$openJpegVersion = (Split-Path $openJpegSource -Leaf) -replace '^openjpeg-', ''
+$openJpegConfig = Get-ChildItem (Join-Path $openJpegInstall 'include') -Recurse -Filter 'opj_config.h' -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+$openJpegSame = $false
+if ($openJpegConfig) {
+    $v = Get-Content $openJpegConfig.FullName | ForEach-Object { if ($_ -match '#define OPJ_VERSION_(MAJOR|MINOR|BUILD) (\d+)') { $Matches[2] } }
+    $openJpegSame = ($v -join '.') -eq $openJpegVersion
+}
+if ($OpenJpeg -or ($Cpp -and (-not (Test-Path (Join-Path $openJpegInstall 'lib\openjp2.lib')) -or -not $openJpegSame))) {
     $vs = Get-VisualStudio
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     if (-not (Test-Path $cmake)) { $cmake = (Get-Command cmake -ErrorAction Stop).Source }
     $work = Join-Path $root 'build\openjpeg'
-    & $cmake -S (Join-Path $root 'third_party\openjpeg-2.5.3') -B $work -A x64 `
+    if (-not $openJpegSame) {
+        foreach ($old in $work, $openJpegInstall) { if (Test-Path $old) { Remove-Item -LiteralPath $old -Recurse -Force } }
+    }
+    & $cmake -S $openJpegSource -B $work -A x64 `
         -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_CODEC=OFF -DBUILD_TESTING=OFF -DBUILD_DOC=OFF `
         -DCMAKE_POLICY_DEFAULT_CMP0091=NEW '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded' `
         "-DCMAKE_INSTALL_PREFIX=$openJpegInstall"
