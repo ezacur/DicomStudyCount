@@ -256,6 +256,7 @@ IFACEMETHODIMP PreviewHandler::DoPreview()
         view = RenderDicom(data);
     }
     catch (...) { view = Rendered(); view.summary = L"This file cannot be shown"; }
+    frameProblem.clear();
     return CreateWindows();
 }
 
@@ -287,6 +288,7 @@ IFACEMETHODIMP PreviewHandler::Unload()
     folder.clear();
     note.clear();
     view = Rendered();
+    frameProblem.clear();
     return S_OK;
 }
 
@@ -330,6 +332,20 @@ IFACEMETHODIMP PreviewHandler::TranslateAccelerator(MSG* msg)
             return S_OK;
         case 'T':
             SelectTab(tab == TabHeader ? TabTags : TabHeader);
+            return S_OK;
+        }
+    }
+    // In the Lister, the keys not used here go to it (Esc closes it, N and P go to the next and the previous
+    // file, the F keys...): those of the image, and those the header, the columns and the tree do not move
+    // through (arrows, pages, Home, End; the tree opens and chooses with Space and Enter)
+    if (listerWindow && focus && (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN))
+    {
+        const WPARAM k = msg->wParam;
+        const bool moves = (k >= VK_PRIOR && k <= VK_DOWN) || k == VK_SHIFT || k == VK_CONTROL || k == VK_MENU ||
+                           (focus == tree && (k == VK_SPACE || k == VK_RETURN || k == VK_ADD || k == VK_SUBTRACT));
+        if (msg->message == WM_SYSKEYDOWN || focus == wnd || !moves)
+        {
+            PostMessageW(listerWindow, msg->message, msg->wParam, msg->lParam);
             return S_OK;
         }
     }
@@ -492,6 +508,7 @@ void PreviewHandler::ShowPoster(std::vector<PosterFrame> frames, int delay, cons
     poster = std::move(frames);
     posterFrame = 0;
     view = Rendered();
+    frameProblem.clear();
     view.summary = caption;
     PosterPixels();
     slice = -1;
@@ -672,8 +689,9 @@ HRESULT PreviewHandler::CreateWindows()
     Recolor();
     Place();
     ShowContent();
-    // Which columns Explorer shows: after DoPreview has returned, Explorer is not waiting for it
-    if (list) PostMessageW(wnd, WM_READCOLUMNS, 0, 0);
+    // Which columns Explorer shows: after DoPreview has returned, Explorer is not waiting for it (not in
+    // the Lister of Total Commander, which has no columns of Explorer)
+    if (list && !listerWindow) PostMessageW(wnd, WM_READCOLUMNS, 0, 0);
     // The other files of its series, to step through them
     if (!view.pixels.empty() && !path.empty()) scan = StartSeriesScan(path, folder, view.studyUid, wnd, WM_SERIES, WM_SEGMENTS);
     return S_OK;

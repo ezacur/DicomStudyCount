@@ -1,8 +1,10 @@
-// The decoding of DICOM images with DCMTK (and OpenJPEG, deflated and float frames, Philips private CT), the overlay, the DICOMDIR
+// The decoding of DICOM images with DCMTK (and OpenJPEG, libjxl, deflated and float frames, Philips private CT), the overlay, the DICOMDIR
 // (included by Shell.h, after the headers of the parts before it)
 #pragma once
 
 void InitDcmtk();
+
+struct VideoFrames;
 
 // The decoded file of the preview, kept to change its frame, and its window (brightness / contrast)
 // while the mouse drags over it. Monochrome: the window of DCMTK, on the values of the pixels. Color:
@@ -11,6 +13,7 @@ struct Imaging
 {
     std::unique_ptr<DcmFileFormat> file;
     std::unique_ptr<DcmDataset> decoded;           // JPEG 2000, decoded by OpenJPEG
+    std::shared_ptr<VideoFrames> video;            // a video, as far as it is decoded
     std::unique_ptr<DicomImage> image;             // destroyed first: it reads the two above
     E_TransferSyntax xfer = EXS_Unknown;
     bool mono = false;
@@ -42,6 +45,7 @@ struct Rendered
     std::string studyUid, seriesNumber;
     int frames = 1, frame = 0;
     double frameTime = 0;                          // ms from frame to frame (the cine), 0 if not known
+    double aspect = 1;                             // the height of a pixel for its width (PixelSpacing: rows / columns)
     std::wstring corners[3];                       // the overlay: top left, top right, bottom left (lines)
     std::wstring sides[4];                         // the patient directions at the left, top, right, bottom
     std::vector<DirNode> directory;                // a DICOMDIR: its patients
@@ -60,9 +64,23 @@ bool IsJpeg2000(E_TransferSyntax x);
 
 DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame);
 
+bool IsJpegXl(E_TransferSyntax x);
+
+DcmDataset* DecodeJpegXl(DcmDataset* ds, bool multiframe, int frame);
+
 bool IsPmsct(DcmFileFormat& ff);
 
 DcmDataset* DecodePmsct(DcmDataset* ds);
+
+bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<Uint8>& out);
+
+bool UnindexedJpegFrames(DcmDataset* ds, E_TransferSyntax xfer);
+
+DcmDataset* DecodeUnindexedJpegFrame(DcmDataset* ds, E_TransferSyntax xfer, int frame);
+
+DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 allocated);
+
+DcmDataset* DecodeEncapsulatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 

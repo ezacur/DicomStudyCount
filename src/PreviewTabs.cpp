@@ -190,7 +190,8 @@ void PreviewHandler::Reveal(LPARAM p)
 void PreviewHandler::FillColumns()
 {
     SendMessageW(list, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), FALSE);
-    ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    // (the check boxes: which of them Explorer shows; not in the Lister of Total Commander)
+    ListView_SetExtendedListViewStyle(list, (listerWindow ? 0 : LVS_EX_CHECKBOXES) | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     LVCOLUMNW c = {};
     c.mask = LVCF_TEXT | LVCF_WIDTH;
     c.pszText = const_cast<wchar_t*>(L"Column");

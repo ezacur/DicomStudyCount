@@ -22,7 +22,7 @@ Person PersonOf(const std::string& name, const std::string& charset, const std::
 {
     Person p;
     for (char c : birth) if (c >= '0' && c <= '9') p.birth += c;
-    const std::wstring w = Widen(name, charset);
+    const std::wstring w = Widen(name, charset, "\\=^");           // (a name: PN)
     // Decomposed, the accents are marks of their own (not letters), and go
     std::wstring d = w;
     const int n = NormalizeString(NormalizationD, w.c_str(), static_cast<int>(w.size()), nullptr, 0);

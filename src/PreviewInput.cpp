@@ -21,9 +21,13 @@ double PreviewHandler::Scale() const
 {
     if (view.pixels.empty() || view.width <= 0 || view.height <= 0) return 0;
     const double fit = (std::min)(static_cast<double>(imageArea.right - imageArea.left) / view.width,
-                                  static_cast<double>(imageArea.bottom - imageArea.top) / view.height);
+                                  static_cast<double>(imageArea.bottom - imageArea.top) / (view.height * Aspect()));
     return fit > 0 ? fit * zoom : 0;
 }
+
+// The height of a pixel on the screen for its width: as its spacing says (Scale() along the rows, this
+// times it down the columns)
+double PreviewHandler::Aspect() const { return view.aspect > 0 ? view.aspect : 1; }
 
 // The point of the image at the center of the area: inside the image, the middle of it unzoomed
 void PreviewHandler::KeepView()
@@ -50,11 +54,11 @@ void PreviewHandler::SetZoom(POINT pt, double next)
     const double before = Scale();
     if (before <= 0) return;
     const double cx = (imageArea.left + imageArea.right) / 2.0, cy = (imageArea.top + imageArea.bottom) / 2.0;
-    const double px = viewX + (pt.x - cx) / before, py = viewY + (pt.y - cy) / before;
+    const double px = viewX + (pt.x - cx) / before, py = viewY + (pt.y - cy) / (before * Aspect());
     zoom = (std::max)(1.0, (std::min)(64.0, next));
     const double after = Scale();
     viewX = px - (pt.x - cx) / after;
-    viewY = py - (pt.y - cy) / after;
+    viewY = py - (pt.y - cy) / (after * Aspect());
     KeepView();
     InvalidateRect(wnd, &imageArea, FALSE);
     InvalidateRect(wnd, &statusArea, FALSE);
@@ -83,7 +87,7 @@ void PreviewHandler::PanTo(POINT pt)
     const double scale = Scale();
     if (scale <= 0) return;
     viewX = dragViewX - (pt.x - dragFrom.x) / scale;
-    viewY = dragViewY - (pt.y - dragFrom.y) / scale;
+    viewY = dragViewY - (pt.y - dragFrom.y) / (scale * Aspect());
     KeepView();
     InvalidateRect(wnd, &imageArea, FALSE);
 }
@@ -206,9 +210,10 @@ LRESULT CALLBACK PreviewHandler::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             if (scale > 0 && self->poster.empty() && self->slice >= 0 && PtInRect(&self->imageArea, pt))
             {
                 const double left = (self->imageArea.left + self->imageArea.right) / 2.0 - self->viewX * scale;
-                const double top = (self->imageArea.top + self->imageArea.bottom) / 2.0 - self->viewY * scale;
+                const double down = scale * self->Aspect();
+                const double top = (self->imageArea.top + self->imageArea.bottom) / 2.0 - self->viewY * down;
                 column = (pt.x - left) / scale - 0.5;
-                row = (pt.y - top) / scale - 0.5;
+                row = (pt.y - top) / down - 0.5;
                 inside = column >= -0.5 && row >= -0.5 && column < self->view.width - 0.5 && row < self->view.height - 0.5;
             }
             if (inside && !self->pointing)

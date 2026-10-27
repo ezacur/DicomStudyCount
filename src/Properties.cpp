@@ -1,18 +1,46 @@
 // The columns of Explorer: the Explorer4Dicoms.* properties of a DICOM file, read from its header
 #include "Shell.h"
 
-// DICOM text: UTF-8 when the SpecificCharacterSet says ISO_IR 192, otherwise read as Latin-1 (as the
-// script's reader does: one byte, one character)
-std::wstring Widen(const std::string& s, const std::string& charset)
+// DICOM text in its character set (the SpecificCharacterSet: one, or several switched by escape
+// sequences, ISO 2022), by oficonv into UTF-8, one converter for each set in each thread. Plain ASCII
+// as it is; without a set, or with one oficonv does not take, Latin-1 (one byte, one character: what
+// most files without one mean). The delimiters end the escape sequences: values (\), and in a name
+// (PN) its groups and components too (\=^).
+std::wstring Widen(const std::string& s, const std::string& charset, const char* delimiters)
 {
     std::wstring w;
-    if (charset.find("ISO_IR 192") != std::string::npos && !s.empty())
+    const bool ascii = std::all_of(s.begin(), s.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80 && c != 0x1B; });
+    std::string utf8;
+    bool converted = false;
+    if (!ascii && charset.find("ISO_IR 192") != std::string::npos && charset.find('\\') == std::string::npos)
     {
-        int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        utf8 = s;
+        converted = true;
+    }
+    else if (!ascii && !charset.empty())
+    {
+        thread_local std::map<std::string, std::unique_ptr<DcmSpecificCharacterSet>> converters;
+        auto it = converters.find(charset);
+        if (it == converters.end())
+        {
+            std::unique_ptr<DcmSpecificCharacterSet> c(new DcmSpecificCharacterSet());
+            if (c->selectCharacterSet(charset.c_str()).bad()) c.reset();
+            it = converters.emplace(charset, std::move(c)).first;
+        }
+        OFString out;
+        if (it->second && it->second->convertString(OFString(s.data(), s.size()), out, delimiters).good())
+        {
+            utf8.assign(out.c_str(), out.length());
+            converted = true;
+        }
+    }
+    if (converted && !utf8.empty())
+    {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
         if (n > 0)
         {
             w.resize(n);
-            MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+            MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), &w[0], n);
             return w;
         }
     }
@@ -215,10 +243,17 @@ std::wstring ObjectType(const std::string& uid)
         { "1.2.840.10008.5.1.4.1.1.12.2", L"X-Ray Radiofluoroscopic Image" },
         { "1.2.840.10008.5.1.4.1.1.13.1.3", L"Breast Tomosynthesis Image" },
         { "1.2.840.10008.5.1.4.1.1.20", L"NM Image" },
+        { "1.2.840.10008.5.1.4.1.1.30", L"Parametric Map" },
         { "1.2.840.10008.5.1.4.1.1.66", L"Raw Data" },
         { "1.2.840.10008.5.1.4.1.1.66.1", L"Spatial Registration" },
         { "1.2.840.10008.5.1.4.1.1.66.4", L"Segmentation" },
         { "1.2.840.10008.5.1.4.1.1.66.5", L"Surface Segmentation" },
+        { "1.2.840.10008.5.1.4.1.1.77.1.1", L"VL Endoscopic Image" },
+        { "1.2.840.10008.5.1.4.1.1.77.1.1.1", L"Video Endoscopic Image" },
+        { "1.2.840.10008.5.1.4.1.1.77.1.2", L"VL Microscopic Image" },
+        { "1.2.840.10008.5.1.4.1.1.77.1.2.1", L"Video Microscopic Image" },
+        { "1.2.840.10008.5.1.4.1.1.77.1.4", L"VL Photographic Image" },
+        { "1.2.840.10008.5.1.4.1.1.77.1.4.1", L"Video Photographic Image" },
         { "1.2.840.10008.5.1.4.1.1.77.1.6", L"Whole Slide Microscopy Image" },
         { "1.2.840.10008.5.1.4.1.1.88.11", L"Basic Text SR" },
         { "1.2.840.10008.5.1.4.1.1.88.22", L"Enhanced SR" },
@@ -247,9 +282,12 @@ std::wstring Compression(const std::string& ts)
         { "1.2.840.10008.1.2.1", L"none" },                     // Explicit VR Little Endian
         { "1.2.840.10008.1.2.2", L"none" },                     // Explicit VR Big Endian
         { "1.2.840.10008.1.2.1.99", L"Deflate" },
+        { "1.2.840.10008.1.2.1.98", L"none (encapsulated)" },
         { "1.2.840.10008.1.2.5", L"RLE" },
         { "1.2.840.10008.1.2.4.50", L"JPEG baseline" },
         { "1.2.840.10008.1.2.4.51", L"JPEG extended" },
+        { "1.2.840.10008.1.2.4.53", L"JPEG extended (retired)" },
+        { "1.2.840.10008.1.2.4.55", L"JPEG extended (retired)" },
         { "1.2.840.10008.1.2.4.57", L"JPEG lossless" },
         { "1.2.840.10008.1.2.4.70", L"JPEG lossless" },
         { "1.2.840.10008.1.2.4.80", L"JPEG-LS lossless" },
@@ -259,12 +297,19 @@ std::wstring Compression(const std::string& ts)
         { "1.2.840.10008.1.2.4.92", L"JPEG 2000 multi-component lossless" },
         { "1.2.840.10008.1.2.4.93", L"JPEG 2000 multi-component" },
         { "1.2.840.10008.1.2.4.100", L"MPEG-2" },
+        { "1.2.840.10008.1.2.4.100.1", L"MPEG-2 (fragmentable)" },
         { "1.2.840.10008.1.2.4.101", L"MPEG-2" },
+        { "1.2.840.10008.1.2.4.101.1", L"MPEG-2 (fragmentable)" },
         { "1.2.840.10008.1.2.4.102", L"MPEG-4" },
+        { "1.2.840.10008.1.2.4.102.1", L"MPEG-4 (fragmentable)" },
         { "1.2.840.10008.1.2.4.103", L"MPEG-4" },
+        { "1.2.840.10008.1.2.4.103.1", L"MPEG-4 (fragmentable)" },
         { "1.2.840.10008.1.2.4.104", L"MPEG-4" },
+        { "1.2.840.10008.1.2.4.104.1", L"MPEG-4 (fragmentable)" },
         { "1.2.840.10008.1.2.4.105", L"MPEG-4" },
+        { "1.2.840.10008.1.2.4.105.1", L"MPEG-4 (fragmentable)" },
         { "1.2.840.10008.1.2.4.106", L"MPEG-4" },
+        { "1.2.840.10008.1.2.4.106.1", L"MPEG-4 (fragmentable)" },
         { "1.2.840.10008.1.2.4.107", L"HEVC" },
         { "1.2.840.10008.1.2.4.108", L"HEVC" },
         { "1.2.840.10008.1.2.4.201", L"HTJ2K lossless" },

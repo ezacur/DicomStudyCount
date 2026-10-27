@@ -1,4 +1,4 @@
-// The decoding of DICOM images with DCMTK (and OpenJPEG, deflated and float frames, Philips private CT), the overlay, the DICOMDIR
+// The decoding of DICOM images with DCMTK (and OpenJPEG, libjxl, deflated and float frames, Philips private CT), the overlay, the DICOMDIR
 #include "Shell.h"
 
 // ---------------------------------------------------------------------------------------------
@@ -7,7 +7,7 @@
 // mouse. It runs in prevhost.exe, a process of its own (a crash there never takes Explorer down), at
 // medium integrity (DisableLowILProcessIsolation), to reach the Explorer window for its columns.
 // DCMTK reads the file from memory, decodes the pixels (uncompressed, JPEG baseline / extended /
-// lossless, JPEG-LS, RLE; JPEG 2000 with OpenJPEG) and renders them with the window of the header.
+// lossless, JPEG-LS, RLE; JPEG 2000 with OpenJPEG, JPEG XL with libjxl) and renders them with the window of the header.
 
 void InitDcmtk()
 {
@@ -64,7 +64,7 @@ std::wstring ValueOf(DcmElement* e, const std::string& charset)
     if ((binary && length > 64) || length > 4096) return L"(" + std::to_wstring(length) + L" bytes)";
     OFString v;
     if (e->getOFStringArray(v).bad()) return L"(not readable)";
-    std::wstring w = Widen(std::string(v.c_str(), v.length()), charset);
+    std::wstring w = Widen(std::string(v.c_str(), v.length()), charset, vr == EVR_PN ? "\\=^" : "\\");
     for (auto& c : w) if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
     if (w.size() > 200) w = w.substr(0, 200) + L"...";
     return L"[" + w + L"]";
@@ -110,7 +110,8 @@ static void Dump(DcmItem* item, const std::string& charset, int depth, std::wstr
 void DumpHeader(DcmFileFormat& ff, std::wstring& tags, std::wstring& names)
 {
     OFString charset;
-    ff.getDataset()->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    // (all its values: "\ISO 2022 IR 87" begins with an empty one)
+    ff.getDataset()->findAndGetOFStringArray(DCM_SpecificCharacterSet, charset);
     const std::wstring meta = L"# File meta information\r\n", dataset = L"\r\n# Dataset\r\n";
     tags = meta;
     names = meta;
@@ -151,7 +152,7 @@ static std::wstring Direction(double x, double y, double z)
 static void Annotate(Rendered& r, DcmDataset* ds)
 {
     OFString cs;
-    ds->findAndGetOFString(DCM_SpecificCharacterSet, cs);
+    ds->findAndGetOFStringArray(DCM_SpecificCharacterSet, cs);
     const std::string charset = cs.c_str();
     auto get = [&](const DcmTagKey& key, bool deep = false) {
         OFString v;
@@ -323,18 +324,21 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
             out->findAndDeleteElement(DCM_PixelData);
             const size_t n = static_cast<size_t>(w) * h;
             const bool bytes = prec <= 8 && !sgnd;
+            // The values within their range: lossy ones near its ends come out beyond them (65536 is no 0)
+            const OPJ_INT32 lo = sgnd ? -(1 << (prec - 1)) : 0, hi = sgnd ? (1 << (prec - 1)) - 1 : (1 << prec) - 1;
+            auto value = [&](OPJ_UINT32 k, size_t i) { const OPJ_INT32 x = c[k].data[i]; return x < lo ? lo : x > hi ? hi : x; };
             if (bytes)
             {
                 std::vector<Uint8> v(n * samples);
                 for (size_t i = 0; i < n; i++)
-                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint8>(c[k].data[i]);
+                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint8>(value(k, i));
                 out->putAndInsertUint8Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
             }
             else
             {
                 std::vector<Uint16> v(n * samples);
                 for (size_t i = 0; i < n; i++)
-                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint16>(c[k].data[i]);
+                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint16>(value(k, i));
                 out->putAndInsertUint16Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
             }
             out->putAndInsertUint16(DCM_SamplesPerPixel, static_cast<Uint16>(samples));
@@ -361,6 +365,85 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
         }
     }
     if (image) opj_image_destroy(image);
+    return out;
+}
+
+// JPEG XL (lossless; a JPEG recompressed; lossy): DCMTK has no decoder for it, libjxl decodes it
+bool IsJpegXl(E_TransferSyntax x)
+{
+    return x == EXS_JPEGXLLossless || x == EXS_JPEGXLJPEGRecompression || x == EXS_JPEGXL;
+}
+
+// One frame (its fragments: a codestream, or one in its container) as a copy of the dataset with it as
+// native pixels: gray, or three samples (a lossy one comes out of its XYB as they went in, a recompressed
+// JPEG out of its YCbCr in RGB), 8 or 16 bits. Null if it cannot (floating point samples too).
+DcmDataset* DecodeJpegXl(DcmDataset* ds, bool multiframe, int frame)
+{
+    std::vector<Uint8> code;
+    if (!FrameBytes(ds, multiframe, frame, code)) return nullptr;
+    std::unique_ptr<JxlDecoder, decltype(&JxlDecoderDestroy)> decoder(JxlDecoderCreate(nullptr), JxlDecoderDestroy);
+    JxlDecoder* d = decoder.get();
+    if (!d || JxlDecoderSubscribeEvents(d, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS) return nullptr;
+    JxlDecoderSetKeepOrientation(d, JXL_TRUE);      // (the pixels as the header describes them)
+    if (JxlDecoderSetInput(d, code.data(), code.size()) != JXL_DEC_SUCCESS) return nullptr;
+    JxlDecoderCloseInput(d);
+    JxlBasicInfo info = {};
+    JxlPixelFormat format = {};
+    std::vector<Uint8> pixels;
+    for (bool done = false; !done; )
+    {
+        switch (JxlDecoderProcessInput(d))
+        {
+        case JXL_DEC_BASIC_INFO:
+            if (JxlDecoderGetBasicInfo(d, &info) != JXL_DEC_SUCCESS || info.exponent_bits_per_sample > 0 ||
+                info.bits_per_sample < 1 || info.bits_per_sample > 16 || info.xsize < 1 || info.ysize < 1 ||
+                info.xsize > 65535 || info.ysize > 65535)
+                return nullptr;
+            format = { info.num_color_channels >= 3 ? 3u : 1u, info.bits_per_sample <= 8 ? JXL_TYPE_UINT8 : JXL_TYPE_UINT16,
+                       JXL_LITTLE_ENDIAN, 0 };
+            break;
+        case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
+        {
+            size_t size = 0;
+            if (JxlDecoderImageOutBufferSize(d, &format, &size) != JXL_DEC_SUCCESS) return nullptr;
+            pixels.resize(size);
+            if (JxlDecoderSetImageOutBuffer(d, &format, pixels.data(), size) != JXL_DEC_SUCCESS) return nullptr;
+            break;
+        }
+        case JXL_DEC_FULL_IMAGE: done = true; break;
+        default: return nullptr;                    // an error, or the codestream ends without an image
+        }
+    }
+    const Uint16 samples = static_cast<Uint16>(format.num_channels), bits = static_cast<Uint16>(info.bits_per_sample);
+    const Uint16 allocated = format.data_type == JXL_TYPE_UINT8 ? 8 : 16;
+    DcmDataset* out = NativeCopy(ds, pixels, allocated);
+    out->putAndInsertUint16(DCM_SamplesPerPixel, samples);
+    out->putAndInsertUint16(DCM_Rows, static_cast<Uint16>(info.ysize));
+    out->putAndInsertUint16(DCM_Columns, static_cast<Uint16>(info.xsize));
+    out->putAndInsertUint16(DCM_BitsAllocated, allocated);
+    // The bits of the header, when they fit (a signed one keeps its sign there); else those of the codestream
+    Uint16 stored = 0;
+    if (ds->findAndGetUint16(DCM_BitsStored, stored).bad() || stored < 1 || stored > bits) stored = bits;
+    out->putAndInsertUint16(DCM_BitsStored, stored);
+    out->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(stored - 1));
+    if (samples == 3)
+    {
+        // Its samples as they were given, but for a recompressed JPEG (libjxl turns its YCbCr into RGB):
+        // YBR_FULL stays so, the rest is RGB
+        OFString photometric;
+        ds->findAndGetOFString(DCM_PhotometricInterpretation, photometric);
+        const bool ybr = photometric.substr(0, 8) == "YBR_FULL" && ds->getOriginalXfer() != EXS_JPEGXLJPEGRecompression;
+        out->putAndInsertString(DCM_PhotometricInterpretation, ybr ? "YBR_FULL" : "RGB");
+        out->putAndInsertUint16(DCM_PlanarConfiguration, 0);
+        out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+    }
+    else
+    {
+        OFString photometric;
+        out->findAndGetOFString(DCM_PhotometricInterpretation, photometric);
+        if (photometric != "MONOCHROME1") out->putAndInsertString(DCM_PhotometricInterpretation, "MONOCHROME2");
+        out->findAndDeleteElement(DCM_PlanarConfiguration);
+    }
     return out;
 }
 
@@ -437,9 +520,61 @@ DcmDataset* DecodePmsct(DcmDataset* ds)
     return copy;
 }
 
+// Whether a fragment starts a codestream: JPEG and JPEG-LS (their SOI, FF D8), JPEG 2000 (SOC, FF 4F, or
+// a JP2 signature box), JPEG XL (FF 0A, or its container)
+static bool StartsCodestream(const Uint8* b, Uint32 n)
+{
+    if (n >= 2 && b[0] == 0xFF && (b[1] == 0xD8 || b[1] == 0x4F || b[1] == 0x0A)) return true;
+    return n >= 8 && b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0x0C &&
+           ((b[4] == 'j' && b[5] == 'P') || (b[4] == 'J' && b[5] == 'X' && b[6] == 'L'));
+}
+
+// Frames of JPEG or JPEG-LS data in more fragments than frames, without an offset table: DCMTK cannot tell
+// where each starts (it decodes the first one only)
+bool UnindexedJpegFrames(DcmDataset* ds, E_TransferSyntax xfer)
+{
+    DcmXfer x(xfer);
+    if (x.getJPEGProcess8Bit() == 0 && xfer != EXS_JPEGLSLossless && xfer != EXS_JPEGLSLossy) return false;
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 2) return false;
+    DcmElement* element = nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return false;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    DcmPixelItem* table = nullptr;
+    if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq || seq->getItem(table, 0).bad() || !table) return false;
+    return table->getLength() == 0 && static_cast<long>(seq->card()) - 1 > frames;
+}
+
+// One of those frames: its fragments as the one fragment of a copy of the dataset with that frame only,
+// which DCMTK decodes then. Null if it cannot.
+DcmDataset* DecodeUnindexedJpegFrame(DcmDataset* ds, E_TransferSyntax xfer, int frame)
+{
+    std::vector<Uint8> code;
+    if (!FrameBytes(ds, true, frame, code)) return nullptr;
+    if (code.size() % 2) code.push_back(0);         // (items are even)
+    std::unique_ptr<DcmDataset> out(new DcmDataset(*ds));
+    out->findAndDeleteElement(DCM_PixelData);
+    out->findAndDeleteElement(DCM_NumberOfFrames);
+    auto sequence = new DcmPixelSequence(DCM_PixelSequenceTag);
+    sequence->insert(new DcmPixelItem(DCM_PixelItemTag));                    // (an empty offset table)
+    auto item = new DcmPixelItem(DCM_PixelItemTag);
+    item->putUint8Array(code.data(), static_cast<unsigned long>(code.size()));
+    sequence->insert(item);
+    auto pixels = new DcmPixelData(DCM_PixelData);
+    pixels->putOriginalRepresentation(xfer, nullptr, sequence);
+    out->insert(pixels, true);
+    if (out->chooseRepresentation(EXS_LittleEndianExplicit, nullptr).bad() || !out->canWriteXfer(EXS_LittleEndianExplicit)) return nullptr;
+    return out.release();
+}
+
 // The fragments of one frame of encapsulated pixel data (item 0 is the offset table): all of them for
-// a single frame; for more, one fragment a frame when there are as many, or else the offset table
-static bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<Uint8>& out)
+// a single frame; for more, one fragment a frame when there are as many, or else the offset table, or
+// else where each codestream starts
+bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<Uint8>& out)
 {
     out.clear();
     DcmElement* element = nullptr;
@@ -466,11 +601,24 @@ static bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<U
         return !out.empty();
     }
     if (static_cast<long>(fragments) == frames) return append(static_cast<unsigned long>(frame) + 1);
-    // The offset table: where each frame starts, counted from the first fragment (8 bytes of header each)
+    // The offset table: where each frame starts, counted from the first fragment (8 bytes of header each).
+    // Without one, a frame starts at each fragment that starts a codestream.
     DcmPixelItem* table = nullptr;
     Uint8* offsets = nullptr;
     if (seq->getItem(table, 0).bad() || !table || table->getLength() < static_cast<Uint32>(4 * frames) || table->getUint8Array(offsets).bad() || !offsets)
-        return false;
+    {
+        int at = -1;
+        for (unsigned long i = 1; i <= fragments; i++)
+        {
+            DcmPixelItem* item = nullptr;
+            Uint8* bytes = nullptr;
+            if (seq->getItem(item, i).bad() || !item || item->getUint8Array(bytes).bad() || !bytes) return false;
+            if (at < 0 || StartsCodestream(bytes, item->getLength())) at++;
+            if (at > frame) break;
+            if (at == frame && !append(i)) return false;
+        }
+        return at >= frame && !out.empty();
+    }
     auto at = [&](int k) { Uint32 v; memcpy(&v, offsets + 4 * k, 4); return v; };
     const Uint32 from = at(frame), to = frame + 1 < frames ? at(frame + 1) : 0xFFFFFFFF;
     Uint32 position = 0;
@@ -486,7 +634,7 @@ static bool FrameBytes(DcmDataset* ds, bool multiframe, int frame, std::vector<U
 
 // A copy of a dataset with one frame as native pixel data (Explicit VR Little Endian), as the decoders
 // below give it to DicomImage: 8 or 16 bits as stored, no other frames
-static DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 allocated)
+DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 allocated)
 {
     auto out = new DcmDataset(*ds);
     out->findAndDeleteElement(DCM_PixelData);
@@ -501,6 +649,36 @@ static DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, U
     }
     out->findAndDeleteElement(DCM_NumberOfFrames);
     return out;
+}
+
+// 1-bit pixels, one a byte (0 or 255), as a copy of the dataset with them as 8 bits
+static DcmDataset* AsBytes(DcmDataset* ds, const std::vector<Uint8>& wide)
+{
+    DcmDataset* out = NativeCopy(ds, wide, 8);
+    out->putAndInsertUint16(DCM_BitsAllocated, 8);
+    out->putAndInsertUint16(DCM_BitsStored, 8);
+    out->putAndInsertUint16(DCM_HighBit, 7);
+    out->putAndInsertUint16(DCM_PixelRepresentation, 0);
+    return out;
+}
+
+// The same from n bits from the bit `first` (from the lowest bit of each byte, as DICOM packs them)
+static DcmDataset* BitsAsBytes(DcmDataset* ds, const Uint8* bits, size_t first, size_t n)
+{
+    std::vector<Uint8> wide(n);
+    for (size_t i = 0; i < n; i++) wide[i] = (bits[(first + i) / 8] >> ((first + i) % 8)) & 1 ? 255 : 0;
+    return AsBytes(ds, wide);
+}
+
+// Encapsulated uncompressed (1.2.840.10008.1.2.1.98): each frame as it is, in fragments of its own,
+// which DCMTK reads the name of but renders not. Null if it cannot.
+DcmDataset* DecodeEncapsulatedFrame(DcmDataset* ds, bool multiframe, int frame)
+{
+    std::vector<Uint8> bytes;
+    Uint16 allocated = 0;
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    if (!FrameBytes(ds, multiframe, frame, bytes) || (allocated != 8 && allocated != 16)) return nullptr;
+    return NativeCopy(ds, bytes, allocated);
 }
 
 // Deflated image frames (1.2.840.10008.1.2.8.1): each frame compressed by deflate (raw, or with a zlib
@@ -535,28 +713,57 @@ DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame)
         if (ok) break;
     }
     if (!ok) return nullptr;
-    if (allocated == 1)
-    {
-        // (bits from the lowest one of each byte, as DICOM packs them)
-        std::vector<Uint8> wide(n);
-        for (size_t i = 0; i < n; i++) wide[i] = (plain[i / 8] >> (i % 8)) & 1 ? 255 : 0;
-        DcmDataset* out = NativeCopy(ds, wide, 8);
-        out->putAndInsertUint16(DCM_BitsAllocated, 8);
-        out->putAndInsertUint16(DCM_BitsStored, 8);
-        out->putAndInsertUint16(DCM_HighBit, 7);
-        out->putAndInsertUint16(DCM_PixelRepresentation, 0);
-        return out;
-    }
+    if (allocated == 1) return BitsAsBytes(ds, plain.data(), 0, n);
     return NativeCopy(ds, plain, allocated);
 }
 
-// 1-bit pixels as they are (segmentations): a frame need not start at a byte, and DCMTK reads only the
-// frames that do. Its bits, from the lowest one of each byte, as 8 bits (0 or 255).
+// 1-bit pixels (segmentations), as they are or in RLE, which DCMTK has no decoder for at 1 bit: as they
+// are, a frame need not start at a byte, and DCMTK reads only the frames that do. Its bits, from the
+// lowest one of each byte, as 8 bits (0 or 255).
 bool IsBitFrames(DcmDataset* ds, E_TransferSyntax xfer)
 {
     Uint16 allocated = 0;
     ds->findAndGetUint16(DCM_BitsAllocated, allocated);
-    return allocated == 1 && !DcmXfer(xfer).isEncapsulated() && ds->tagExists(DCM_PixelData);
+    return allocated == 1 && (!DcmXfer(xfer).isEncapsulated() || xfer == EXS_RLELossless) && ds->tagExists(DCM_PixelData);
+}
+
+// One RLE segment (PS3.5 G.3.1, PackBits): a byte n, then n + 1 bytes as they are (n < 128), or the
+// next byte 257 - n times (n > 128); 128 is nothing. At most `most` bytes; a run cut short at the end
+// stops it (as the byte that pads a segment to an even length, which reads as one more run)
+static void UnpackBits(const Uint8* in, size_t length, std::vector<Uint8>& out, size_t most)
+{
+    out.clear();
+    for (size_t i = 0; i < length && out.size() < most; )
+    {
+        const Uint8 n = in[i++];
+        if (n < 128)
+        {
+            if (i + n + 1 > length) return;
+            out.insert(out.end(), in + i, in + i + n + 1);
+            i += n + 1;
+        }
+        else if (n > 128)
+        {
+            if (i >= length) return;
+            out.insert(out.end(), static_cast<size_t>(257 - n), in[i++]);
+        }
+    }
+}
+
+// One 1-bit RLE frame: a header of 16 numbers (how many segments, where each starts) and its one segment,
+// with the pixels packed in bits, or one a byte (as pydicom writes them)
+static bool RleBits(DcmDataset* ds, int frame, size_t n, std::vector<Uint8>& bits)
+{
+    Sint32 frames = 1;
+    if (ds->findAndGetSint32(DCM_NumberOfFrames, frames).bad() || frames < 1) frames = 1;
+    std::vector<Uint8> rle;
+    if (!FrameBytes(ds, frames > 1, frame, rle) || rle.size() < 64) return false;
+    Uint32 header[16];
+    memcpy(header, rle.data(), sizeof(header));
+    if (header[0] < 1 || header[0] > 15 || header[1] < 64 || header[1] >= rle.size()) return false;
+    const size_t end = header[0] > 1 && header[2] > header[1] && header[2] <= rle.size() ? header[2] : rle.size();
+    UnpackBits(rle.data() + header[1], end - header[1], bits, n);
+    return bits.size() >= (n + 7) / 8;
 }
 
 DcmDataset* DecodeBitFrame(DcmDataset* ds, int frame)
@@ -565,8 +772,17 @@ DcmDataset* DecodeBitFrame(DcmDataset* ds, int frame)
     ds->findAndGetUint16(DCM_Rows, rows);
     ds->findAndGetUint16(DCM_Columns, columns);
     const size_t n = static_cast<size_t>(rows) * columns, first = static_cast<size_t>(frame) * n;
+    if (n == 0) return nullptr;
+    if (ds->getOriginalXfer() == EXS_RLELossless)
+    {
+        std::vector<Uint8> bits;
+        if (!RleBits(ds, frame, n, bits)) return nullptr;
+        if (bits.size() < n) return BitsAsBytes(ds, bits.data(), 0, n);
+        for (auto& b : bits) b = b ? 255 : 0;
+        return AsBytes(ds, bits);
+    }
     DcmElement* e = nullptr;
-    if (n == 0 || ds->findAndGetElement(DCM_PixelData, e).bad() || !e) return nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, e).bad() || !e) return nullptr;
     Uint8* bytes = nullptr;
     Uint16* words = nullptr;                        // (OW: the same bytes, little endian)
     if (e->getUint8Array(bytes).bad() || !bytes)
@@ -576,14 +792,7 @@ DcmDataset* DecodeBitFrame(DcmDataset* ds, int frame)
     }
     const unsigned long count = e->getLength();
     if ((first + n + 7) / 8 > count) return nullptr;
-    std::vector<Uint8> wide(n);
-    for (size_t i = 0; i < n; i++) wide[i] = (bytes[(first + i) / 8] >> ((first + i) % 8)) & 1 ? 255 : 0;
-    DcmDataset* out = NativeCopy(ds, wide, 8);
-    out->putAndInsertUint16(DCM_BitsAllocated, 8);
-    out->putAndInsertUint16(DCM_BitsStored, 8);
-    out->putAndInsertUint16(DCM_HighBit, 7);
-    out->putAndInsertUint16(DCM_PixelRepresentation, 0);
-    return out;
+    return BitsAsBytes(ds, bytes, first, n);
 }
 
 // Float pixel data (Parametric Maps: T1, T2, ADC... as decimal numbers, 7FE0,0008 or 7FE0,0009): the
@@ -754,7 +963,7 @@ static std::vector<DirNode> ReadDirectory(DcmDataset* ds)
     Uint32 first = 0;
     ds->findAndGetUint32(DCM_OffsetOfTheFirstDirectoryRecordOfTheRootDirectoryEntity, first);
     OFString charset;
-    ds->findAndGetOFString(DCM_SpecificCharacterSet, charset);
+    ds->findAndGetOFStringArray(DCM_SpecificCharacterSet, charset);
     std::unordered_set<Uint32> seen;
     ReadRecords(records, first, charset.c_str(), roots, 0, seen);
     return roots;
@@ -812,10 +1021,32 @@ std::wstring ShowFrame(Rendered& r, int frame, bool keep)
         decoded.reset(DecodeJpeg2000(ff.getDataset(), r.frames > 1, frame));
         if (!decoded) return L"its JPEG 2000 data could not be decoded";
     }
+    else if (UnindexedJpegFrames(ff.getDataset(), im->xfer))
+    {
+        decoded.reset(DecodeUnindexedJpegFrame(ff.getDataset(), im->xfer, frame));
+        if (!decoded) return L"its frame could not be found among its fragments, or decoded";
+    }
+    else if (IsJpegXl(im->xfer))
+    {
+        decoded.reset(DecodeJpegXl(ff.getDataset(), r.frames > 1, frame));
+        if (!decoded) return L"its JPEG XL data could not be decoded";
+    }
+    else if (IsVideo(im->xfer))
+    {
+        std::wstring why;
+        if (!im->video) im->video = OpenVideo(ff.getDataset(), why);
+        if (im->video) decoded.reset(DecodeVideoFrame(*im->video, ff.getDataset(), frame, why));
+        if (!decoded) return why;
+    }
     else if (IsPmsct(ff))
     {
         decoded.reset(DecodePmsct(ff.getDataset()));
         if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
+    }
+    else if (im->xfer == EXS_EncapsulatedUncompressedLittleEndianExplicit)
+    {
+        decoded.reset(DecodeEncapsulatedFrame(ff.getDataset(), r.frames > 1, frame));
+        if (!decoded) return L"its encapsulated frames could not be read";
     }
     else if (IsBitFrames(ff.getDataset(), im->xfer))
     {
@@ -902,6 +1133,25 @@ std::wstring ShowFrame(Rendered& r, int frame, bool keep)
     return std::wstring();
 }
 
+// The height of a pixel for its width, as the image is to be seen: its PixelSpacing (the rows apart, the
+// columns apart; in the functional groups of an enhanced file too), or else the ImagerPixelSpacing of a
+// projection, or else its PixelAspectRatio (vertical, horizontal: video, ultrasound); 1 if none says
+static double PixelAspect(DcmDataset* ds)
+{
+    for (const DcmTagKey& key : { DCM_PixelSpacing, DCM_ImagerPixelSpacing, DCM_PixelAspectRatio })
+    {
+        OFString v;
+        double two[2] = {};
+        if (ds->findAndGetOFStringArray(key, v, true).good() && Numbers(std::string(v.c_str(), v.length()), two, 2) &&
+            two[0] > 0 && two[1] > 0)
+        {
+            const double a = two[0] / two[1];
+            return a < 1.0 / 16 || a > 16 || std::fabs(a - 1) < 1e-3 ? 1 : a;
+        }
+    }
+    return 1;
+}
+
 Rendered RenderDicom(const std::vector<char>& data, Render what)
 {
     Rendered r;
@@ -939,6 +1189,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     if (ds->findAndGetFloat64(DCM_FrameTime, r.frameTime).bad() || !(r.frameTime > 0)) r.frameTime = 0;
     if (r.frameTime == 0 && ds->findAndGetFloat64(DCM_RecommendedDisplayFrameRate, rate).good() && rate > 0) r.frameTime = 1000 / rate;
     if (r.frameTime == 0 && ds->findAndGetFloat64(DCM_CineRate, rate).good() && rate > 0) r.frameTime = 1000 / rate;
+    r.aspect = PixelAspect(ds);
 
     OFString studyUid, seriesNumber;
     ds->findAndGetOFString(DCM_StudyInstanceUID, studyUid);
@@ -965,6 +1216,14 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     {
         // Only the frame shown is decoded: a multi-frame file can be large
         const std::wstring why = ShowFrame(r, 0, false);
+        // A video: how many frames, and their time, from the video when the header does not say
+        if (im->video)
+        {
+            double time = 0;
+            const int count = VideoFrameCount(*im->video, time);
+            if (!ds->tagExists(DCM_NumberOfFrames) && count > 1) r.frames = frames = count;
+            if (r.frameTime == 0 && time > 0) r.frameTime = time;
+        }
         if (why.empty())
         {
             r.summary += L"  -  " + std::to_wstring(r.width) + L" x " + std::to_wstring(r.height);

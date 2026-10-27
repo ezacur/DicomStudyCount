@@ -47,10 +47,32 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
         decoded.reset(DecodeJpeg2000(ds, frames > 1, frame));
         if (!decoded) return L"its JPEG 2000 data could not be decoded";
     }
+    else if (UnindexedJpegFrames(ds, xfer))
+    {
+        decoded.reset(DecodeUnindexedJpegFrame(ds, xfer, frame));
+        if (!decoded) return L"its frame could not be found among its fragments, or decoded";
+    }
+    else if (IsJpegXl(xfer))
+    {
+        decoded.reset(DecodeJpegXl(ds, frames > 1, frame));
+        if (!decoded) return L"its JPEG XL data could not be decoded";
+    }
+    else if (IsVideo(xfer))
+    {
+        std::wstring why;
+        std::shared_ptr<VideoFrames> video = VideoOfFile(path, ds, why);
+        if (video) decoded.reset(DecodeVideoFrame(*video, ds, frame, why));
+        if (!decoded) return why;
+    }
     else if (IsPmsct(ff))
     {
         decoded.reset(DecodePmsct(ds));
         if (!decoded) return L"its PMSCT_RLE1 data could not be decoded";
+    }
+    else if (xfer == EXS_EncapsulatedUncompressedLittleEndianExplicit)
+    {
+        decoded.reset(DecodeEncapsulatedFrame(ds, frames > 1, frame));
+        if (!decoded) return L"its encapsulated frames could not be read";
     }
     else if (IsBitFrames(ds, xfer))
     {

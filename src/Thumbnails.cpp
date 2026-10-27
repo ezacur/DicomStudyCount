@@ -55,9 +55,11 @@ IFACEMETHODIMP ThumbnailProvider::GetThumbnail(UINT cx, HBITMAP* bitmap, WTS_ALP
         if (FAILED(hr)) return hr;
         Rendered r = RenderDicom(data, Render::Thumbnail);
         if (r.pixels.empty()) return E_FAIL;
+        // (its height as its pixels are high: their spacing)
+        const double high = r.height * (r.aspect > 0 ? r.aspect : 1);
         int w = static_cast<int>(cx), h = static_cast<int>(cx);
-        if (r.width >= r.height) h = static_cast<int>(static_cast<long long>(cx) * r.height / r.width);
-        else w = static_cast<int>(static_cast<long long>(cx) * r.width / r.height);
+        if (r.width >= high) h = static_cast<int>(std::lround(cx * high / r.width));
+        else w = static_cast<int>(std::lround(cx * r.width / high));
         if (w < 1) w = 1;
         if (h < 1) h = 1;
 

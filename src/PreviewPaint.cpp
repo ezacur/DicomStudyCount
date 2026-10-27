@@ -67,12 +67,14 @@ void PreviewHandler::Paint(HDC dc)
         tabRects[t] = {};
         if ((t == TabDirectory && !tree) || hosted) continue;
         SelectObject(dc, t == tab && boldFont ? boldFont : uiFont);
+        // (in the Lister of Total Commander the columns are no columns of its: the values of the file)
+        const wchar_t* label = t == TabColumns && listerWindow ? L"Info" : labels[t];
         SIZE ext = {};
-        GetTextExtentPoint32W(dc, labels[t], static_cast<int>(wcslen(labels[t])), &ext);
+        GetTextExtentPoint32W(dc, label, static_cast<int>(wcslen(label)), &ext);
         tabRects[t] = { x, 0, x + ext.cx + Px(16), tabArea.bottom };
         ::SetTextColor(dc, t == tab ? textColor : Dim(60));
         RECT r = tabRects[t];
-        DrawTextW(dc, labels[t], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(dc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         if (t == tab)
         {
             RECT u = { tabRects[t].left + Px(4), tabArea.bottom - Px(3), tabRects[t].right - Px(4), tabArea.bottom - Px(1) };
@@ -93,20 +95,21 @@ void PreviewHandler::Paint(HDC dc)
     }
     DeleteObject(line);
 
-    const double scale = Scale();
+    const double scale = Scale(), down = scale * Aspect();     // (along the rows, down the columns)
     if (scale > 0)
     {
         // Fitted into the image area (zoom 1, centered), or the part of it in sight: only the rows and
-        // columns in the area are stretched, those from the first one in a DIB of their own
+        // columns in the area are stretched, those from the first one in a DIB of their own. A pixel
+        // as its spacing says: `down` high for `scale` wide.
         const double left = (imageArea.left + imageArea.right) / 2.0 - viewX * scale;
-        const double top = (imageArea.top + imageArea.bottom) / 2.0 - viewY * scale;
+        const double top = (imageArea.top + imageArea.bottom) / 2.0 - viewY * down;
         const int x0 = (std::max)(0, static_cast<int>(std::floor((imageArea.left - left) / scale)));
         const int x1 = (std::min)(view.width, static_cast<int>(std::ceil((imageArea.right - left) / scale)));
-        const int y0 = (std::max)(0, static_cast<int>(std::floor((imageArea.top - top) / scale)));
-        const int y1 = (std::min)(view.height, static_cast<int>(std::ceil((imageArea.bottom - top) / scale)));
+        const int y0 = (std::max)(0, static_cast<int>(std::floor((imageArea.top - top) / down)));
+        const int y1 = (std::min)(view.height, static_cast<int>(std::ceil((imageArea.bottom - top) / down)));
         if (x1 > x0 && y1 > y0)
         {
-            const int dx = static_cast<int>(std::lround(left + x0 * scale)), dy = static_cast<int>(std::lround(top + y0 * scale));
+            const int dx = static_cast<int>(std::lround(left + x0 * scale)), dy = static_cast<int>(std::lround(top + y0 * down));
             BITMAPINFO bi = {};
             bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
             bi.bmiHeader.biWidth = view.width;
@@ -119,7 +122,7 @@ void PreviewHandler::Paint(HDC dc)
             SetStretchBltMode(dc, HALFTONE);
             SetBrushOrgEx(dc, 0, 0, nullptr);
             StretchDIBits(dc, dx, dy, static_cast<int>(std::lround(left + x1 * scale)) - dx,
-                          static_cast<int>(std::lround(top + y1 * scale)) - dy, x0, 0, x1 - x0, y1 - y0,
+                          static_cast<int>(std::lround(top + y1 * down)) - dy, x0, 0, x1 - x0, y1 - y0,
                           view.pixels.data() + static_cast<size_t>(y0) * view.width, &bi, DIB_RGB_COLORS, SRCCOPY);
             RestoreDC(dc, saved);
         }
@@ -134,7 +137,7 @@ void PreviewHandler::Paint(HDC dc)
                 HGDIOBJ kept = SelectObject(src, maskBitmap);
                 BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
                 AlphaBlend(dc, static_cast<int>(std::lround(left)), static_cast<int>(std::lround(top)),
-                           static_cast<int>(std::lround(view.width * scale)), static_cast<int>(std::lround(view.height * scale)),
+                           static_cast<int>(std::lround(view.width * scale)), static_cast<int>(std::lround(view.height * down)),
                            src, 0, 0, maskWidth, maskHeight, blend);
                 SelectObject(src, kept);
                 DeleteDC(src);
@@ -145,7 +148,7 @@ void PreviewHandler::Paint(HDC dc)
                 HGDIOBJ kept = SelectObject(dc, pen);
                 std::vector<POINT> pts;
                 for (const auto& p : o.points)
-                    pts.push_back({ static_cast<LONG>(std::lround(left + (p[0] + 0.5) * scale)), static_cast<LONG>(std::lround(top + (p[1] + 0.5) * scale)) });
+                    pts.push_back({ static_cast<LONG>(std::lround(left + (p[0] + 0.5) * scale)), static_cast<LONG>(std::lround(top + (p[1] + 0.5) * down)) });
                 if (o.closed && pts.size() > 2) pts.push_back(pts.front());
                 if (pts.size() > 1) Polyline(dc, pts.data(), static_cast<int>(pts.size()));
                 SelectObject(dc, kept);
@@ -158,7 +161,7 @@ void PreviewHandler::Paint(HDC dc)
         {
             const int saved = SaveDC(dc);
             IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
-            auto at = [&](double c, double r) { return POINT{ static_cast<LONG>(std::lround(left + (c + 0.5) * scale)), static_cast<LONG>(std::lround(top + (r + 0.5) * scale)) }; };
+            auto at = [&](double c, double r) { return POINT{ static_cast<LONG>(std::lround(left + (c + 0.5) * scale)), static_cast<LONG>(std::lround(top + (r + 0.5) * down)) }; };
             LOGBRUSH lb = { BS_SOLID, RGB(214, 170, 0), 0 };
             const DWORD dashes[2] = { static_cast<DWORD>(Px(6)), static_cast<DWORD>(Px(4)) };
             HPEN dashed = ExtCreatePen(PS_GEOMETRIC | PS_USERSTYLE | PS_ENDCAP_FLAT, 1, &lb, 2, dashes);
@@ -209,7 +212,7 @@ void PreviewHandler::Paint(HDC dc)
                 IntersectClipRect(dc, imageArea.left, imageArea.top, imageArea.right, imageArea.bottom);
                 BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
                 AlphaBlend(dc, static_cast<int>(std::lround(left)), static_cast<int>(std::lround(top)),
-                           static_cast<int>(std::lround(view.width * scale)), static_cast<int>(std::lround(view.height * scale)),
+                           static_cast<int>(std::lround(view.width * scale)), static_cast<int>(std::lround(view.height * down)),
                            src, 0, 0, view.width, view.height, blend);
                 RestoreDC(dc, saved);
                 SelectObject(src, kept);
@@ -219,10 +222,21 @@ void PreviewHandler::Paint(HDC dc)
         }
         // The overlay, on the part of the image in sight
         RECT shown = { static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top)),
-                       static_cast<LONG>(std::lround(left + view.width * scale)), static_cast<LONG>(std::lround(top + view.height * scale)) };
+                       static_cast<LONG>(std::lround(left + view.width * scale)), static_cast<LONG>(std::lround(top + view.height * down)) };
         if (overlay && IntersectRect(&shown, &shown, &imageArea) && shown.right - shown.left >= Px(200) &&
             shown.bottom - shown.top >= Px(150))        // (not on a small image: it would hide it)
             PaintOverlay(dc, shown);
+        if (!frameProblem.empty())
+        {
+            // (in the middle: its height first)
+            RECT why = imageArea;
+            InflateRect(&why, -Px(12), -Px(12));
+            RECT need = why;
+            DrawTextW(dc, frameProblem.c_str(), -1, &need, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+            why.top = (std::max)(why.top, (imageArea.top + imageArea.bottom - (need.bottom - need.top)) / 2);
+            ::SetTextColor(dc, RGB(220, 220, 220));
+            DrawTextW(dc, frameProblem.c_str(), -1, &why, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+        }
     }
     PaintBar(dc);
 

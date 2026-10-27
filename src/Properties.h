@@ -2,7 +2,7 @@
 // (included by Shell.h, after the headers of the parts before it)
 #pragma once
 
-std::wstring Widen(const std::string& s, const std::string& charset = std::string());
+std::wstring Widen(const std::string& s, const std::string& charset = std::string(), const char* delimiters = "\\");
 
 std::wstring Hash6(const std::string& uid);
 

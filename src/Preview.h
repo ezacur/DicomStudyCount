@@ -51,6 +51,9 @@ public:
     IFACEMETHODIMP GetSite(REFIID riid, void** ppv) override;
 
     HRESULT Host(HWND host, const RECT& rc);
+    // In Total Commander's Lister (before DoPreview): its window, which the keys not used here go to; and
+    // no check boxes for the columns of Explorer
+    void ForLister(HWND lister) { listerWindow = lister; }
     // (frames: of each file, which one of an enhanced multi-frame file it is; -1: the file as it is. space,
     // time: of each file, its place - a plane or a series - and its position, whose files are its times; the
     // jumps go through the places, delay ms apart)
@@ -155,6 +158,8 @@ private:
     std::vector<int> spaceIndex;                    // of each file, its place in `spaces`
     int jumpDelay = 100;                            // ms from place to place
     bool plain = false;                             // not DICOM, and nothing before: only a line saying so
+    HWND listerWindow = nullptr;                    // in Total Commander's Lister: its window
+    std::wstring frameProblem;                      // why the frame stepped to is not shown (over its place)
     bool hosted = false;                            // in the DICOM explorer: the image alone
     bool stale = false;                             // its header and values are those of a slice shown before
     bool windowSet = false;                         // the window dragged: it stays from slice to slice
@@ -284,6 +289,7 @@ private:
     void MoveWindowTo(POINT pt);
 
     double Scale() const;
+    double Aspect() const;
 
     void KeepView();
 

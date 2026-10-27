@@ -26,10 +26,24 @@ void PreviewHandler::GoFrame(int f)
 {
     if (f < 0 || f >= view.frames || f == view.frame || !view.imaging) return;
     const bool had = !view.pixels.empty();
+    const int w = view.width, h = view.height;
     std::wstring why;
     try { why = ShowFrame(view, f, true); }
     catch (...) { why = L"it cannot be shown"; }
-    if (!why.empty()) view.frame = f;           // no image, and the stepping goes on from there
+    frameProblem.clear();
+    if (!why.empty())
+    {
+        // No image, and the stepping goes on from there: its place kept, black, and why over it
+        view.frame = f;
+        if (had)
+        {
+            view.width = w;
+            view.height = h;
+            view.pixels.assign(static_cast<size_t>(w) * h, 0);
+            if (view.imaging) view.imaging->planes.clear();
+        }
+        frameProblem = L"Frame " + std::to_wstring(f + 1) + L": " + why;
+    }
     Shown(had);
     if (hosted && moved && (playing || jumping)) moved(slice);     // (the explorer draws it where it is)
 }
@@ -48,6 +62,7 @@ void PreviewHandler::GoSlice(int i)
         std::wstring why;
         try { why = ShowFrame(view, wanted, true); }
         catch (...) { why = L"it cannot be shown"; }
+        frameProblem = why.empty() ? std::wstring() : L"Frame " + std::to_wstring(wanted + 1) + L": " + why;
         view.frame = wanted;
         slice = i;
         if (hosted && moved) moved(i);
@@ -74,6 +89,7 @@ void PreviewHandler::GoSlice(int i)
     const bool had = !view.pixels.empty();
     if (next.width != view.width || next.height != view.height) zoom = 1;
     view = std::move(next);
+    frameProblem.clear();
     slice = i;
     current = series[i];
     stale = !hosted;                            // (hosted: no header here to write)

@@ -7,6 +7,7 @@
 #include "dcmtk/dcmdata/dcistrmb.h"
 #include "dcmtk/dcmdata/dcpxitem.h"
 #include "dcmtk/dcmdata/dcrledrg.h"
+#include "dcmtk/dcmdata/dcspchrs.h"
 #include "dcmtk/dcmimgle/dcmimage.h"
 #include "dcmtk/dcmimgle/dipixel.h"
 #include "dcmtk/dcmimage/diregist.h"
@@ -14,6 +15,7 @@
 #include "dcmtk/dcmjpls/djdecode.h"
 #include "dcmtk/oflog/oflog.h"
 #include "openjpeg.h"
+#include "jxl/decode.h"
 #include "zlib.h"
 #include <memory>
 #include <mutex>
@@ -87,6 +89,7 @@ static const wchar_t KeyPrefix[] = L"explorer4dicoms|v2|";
 #include "Icons.h"
 #include "Properties.h"
 #include "Decode.h"
+#include "Video.h"
 #include "Segments.h"
 #include "Preview.h"
 #include "Thumbnails.h"

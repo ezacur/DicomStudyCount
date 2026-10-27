@@ -133,13 +133,26 @@ tree** opens the whole folder tree with one color per study.
   over its series; Enter or a double click opens its folder in Explorer with the file selected. The
   DICOMDIR is only read (DCMTK's DICOMDIR class is not used: it writes the file back when it finds
   something to correct).
-  Uncompressed, JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000 and High-Throughput
-  JPEG 2000 pixel data, deflated files and deflated image frames, the private PMSCT_RLE1 of Elscint /
-  Philips CT, floating point pixels (Parametric Maps: T1, T2, ADC... maps) and 1-bit ones
-  (segmentations, also when a frame does not start at a byte). It uses DCMTK, OpenJPEG and zlib, inside
-  the same DLL. Files without pixels (reports, PDFs, presentation states) say so.
+  Uncompressed (also encapsulated), JPEG baseline / extended / lossless, JPEG-LS, RLE, JPEG 2000,
+  High-Throughput JPEG 2000 and JPEG XL (lossless, recompressed JPEG, lossy) pixel data, deflated files
+  and deflated image frames, the private PMSCT_RLE1 of Elscint / Philips CT, floating point pixels
+  (Parametric Maps: T1, T2, ADC... maps) and 1-bit ones (segmentations, also when a frame does not start
+  at a byte, also in RLE). Its text in any of the character sets of DICOM (the oficonv of DCMTK: Latin,
+  Cyrillic, Greek, Arabic, Hebrew, Thai, Japanese and Korean with their escape sequences, Chinese GB18030
+  and GBK, UTF-8). It uses DCMTK, OpenJPEG, libjxl and zlib, inside the same DLL. Video (MPEG-2,
+  MPEG-4 AVC/H.264, HEVC/H.265; as an elementary stream, or in an MPEG-1 / MPEG-2 program stream, an
+  MPEG-2 transport stream or MP4) frame after frame with the decoders of Windows (Media
+  Foundation): H.264 comes with Windows; MPEG-2 and HEVC need the *MPEG-2 Video Extension* and the
+  *HEVC Video Extensions* of the Microsoft Store, and it says so when they are missing. Files without
+  pixels (reports, PDFs, presentation states) say so.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
   usual low one: the low one cannot reach the Explorer window, and the *Columns* tab needs it.
+- **In Total Commander's Lister** (F3, and Ctrl+Q in a panel): the same preview, as a Lister plugin.
+  Its *Info* tab has the values of the columns of the file, without the check boxes (there is no
+  Explorer window there). The keys of the preview stay in it (arrows, Home, End, Space, Ctrl+C, Ctrl+T);
+  the rest go to the Lister (Esc, N, P...). `tools\New-ListerPlugin.ps1` makes a zip with it; opened in
+  Total Commander (Enter on it), Total Commander installs it. It reads only DICOM files (by their
+  extension, or "DICM" after the preamble), and leaves any other to the next plugin.
 - **Hovering a DICOM file** shows its modality, series number and description, instance number,
   plane, Z level, acquisition time and copies; those and more are in the Details pane (Alt+Shift+P)
   and in *Properties > Details*.
@@ -382,8 +395,8 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
 | `bin\explorer4dicoms.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs: `Explorer4Dicoms\` (those of `Explorer4Dicoms.dll`, a file for each part: the count, the DICOM reader, the folder comments and icons, the Explorer columns and views, the index), and those of `DicomShell.dll`, a file for each part - `Shell.h` (what they share), `DicomShell.cpp` (its COM factories and entry points), `HeaderReader`, `Icons`, `Properties`, `Decode`, `Segments` (the SEG and RT Structure Sets: read, found near a file, matched to the plane of an image), `Preview` (its window and interfaces; `Preview*.cpp`, its parts: the tabs, the painting, the stepping, the mouse), `Thumbnails`, `Gather`, `Pixels`, `Export`, `Navigator`, `Plot`, and the DICOM explorer (`Explorer.h`, its class; `Explorer*.cpp`, its parts: the window, the tree, the checks, the navigator, the info, the floating thumbnail, the exports, the report) |
-| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
-| `third_party\` | DCMTK 3.7.0, OpenJPEG 2.5.3 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
+| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, `New-ListerPlugin.ps1` (the Lister plugin of Total Commander, as a zip it installs), and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
+| `third_party\` | DCMTK 3.7.1, OpenJPEG 2.5.3, libjxl 0.12.0 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
 
 ## Installation
 
