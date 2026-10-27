@@ -1,4 +1,4 @@
-// The columns of Explorer: the DicomStudyCount.* properties of a DICOM file, read from its header
+// The columns of Explorer: the Explorer4Dicoms.* properties of a DICOM file, read from its header
 #include "Shell.h"
 
 // DICOM text: UTF-8 when the SpecificCharacterSet says ISO_IR 192, otherwise read as Latin-1 (as the

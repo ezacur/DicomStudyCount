@@ -60,8 +60,7 @@ namespace Explorer4Dicoms
         public static bool IsOurs(string iconPath)
         {
             return !string.IsNullOrEmpty(iconPath) &&
-                   (iconPath.IndexOf(@"\explorer4dicoms\icons\", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    iconPath.IndexOf(@"\DicomStudyCount\icons\", StringComparison.OrdinalIgnoreCase) >= 0);     // (the name of the suite before)
+                   iconPath.IndexOf(@"\explorer4dicoms\icons\", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         // Full path of the icon, created if it does not exist yet (or was lost)

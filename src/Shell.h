@@ -80,9 +80,8 @@ extern HMODULE g_module;
 
 extern LONG g_locks;
 
-// Icon cache key: changes when the drawing changes, so Explorer never mixes old and new icons (the name
-// of the suite before in it: Explorer keeps these keys in its icon cache)
-static const wchar_t KeyPrefix[] = L"DicomStudyCount|v2|";
+// Icon cache key: changes when the drawing changes, so Explorer never mixes old and new icons
+static const wchar_t KeyPrefix[] = L"explorer4dicoms|v2|";
 
 #include "HeaderReader.h"
 #include "Icons.h"

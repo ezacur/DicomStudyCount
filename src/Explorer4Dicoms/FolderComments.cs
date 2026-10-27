@@ -16,7 +16,7 @@ namespace Explorer4Dicoms
 {
     // Folder comments via desktop.ini. Explorer shows the InfoTip in the Comments column, but it
     // only reads desktop.ini when the folder has the Read-only or System attribute.
-    // The [DicomStudyCount] section marks what this script wrote, so comments or settings
+    // The [explorer4dicoms] section marks what this script wrote, so comments or settings
     // made by anyone else are never removed.
     public static class FolderComments
     {
@@ -28,7 +28,7 @@ namespace Explorer4Dicoms
         {
             return "(0 DICOMs of " + totalFiles + (totalFiles == 1 ? " file)" : " files)");
         }
-        const string Marker = "DicomStudyCount";
+        const string Marker = "explorer4dicoms";
 
         // One lock per folder (striped by path), not one for all: different folders are written in
         // parallel, which is several times faster (the shell API takes ~7 ms per folder)

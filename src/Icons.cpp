@@ -243,7 +243,7 @@ HICON DrawIcon(int size, int color, const std::wstring& label)
 // ---------------------------------------------------------------------------------------------
 // Chaining: the handlers another program had for an extension (files without one included) before the
 // install put these in front of them (tools\Register-DicomIcons.ps1 in HKCU\Software\explorer4dicoms\
-// Chain\<ext>, Register-DicomProperties.ps1 in HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain\<ext>).
+// Chain\<ext>, Register-DicomProperties.ps1 in HKLM\SOFTWARE\explorer4dicoms\PropertyHandler\Chain\<ext>).
 // Files that are not DICOM go to them, as if this DLL were not there.
 
 // ".ima" (lowercase), or "(none)"
@@ -345,7 +345,7 @@ IFACEMETHODIMP IconHandler::SaveCompleted(LPCOLESTR) { return E_NOTIMPL; }
 
 IFACEMETHODIMP IconHandler::GetCurFile(LPOLESTR*) { return E_NOTIMPL; }
 
-// IExtractIconW: the location is a key ("DicomStudyCount|v2|<color>|<number>") that Explorer
+// IExtractIconW: the location is a key ("explorer4dicoms|v2|<color>|<number>") that Explorer
 // caches the drawn icon under, so every color and number is drawn only once
 IFACEMETHODIMP IconHandler::GetIconLocation(UINT flags, LPWSTR file, UINT cch, int* index, UINT* outFlags)
 {

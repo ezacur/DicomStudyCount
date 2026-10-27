@@ -3,7 +3,7 @@
     Registers the DICOM property handler of bin\DicomShell.dll for the whole machine (it needs administrator
     rights: Windows reads property handlers only from HKLM). -Uninstall removes it.
 .NOTES
-    The DLL is copied to %ProgramFiles%\DicomStudyCount, which only administrators can change: Explorer
+    The DLL is copied to %ProgramFiles%\explorer4dicoms, which only administrators can change: Explorer
     and the search indexer load it. Its name carries its hash, since a loaded DLL cannot be overwritten.
     An extension that already has a property handler of another program is chained: this one goes in
     front of it, and gives every file that is not DICOM to it (recorded in Chain\<ext> of the state key
@@ -26,16 +26,16 @@ if (-not $Dll) { $Dll = Join-Path $bin 'DicomShell.dll' }
 $clsid = '{21329A2B-09B3-4250-9103-9267877321EB}'
 $previewClsid = '{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}'     # the preview, see below
 $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
-$state = 'SOFTWARE\DicomStudyCount\PropertyHandler'      # what was registered, to undo only that
+$state = 'SOFTWARE\explorer4dicoms\PropertyHandler'      # what was registered, to undo only that
 $extensions = '.', '.dcm', '.ima', '.dicom'                 # '.': files without extension
 $hklm = [Microsoft.Win32.Registry]::LocalMachine
 $st = $hklm.OpenSubKey($state)
 if ($Img -or $Uninstall -or ($st -and $st.GetValue('Img') -eq 1)) { $extensions += '.img' }
 function Get-ChainName([string]$ext) { if ($ext -eq '.') { '(none)' } else { $ext } }
-$dir = Join-Path $env:ProgramFiles 'DicomStudyCount'
+$dir = Join-Path $env:ProgramFiles 'explorer4dicoms'
 # The columns (names, types) of the properties: a schema registered from its installed copy
-$schemaSource = Join-Path $bin 'DicomStudyCount.propdesc'
-$schema = Join-Path $dir 'DicomStudyCount.propdesc'
+$schemaSource = Join-Path $bin 'explorer4dicoms.propdesc'
+$schema = Join-Path $dir 'explorer4dicoms.propdesc'
 Add-Type -Namespace DicomPropsSetup -Name PropSys -MemberDefinition '
     [DllImport("propsys.dll", CharSet = CharSet.Unicode)] public static extern int PSRegisterPropertySchema(string path);
     [DllImport("propsys.dll", CharSet = CharSet.Unicode)] public static extern int PSUnregisterPropertySchema(string path);

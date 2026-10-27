@@ -3,7 +3,7 @@
     Prints properties of files as Explorer sees them (through the property system, so through the
     registered property handlers): to check the DICOM property handler.
 .EXAMPLE
-    .\Get-ShellProperties.ps1 -Files D:\DICOM\IM0001 -Properties System.Title, DicomStudyCount.SeriesNumber
+    .\Get-ShellProperties.ps1 -Files D:\DICOM\IM0001 -Properties System.Title, Explorer4Dicoms.SeriesNumber
 #>
 param(
     [Parameter(Mandatory = $true)] [string[]]$Files,

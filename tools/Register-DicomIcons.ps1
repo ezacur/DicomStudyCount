@@ -38,20 +38,19 @@ $classes = 'Software\Classes'
 $sfa = 'Software\Classes\SystemFileAssociations'
 $state = 'Software\explorer4dicoms\IconHandler'      # what was registered, to undo only that
 $previewSettings = 'Software\explorer4dicoms\Preview'  # the split, and the tab of each folder
-# (the file types and the verb keep the name of the suite before: see $oldName in explorer4dicoms.ps1)
 $types = @(
-    @{ Ext = '.'; ProgId = 'DicomStudyCount.NoExtension'; Name = 'File' },
-    @{ Ext = '.dcm'; ProgId = 'DicomStudyCount.Dcm'; Name = 'DICOM File' },
-    @{ Ext = '.ima'; ProgId = 'DicomStudyCount.Ima'; Name = 'DICOM File (IMA)' },
-    @{ Ext = '.dicom'; ProgId = 'DicomStudyCount.Dicom'; Name = 'DICOM File' },
-    @{ Ext = '.img'; ProgId = 'DicomStudyCount.Img'; Name = 'Image File' }
+    @{ Ext = '.'; ProgId = 'Explorer4Dicoms.NoExtension'; Name = 'File' },
+    @{ Ext = '.dcm'; ProgId = 'Explorer4Dicoms.Dcm'; Name = 'DICOM File' },
+    @{ Ext = '.ima'; ProgId = 'Explorer4Dicoms.Ima'; Name = 'DICOM File (IMA)' },
+    @{ Ext = '.dicom'; ProgId = 'Explorer4Dicoms.Dicom'; Name = 'DICOM File' },
+    @{ Ext = '.img'; ProgId = 'Explorer4Dicoms.Img'; Name = 'Image File' }
 )
 $chain = 'Software\explorer4dicoms\Chain'           # what other programs had (read by the DLL)
 $iconHandlerKey = 'ShellEx\IconHandler'
-$verbKey = 'shell\DicomStudyCountDuplicates'
+$verbKey = 'shell\Explorer4DicomsDuplicates'
 
 # DICOM values shown when hovering a file, in the Details pane and in Properties > Details
-$d = 'DicomStudyCount.'
+$d = 'Explorer4Dicoms.'
 $infoTip = 'prop:' + (('Modality', 'SeriesNumber', 'SeriesDescription', 'InstanceNumber', 'Plane', 'ZLevel', 'Acquired',
     'DuplicatedIn' | ForEach-Object { $d + $_ }) -join ';')
 $previewDetails = 'prop:' + ((('StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'SeriesDescription', 'InstanceNumber', 'Rows',
@@ -109,7 +108,7 @@ function Set-FileType([string]$key, [bool]$icon, [bool]$rest) {
 function Clear-Sfa([string]$key) {
     $k = $hkcu.OpenSubKey($key, $true)
     if (-not $k) { return }
-    foreach ($n in 'InfoTip', 'PreviewDetails', 'FullDetails') { if ($k.GetValue($n) -like '*DicomStudyCount.*') { $k.DeleteValue($n, $false) } }
+    foreach ($n in 'InfoTip', 'PreviewDetails', 'FullDetails') { if ($k.GetValue($n) -like '*Explorer4Dicoms.*') { $k.DeleteValue($n, $false) } }
     if ($k.GetValue('ThumbnailCutoff') -eq 2 -and $hkcu.OpenSubKey("$key\$thumbShellEx")) { $k.DeleteValue('ThumbnailCutoff', $false) }
     foreach ($sub in $previewShellEx, $thumbShellEx) {
         $s = $hkcu.OpenSubKey("$key\$sub")

@@ -98,7 +98,7 @@ for ($c = 0; $c -lt $rows; $c++) {
         if ($bg -eq 'dark') { $g.FillRectangle($dark, $x, $c * 52, $labels.Count * $sizes.Count * 52, 52) }
         foreach ($s in $sizes) {
             foreach ($l in $labels) {
-                $b = [IconTest]::Draw("DicomStudyCount|v2|$c|$l", $s)
+                $b = [IconTest]::Draw("explorer4dicoms|v2|$c|$l", $s)
                 if ($b) { $g.DrawImage($b, $x + 2, $c * 52 + 2, $s, $s); $b.Dispose() }
                 $x += 52
             }
@@ -112,7 +112,7 @@ $z = New-Object Drawing.Bitmap(($labels.Count * 20 * 4), ($rows * 20 * 4))
 $gz = [Drawing.Graphics]::FromImage($z); $gz.InterpolationMode = 'NearestNeighbor'; $gz.PixelOffsetMode = 'Half'; $gz.Clear([Drawing.Color]::White)
 for ($c = 0; $c -lt $rows; $c++) {
     for ($i = 0; $i -lt $labels.Count; $i++) {
-        $b = [IconTest]::Draw("DicomStudyCount|v2|$c|$($labels[$i])", 16)
+        $b = [IconTest]::Draw("explorer4dicoms|v2|$c|$($labels[$i])", 16)
         if ($b) { $gz.DrawImage($b, $i * 80 + 8, $c * 80 + 8, 64, 64); $b.Dispose() }
     }
 }

@@ -7,8 +7,8 @@
 // Explicit/Implicit VR Little Endian, Explicit VR Big Endian and "raw" files without preamble.
 // Deflated files are DICOM but are not decompressed: they get a "?".
 //
-// It is also the property handler of DICOM files: the DicomStudyCount.* columns of Explorer
-// (DicomStudyCount.propdesc), read from the same header, plus the copies of every file found by the
+// It is also the property handler of DICOM files: the Explorer4Dicoms.* columns of Explorer
+// (explorer4dicoms.propdesc), read from the same header, plus the copies of every file found by the
 // last count ("duplicated in").
 //
 // And the preview (Explorer's preview pane) and the thumbnails of DICOM files, decoded with DCMTK.

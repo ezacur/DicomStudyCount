@@ -1,4 +1,4 @@
-// The columns of Explorer: the DicomStudyCount.* properties of a DICOM file, read from its header
+// The columns of Explorer: the Explorer4Dicoms.* properties of a DICOM file, read from its header
 // (included by Shell.h, after the headers of the parts before it)
 #pragma once
 
@@ -6,7 +6,7 @@ std::wstring Widen(const std::string& s, const std::string& charset = std::strin
 
 std::wstring Hash6(const std::string& uid);
 
-// Our columns (DicomStudyCount.propdesc)
+// Our columns (explorer4dicoms.propdesc)
 static const GUID FMTID_Dicom = { 0xED9AB6BD, 0x5610, 0x4A64, { 0xB2, 0xCC, 0x55, 0xEE, 0x8E, 0x18, 0xD3, 0x29 } };
 
 static const PROPERTYKEY PKEY_StudyHash = { FMTID_Dicom, 2 };

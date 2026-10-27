@@ -49,10 +49,6 @@ param(
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$Clean,
 
-    # Same as -Clean (older name)
-    [Parameter(ParameterSetName = 'Scan')]
-    [switch]$ClearComments,
-
     # Shows the DICOM columns of the files in the Explorer windows open on the folder (or on its
     # parent folder), or hides them if any is visible
     [Parameter(ParameterSetName = 'Scan')]
@@ -94,44 +90,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# The name of the suite, where its data and settings are; and the one it had (DicomStudyCount, when all
-# it did was to count studies): its data are moved here on -Install. The names inside the files and the
-# registry that nobody sees (the [DicomStudyCount] section of desktop.ini, the file types, the column
-# names, the machine part in Program Files) stay: the folders and columns of before keep working.
+# The name of the suite: where its data and settings are, and what it writes in the folders and the registry
 $appName = 'explorer4dicoms'
-$oldName = 'DicomStudyCount'
 $appData = Join-Path $env:LOCALAPPDATA $appName
-
-function Move-OldData {
-    # The settings (HKCU\Software\DicomStudyCount): copied, then the old key removed
-    $oldKey = "HKCU:\Software\$oldName"
-    $newKey = "HKCU:\Software\$appName"
-    if ((Test-Path -LiteralPath $oldKey) -and -not (Test-Path -LiteralPath $newKey)) {
-        try { Rename-Item -LiteralPath $oldKey -NewName $appName }
-        catch {
-            & reg.exe copy "HKCU\Software\$oldName" "HKCU\Software\$appName" /s /f | Out-Null
-            if (Test-Path -LiteralPath $newKey) { Remove-Item -LiteralPath $oldKey -Recurse -Force -ErrorAction SilentlyContinue }
-        }
-        Write-Host "Settings moved to $newKey"
-    }
-    # The data of the counts (index, copies, problems reports): copied; the old ones removed. The icons
-    # stay where they are: the desktop.ini of the folders counted point to them (they are ours too)
-    $old = Join-Path $env:LOCALAPPDATA $oldName
-    if (Test-Path -LiteralPath $old) {
-        foreach ($part in 'index', 'duplicates', 'reports') {
-            $from = Join-Path $old $part
-            if (-not (Test-Path -LiteralPath $from)) { continue }
-            $to = Join-Path $appData $part
-            New-Item -ItemType Directory -Force $to | Out-Null
-            Copy-Item -Path (Join-Path $from '*') -Destination $to -Recurse -Force
-            Remove-Item -LiteralPath $from -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "Moved $from to $to"
-        }
-        # (the copies of the DLL of before: those Explorer does not hold any more)
-        $shell = Join-Path $old 'shellext'
-        if (Test-Path -LiteralPath $shell) { Get-ChildItem -LiteralPath $shell -File | Remove-Item -Force -ErrorAction SilentlyContinue }
-    }
-}
 
 # Context menu: a "DICOM" submenu with fixed entries (the menu cannot depend on whether the folder
 # was counted: Explorer does not read desktop.ini when it builds it). Key names set the order.
@@ -147,21 +108,18 @@ $menuEntries = @(
     # (the same, writing the report of the folder in %TEMP%\explorer4dicoms\reports and opening it)
     @{ Name = '7Report'; Label = 'DICOM report'; Explorer = '/report ' }
 )
-# The DICOM columns of the files (bin\DicomStudyCount.propdesc), in the order they are shown
+# The DICOM columns of the files (bin\explorer4dicoms.propdesc), in the order they are shown
 $dicomColumns = 'StudyHash', 'SeriesHash', 'Modality', 'SeriesNumber', 'InstanceNumber', 'SeriesDescription',
     'Plane', 'SeriesKind', 'Segmentation', 'Acquired', 'TriggerTime', 'ZLevel', 'Rows', 'Columns', 'PixelSpacing', 'SliceThickness', 'Frames',
     'ImageType', 'ObjectType', 'Compression', 'Protocol', 'Manufacturer', 'FrameOfReference', 'StudyDate',
     'PatientID', 'SensitiveData', 'ImageOrientation', 'StudyInstanceUID', 'SeriesInstanceUID', 'DuplicatedIn' |
-    ForEach-Object { "DicomStudyCount.$_" }
+    ForEach-Object { "Explorer4Dicoms.$_" }
 $menuParents = @(
     'HKCU:\Software\Classes\Directory\shell',
     'HKCU:\Software\Classes\Directory\Background\shell'
 )
-# Entries of earlier versions, directly in the context menu
-$oldMenuNames = 'CountDicomStudies', 'ShowDicomTree', 'CleanDicomInfo', 'DicomStudyCount'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runName = 'explorer4dicomsWatcher'
-$oldRunName = 'DicomStudyCountWatcher'          # (of the suite when it was called DicomStudyCount)
 # conhost --headless runs PowerShell without opening a console window
 $watchCommand = 'conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Watch' -f $PSCommandPath
 
@@ -188,13 +146,11 @@ function Invoke-Elevated([string]$script, [string[]]$arguments) {
 
 function Stop-Watcher {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -match '(Count-DicomStudies|explorer4dicoms)\.ps1.*-Watch' -and $_.ProcessId -ne $PID } |
+        Where-Object { $_.CommandLine -match 'explorer4dicoms\.ps1.*-Watch' -and $_.ProcessId -ne $PID } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 if ($Install) {
-    Move-OldData
-    Remove-ItemProperty -LiteralPath $runKey -Name $oldRunName -ErrorAction SilentlyContinue
     Set-ItemProperty -LiteralPath $runKey -Name $runName -Value $watchCommand
     Stop-Watcher
     # (not from this folder: it would hold it, and the folder could not be renamed or moved)
@@ -205,9 +161,6 @@ if ($Install) {
     $dllHash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($shellDll))[0..7] | ForEach-Object { $_.ToString('x2') })
     $shellCopy = Join-Path $appData "shellext\DicomShell-$dllHash.dll"
     foreach ($parent in $menuParents) {
-        foreach ($old in $oldMenuNames) {
-            if (Test-Path -LiteralPath "$parent\$old") { Remove-Item -LiteralPath "$parent\$old" -Recurse -Force }
-        }
         $menu = "$parent\$menuName"
         if (Test-Path -LiteralPath $menu) { Remove-Item -LiteralPath $menu -Recurse -Force }
         New-Item -Path $menu -Force | Out-Null
@@ -230,24 +183,21 @@ if ($Install) {
     # The columns of the DICOM files: Windows takes property handlers from HKLM only. No UAC prompt
     # when the DLL and the column schema installed are already these ones.
     $server = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{21329A2B-09B3-4250-9103-9267877321EB}\InprocServer32')
-    $installedSchema = Join-Path $env:ProgramFiles 'DicomStudyCount\DicomStudyCount.propdesc'
+    $installedSchema = Join-Path $env:ProgramFiles 'explorer4dicoms\explorer4dicoms.propdesc'
     $handlers = 'SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertyHandlers'
     # (and the preview at medium integrity, also from HKLM)
     $preview = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\CLSID\{F3E184D5-95DF-4BE9-9929-32FF8A59CD55}')
     # Every extension ours (or chained to ours: Register-DicomProperties.ps1)
     $extensions = '.', '.dcm', '.ima', '.dicom'
-    $propState = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\DicomStudyCount\PropertyHandler')
+    $propState = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\explorer4dicoms\PropertyHandler')
     if ($Img -or ($propState -and $propState.GetValue('Img') -eq 1)) { $extensions += '.img' }
     $upToDate = $server -and [IO.Path]::GetFileName([string]$server.GetValue('')) -eq "DicomShell-$dllHash.dll" -and
         $preview -and $preview.GetValue('DisableLowILProcessIsolation') -eq 1 -and
         @($extensions | Where-Object { [string](Get-ItemProperty -LiteralPath "HKLM:\$handlers\$_" -ErrorAction SilentlyContinue).'(default)' -ne '{21329A2B-09B3-4250-9103-9267877321EB}' }).Count -eq 0 -and
         (Test-Path -LiteralPath $installedSchema) -and
-        ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'bin\DicomStudyCount.propdesc')).Hash)
+        ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'bin\explorer4dicoms.propdesc')).Hash)
     if ($upToDate) { Write-Host 'DICOM columns already installed and up to date' }
     else { Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') (@('-Dll', $shellDll) + @(if ($Img) { '-Img' })) }
-    # The C# DLL used to be compiled by the script itself into this cache: no longer used
-    $oldCache = Join-Path $env:LOCALAPPDATA 'DicomStudyCount\bin'
-    if (Test-Path -LiteralPath $oldCache) { Remove-Item -LiteralPath $oldCache -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Host 'Installed. Right-click a folder: DICOM >'
     $menuEntries | ForEach-Object { Write-Host "  - $($_.Label)" }
     Write-Host '(on Windows 11 it is under "Show more options" when using the new context menu).'
@@ -257,20 +207,15 @@ if ($Install) {
 
 if ($Uninstall) {
     Remove-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
-    Remove-ItemProperty -LiteralPath $runKey -Name $oldRunName -ErrorAction SilentlyContinue
     Stop-Watcher
     foreach ($parent in $menuParents) {
-        foreach ($name in @($menuName) + $oldMenuNames) {
-            if (Test-Path -LiteralPath "$parent\$name") { Remove-Item -LiteralPath "$parent\$name" -Recurse -Force }
-        }
+        if (Test-Path -LiteralPath "$parent\$menuName") { Remove-Item -LiteralPath "$parent\$menuName" -Recurse -Force }
     }
     & (Join-Path $PSScriptRoot 'tools\Register-DicomIcons.ps1') -Uninstall
-    foreach ($name in $appName, $oldName) {
-        Remove-Item -LiteralPath "HKCU:\Software\$name\Explorer" -Recurse -Force -ErrorAction SilentlyContinue
-        # The reports of the explorer, in a temporary folder of their own
-        Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "$name\reports") -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    if ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\DicomStudyCount\PropertyHandler')) {
+    Remove-Item -LiteralPath "HKCU:\Software\$appName\Explorer" -Recurse -Force -ErrorAction SilentlyContinue
+    # The reports of the explorer, in a temporary folder of their own
+    Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "$appName\reports") -Recurse -Force -ErrorAction SilentlyContinue
+    if ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\$appName\PropertyHandler")) {
         Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') @('-Uninstall')
     }
     Write-Host 'Uninstalled.'
@@ -303,7 +248,7 @@ function Hide-CommentColumn([string]$root, [switch]$Parent) {
 # write their comments again over the cleaned folders
 function Stop-CountsOn([string]$root) {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -match '(Count-DicomStudies|explorer4dicoms)\.ps1.*-WriteComments' -and $_.ProcessId -ne $PID } |
+        Where-Object { $_.CommandLine -match 'explorer4dicoms\.ps1.*-WriteComments' -and $_.ProcessId -ne $PID } |
         ForEach-Object {
             # Counts are started with -Path "<folder>" -WriteComments (conhost --headless drops the
             # quotes, so the folder is whatever lies between both parameters)
@@ -505,7 +450,7 @@ function Test-HasDicomComments([string]$dir) {
         foreach ($sub in [IO.Directory]::EnumerateDirectories($dir)) {
             if ($n++ -ge 500) { break }
             $ini = [IO.Path]::Combine($sub, 'desktop.ini')
-            if ([IO.File]::Exists($ini) -and [Explorer4Dicoms.Native]::ReadIni($ini, 'DicomStudyCount', 'Generated')) { return $true }
+            if ([IO.File]::Exists($ini) -and [Explorer4Dicoms.Native]::ReadIni($ini, 'explorer4dicoms', 'Generated')) { return $true }
         }
     }
     catch { }
@@ -520,8 +465,7 @@ if ($RestoreQuarantine) {
 
 if ($Watch) {
     $isFirst = $false
-    # (the name of the suite before: a watcher started by an older copy is found too)
-    $mutex = New-Object Threading.Mutex($true, 'Local\DicomStudyCountWatcher', [ref]$isFirst)
+    $mutex = New-Object Threading.Mutex($true, 'Local\explorer4dicomsWatcher', [ref]$isFirst)
     if (-not $isFirst) { return }     # another instance is already running
 
     $shell = New-Object -ComObject Shell.Application
@@ -600,7 +544,7 @@ try {
         return
     }
 
-    if ($Clean -or $ClearComments) {
+    if ($Clean) {
         Stop-CountsOn $root
         # Comments, icons, folder type and the attributes added to the folders
         $cleared = 0

@@ -16,11 +16,6 @@ and colored icons on the folders, DICOM columns, thumbnails and preview of the f
 position, image), its images, their full headers, a 3-D navigator of where every image is in the
 patient, their segmentations and the checks of every series.
 
-It started as *DicomStudyCount*, a script to count studies; that name is still inside a few places
-nobody sees (the section of the `desktop.ini` it writes, the names of its columns, the column schema
-in `%ProgramFiles%\DicomStudyCount`), so that the folders and columns of before keep working. The
-first `-Install` of explorer4dicoms moves the settings and data of DicomStudyCount to their new place.
-
 Find duplicated DICOM files and badly organized folders straight from Windows Explorer:
 
 Right-click a folder and choose **DICOM > Count studies**: every folder and subfolder gets a summary
@@ -385,7 +380,7 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 | `lib\TreeWindow.ps1` | its tree window (*Show tree*), loaded by it only for that |
 | `bin\Explorer4Dicoms.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
-| `bin\DicomStudyCount.propdesc` | the definition of those columns |
+| `bin\explorer4dicoms.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs: `Explorer4Dicoms\` (those of `Explorer4Dicoms.dll`, a file for each part: the count, the DICOM reader, the folder comments and icons, the Explorer columns and views, the index), and those of `DicomShell.dll`, a file for each part - `Shell.h` (what they share), `DicomShell.cpp` (its COM factories and entry points), `HeaderReader`, `Icons`, `Properties`, `Decode`, `Segments` (the SEG and RT Structure Sets: read, found near a file, matched to the plane of an image), `Preview` (its window and interfaces; `Preview*.cpp`, its parts: the tabs, the painting, the stepping, the mouse), `Thumbnails`, `Gather`, `Pixels`, `Export`, `Navigator`, `Plot`, and the DICOM explorer (`Explorer.h`, its class; `Explorer*.cpp`, its parts: the window, the tree, the checks, the navigator, the info, the floating thumbnail, the exports, the report) |
 | `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
 | `third_party\` | DCMTK 3.7.0, OpenJPEG 2.5.3 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
@@ -398,8 +393,6 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
    ```powershell
    git clone https://github.com/ezacur/explorer4dicoms.git
    ```
-   Installed before as *DicomStudyCount*: install this one the same way; it takes the place of the old
-   one (its menu, watcher, settings and data), and the folder of the old one can then be deleted.
 2. If it was downloaded as a zip, unblock its files:
    ```powershell
    Get-ChildItem -Recurse | Unblock-File
@@ -416,7 +409,7 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
    go in front of them, look at each file (`DICM` in its first bytes), and give every file that is
    not DICOM to what that program had, as if they were not there. `-Uninstall` puts back everything
    as it was. Explorer loads copies of `bin\DicomShell.dll` (in `%LOCALAPPDATA%` for the
-   icons, in `%ProgramFiles%\DicomStudyCount` for the columns, which the search indexer also loads,
+   icons, in `%ProgramFiles%\explorer4dicoms` for the columns, which the search indexer also loads,
    so only administrators can change it), so the folder can be updated at any time.
 4. Recommended: hide protected operating system files (Explorer > *Options* > *View* >
    *Hide protected operating system files*), so the `desktop.ini` files are not shown.
@@ -470,7 +463,7 @@ menu, so the menu cannot tell a counted folder from one that is not.
 .\explorer4dicoms.ps1 D:\Patients -Csv C:\temp\x.csv  # export the studies (';' separated)
 .\explorer4dicoms.ps1 D:\Patients -WriteComments      # what "DICOM > Count studies" does
 .\explorer4dicoms.ps1 D:\Patients -ShowTree           # what "DICOM > Show tree" does
-.\explorer4dicoms.ps1 D:\Patients -Clean              # what "DICOM > Clean" does (-ClearComments: the same)
+.\explorer4dicoms.ps1 D:\Patients -Clean              # what "DICOM > Clean" does
 .\explorer4dicoms.ps1 D:\Patients -ToggleColumns      # what "DICOM > Show/hide DICOM columns" does
 .\explorer4dicoms.ps1 D:\Patients -Unblock            # what "DICOM > Unblock (allow preview)" does
 rundll32 .\bin\DicomShell.dll,Explore D:\Patients        # what "DICOM > DICOM explorer" does
@@ -485,14 +478,14 @@ rundll32 .\bin\DicomShell.dll,Explore /report D:\Patients   # what "DICOM > DICO
 |---|---|---|
 | Folder comments and icons | a hidden `desktop.ini` in each folder with DICOM, and the folder's Read-only attribute (needed by Explorer to read it) | `-Clean` removes only what the tool wrote and restores the attribute |
 | Comments column | open Explorer windows, and the views Explorer saves (`HKCU\...\Shell\Bags`) | `-Clean` removes it from the views of the cleaned folders |
-| Folder icon files | `%LOCALAPPDATA%\explorer4dicoms\icons\` (built when first needed; a lost one is built again from its name; those of the folders counted before the rename stay in `%LOCALAPPDATA%\DicomStudyCount\icons\` until they are counted again) | delete the folder |
+| Folder icon files | `%LOCALAPPDATA%\explorer4dicoms\icons\` (built when first needed; a lost one is built again from its name) | delete the folder |
 | Problems report | `%LOCALAPPDATA%\explorer4dicoms\reports\` (one JSON per counted folder) | `-Clean`, or delete the folder |
 | Index of counted locations | `%LOCALAPPDATA%\explorer4dicoms\index\` (one TSV per counted folder) | `-Clean`, or delete the folder |
 | Context menu and watcher | `HKCU\Software\Classes\Directory\...` and `HKCU\...\Run` | `-Uninstall` |
 | DICOM explorer | `HKCU\Software\explorer4dicoms\Explorer` (its window, panes, options, last folder and the last folder of its exports) | `-Uninstall` |
 | Reports of the DICOM explorer | `%TEMP%\explorer4dicoms\reports\*.html` (those of more than 7 days go when another one is written) | `-Uninstall` |
-| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\explorer4dicoms\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `DicomStudyCount.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\explorer4dicoms\Chain` (what those programs had), and `HKCU\Software\explorer4dicoms\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
-| Columns of the DICOM files | `%ProgramFiles%\DicomStudyCount\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (and `.img` with `-Img`; the one another program had is kept in `HKLM\SOFTWARE\DicomStudyCount\PropertyHandler\Chain` and gets its files back) and the registered schema | `-Uninstall` (asks for administrator rights) |
+| Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\explorer4dicoms\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `Explorer4Dicoms.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\explorer4dicoms\Chain` (what those programs had), and `HKCU\Software\explorer4dicoms\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
+| Columns of the DICOM files | `%ProgramFiles%\explorer4dicoms\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (and `.img` with `-Img`; the one another program had is kept in `HKLM\SOFTWARE\explorer4dicoms\PropertyHandler\Chain` and gets its files back) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\explorer4dicoms\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
 
 The tool never modifies, moves or deletes DICOM files. The problems reports and the index of the counts
