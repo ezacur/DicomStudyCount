@@ -30,6 +30,9 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     DcmDataset* ds = ff.getDataset();
     const E_TransferSyntax xfer = ds->getOriginalXfer();
     if (TrimLastFragment(ds, path)) s.cutShort = true;     // (compressed, and the file ends in them)
+    const bool cutJpeg = s.cutShort && DcmXfer(ds->getOriginalXfer()).getJPEGProcess8Bit() != 0;
+    OrderBigEndianWords(ds);
+    OrderGePixels(ff);
     const std::wstring none = NoImage(ff);
     if (!none.empty()) return none;
     Sint32 frames = 1;
@@ -50,7 +53,9 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     else if (FirstNumber(get(DCM_CineRate), v) && v > 0) s.frameTime = 1000 / v;
 
     std::unique_ptr<DcmDataset> decoded;
-    if (IsJpeg2000(xfer))
+    if (cutJpeg) decoded.reset(DecodeCutJpeg(ds, frame));
+    if (decoded) {}
+    else if (IsJpeg2000(xfer))
     {
         decoded.reset(DecodeJpeg2000(ds, frames > 1, frame));
         if (!decoded) return L"its JPEG 2000 data could not be decoded";
@@ -110,7 +115,7 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
         s.bits = -32;
         return std::wstring();
     }
-    const unsigned long flags = CIF_UsePartialAccessToPixelData | (stored ? CIF_IgnoreModalityTransformation : 0);
+    const unsigned long flags = (decoded ? CIF_UsePartialAccessToPixelData : PartialAccess(ds, xfer)) | (stored ? CIF_IgnoreModalityTransformation : 0);
     std::unique_ptr<DicomImage> made = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
                                                                     decoded ? EXS_LittleEndianExplicit : xfer, flags,
                                                                     decoded ? 0 : static_cast<unsigned long>(frame), 1);
@@ -182,6 +187,8 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     ds->findAndGetUint16(DCM_PixelRepresentation, representation);
     s.bits = allocated <= 8 ? 8 : allocated <= 16 ? 16 : 32;
     if (representation == 1) s.bits = -s.bits;
+    // (1-bit pixels, decoded here as 0 and 255 to be seen: stored, 0 and 1)
+    if (stored && allocated == 1) for (float& value : s.values) value = value > 0 ? 1.f : 0.f;
     return std::wstring();
 }
 

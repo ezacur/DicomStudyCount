@@ -16,6 +16,7 @@ struct Imaging
     std::shared_ptr<VideoFrames> video;            // a video, as far as it is decoded
     std::unique_ptr<DicomImage> image;             // destroyed first: it reads the two above
     E_TransferSyntax xfer = EXS_Unknown;
+    bool cutJpeg = false;                          // a JPEG the file ends in (DecodeCutJpeg)
     bool mono = false;
     std::vector<DWORD> color;
     double center = 127.5, width = 255, center0 = 127.5, width0 = 255, low = 0, high = 255;
@@ -66,6 +67,8 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame);
 
 bool IsJpegXl(E_TransferSyntax x);
 
+DcmDataset* DecodeCutJpeg(DcmDataset* ds, int frame);
+
 DcmDataset* DecodeJpegXl(DcmDataset* ds, bool multiframe, int frame);
 
 bool IsPmsct(DcmFileFormat& ff);
@@ -92,6 +95,9 @@ bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size, bool* cut =
 
 bool TrimLastFragment(DcmDataset* ds, const char* data, size_t size);
 bool TrimLastFragment(DcmDataset* ds, const std::wstring& path);
+unsigned long PartialAccess(DcmDataset* ds, E_TransferSyntax xfer);
+void OrderBigEndianWords(DcmDataset* ds);
+void OrderGePixels(DcmFileFormat& ff);
 
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
