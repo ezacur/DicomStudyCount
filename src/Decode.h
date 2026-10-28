@@ -84,6 +84,11 @@ DcmDataset* DecodeEncapsulatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
 DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer);
 
+std::unique_ptr<DicomImage> RenderAgain(DcmDataset* ds, E_TransferSyntax xfer, unsigned long flags, unsigned long frame,
+                                        std::unique_ptr<DcmDataset>& kept);
+
+bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size);
+
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
 bool IsBitFrames(DcmDataset* ds, E_TransferSyntax xfer);

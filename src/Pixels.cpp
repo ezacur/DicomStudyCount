@@ -19,7 +19,13 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     s = Slice();
     InitDcmtk();
     DcmFileFormat ff;
-    if (ff.loadFile(OFFilename(path.c_str(), OFTrue)).bad()) return L"not readable as DICOM";
+    if (ff.loadFile(OFFilename(path.c_str(), OFTrue)).bad() && !ff.getDataset()->tagExists(DCM_PixelData) &&
+        !HasFloatPixels(ff.getDataset()))
+    {
+        // (read up to an error before its pixels: found in its bytes, or not readable)
+        std::vector<char> bytes;
+        if (!ReadPath(path, bytes) || !RecoverPixelData(ff.getDataset(), bytes.data(), bytes.size())) return L"not readable as DICOM";
+    }
     DcmDataset* ds = ff.getDataset();
     const E_TransferSyntax xfer = ds->getOriginalXfer();
     const std::wstring none = NoImage(ff);
@@ -109,20 +115,24 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     if (made->getStatus() == EIS_MissingAttribute)     // (ACR-NEMA: as DCMTK reads it)
         made = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer,
                                             flags | CIF_AcrNemaCompatibility, decoded ? 0 : static_cast<unsigned long>(frame), 1);
-    if (made->getStatus() != EIS_Normal)           // (what the file leaves out or has wrong: from a copy repaired)
+    if (made->getStatus() != EIS_Normal)           // (what the file leaves out or has wrong: RenderAgain)
     {
-        E_TransferSyntax as = decoded ? EXS_LittleEndianExplicit : xfer;
-        std::unique_ptr<DcmDataset> fixed(RepairedImage(decoded ? decoded.get() : ds, as));
-        if (fixed)
+        std::unique_ptr<DcmDataset> kept;
+        auto again = RenderAgain(decoded ? decoded.get() : ds, decoded ? EXS_LittleEndianExplicit : xfer, flags,
+                                 decoded ? 0 : static_cast<unsigned long>(frame), kept);
+        if (again)
         {
-            auto again = std::make_unique<DicomImage>(fixed.get(), as, flags | CIF_AcrNemaCompatibility,
-                                                      decoded ? 0 : static_cast<unsigned long>(frame), 1);
-            if (again->getStatus() == EIS_Normal)
-            {
-                made = std::move(again);
-                decoded = std::move(fixed);
-            }
+            made = std::move(again);
+            decoded = std::move(kept);
         }
+    }
+    if (made->getStatus() != EIS_Normal && !decoded)
+    {
+        // Its pixels cut short (the file ends before they do): found in its bytes, the rest zeros
+        std::vector<char> bytes;
+        if (ReadPath(path, bytes) && RecoverPixelData(ds, bytes.data(), bytes.size()))
+            made = std::make_unique<DicomImage>(ds, EXS_LittleEndianExplicit, flags | CIF_AcrNemaCompatibility,
+                                                static_cast<unsigned long>(frame), 1);
     }
     DicomImage& image = *made;
     if (image.getStatus() != EIS_Normal)
