@@ -1047,7 +1047,8 @@ static DcmPixelItem* LastFragment(DcmDataset* ds)
 
 // Compressed pixels the file ends inside of: DCMTK keeps their last fragment at the length it says, the
 // rest of it whatever its memory held before (the image of another file, at times). That fragment as long
-// as the bytes the file has of it. False if there is none such.
+// as the bytes the file has of it, a JPEG one with its end after them (its decoder then
+// fills the rest of its image, as it does with JPEG 2000). False if there is none such.
 bool TrimLastFragment(DcmDataset* ds, const char* data, size_t size)
 {
     DcmPixelItem* last = size < 8 ? nullptr : LastFragment(ds);
@@ -1064,6 +1065,11 @@ bool TrimLastFragment(DcmDataset* ds, const char* data, size_t size)
         const Uint32 said = static_cast<Uint32>(b[i + 4]) | (b[i + 5] << 8) | (b[i + 6] << 16) | (static_cast<Uint32>(b[i + 7]) << 24);
         if ((said != length && said + 1 != length) || i + 8 + static_cast<size_t>(said) <= size) continue;
         std::vector<Uint8> have(b + i + 8, b + size);
+        if (have.size() >= 4 && have[0] == 0xFF && have[1] == 0xD8 && (have[have.size() - 2] != 0xFF || have.back() != 0xD9))
+        {
+            have.push_back(0xFF);
+            have.push_back(0xD9);
+        }
         if (have.size() & 1) have.push_back(0);
         return last->putUint8Array(have.data(), static_cast<unsigned long>(have.size())).good();
     }
@@ -1599,7 +1605,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     // Read up to an error (garbage after the image, a file cut short...): what was read, when it has its
     // pixels, or they are found in its bytes (the summary says so)
     std::wstring readError;
-    TrimLastFragment(ff.getDataset(), data.data(), data.size());
+    const bool trimmed = TrimLastFragment(ff.getDataset(), data.data(), data.size());
     if (st.bad() && (ff.getDataset()->tagExists(DCM_PixelData) || HasFloatPixels(ff.getDataset()) ||
                      RecoverPixelData(ff.getDataset(), data.data(), data.size())))
     {
@@ -1616,6 +1622,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
         return r;
     }
     // (its pixels there, but cut short: the bytes there are, and zeros)
+    if (readError.empty() && trimmed) readError = L"  -  its pixels cut short";
     if (readError.empty() && RecoverPixelData(ff.getDataset(), data.data(), data.size()))
         readError = L"  -  its pixels cut short, the rest zeros";
     DcmDataset* ds = ff.getDataset();

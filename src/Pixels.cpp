@@ -29,7 +29,7 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     }
     DcmDataset* ds = ff.getDataset();
     const E_TransferSyntax xfer = ds->getOriginalXfer();
-    TrimLastFragment(ds, path);                     // (compressed, and the file ends in them)
+    if (TrimLastFragment(ds, path)) s.cutShort = true;     // (compressed, and the file ends in them)
     const std::wstring none = NoImage(ff);
     if (!none.empty()) return none;
     Sint32 frames = 1;
