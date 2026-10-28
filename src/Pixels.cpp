@@ -109,6 +109,21 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     if (made->getStatus() == EIS_MissingAttribute)     // (ACR-NEMA: as DCMTK reads it)
         made = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff, decoded ? EXS_LittleEndianExplicit : xfer,
                                             flags | CIF_AcrNemaCompatibility, decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    if (made->getStatus() != EIS_Normal)           // (what the file leaves out or has wrong: from a copy repaired)
+    {
+        E_TransferSyntax as = decoded ? EXS_LittleEndianExplicit : xfer;
+        std::unique_ptr<DcmDataset> fixed(RepairedImage(decoded ? decoded.get() : ds, as));
+        if (fixed)
+        {
+            auto again = std::make_unique<DicomImage>(fixed.get(), as, flags | CIF_AcrNemaCompatibility,
+                                                      decoded ? 0 : static_cast<unsigned long>(frame), 1);
+            if (again->getStatus() == EIS_Normal)
+            {
+                made = std::move(again);
+                decoded = std::move(fixed);
+            }
+        }
+    }
     DicomImage& image = *made;
     if (image.getStatus() != EIS_Normal)
     {

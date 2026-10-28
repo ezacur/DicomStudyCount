@@ -82,6 +82,8 @@ DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 a
 
 DcmDataset* DecodeEncapsulatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
+DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer);
+
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
 bool IsBitFrames(DcmDataset* ds, E_TransferSyntax xfer);

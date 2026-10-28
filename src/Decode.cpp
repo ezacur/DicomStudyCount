@@ -19,6 +19,14 @@ void InitDcmtk()
         DJDecoderRegistration::registerCodecs(EDC_guessLossyOnly);
         DJLSDecoderRegistration::registerCodecs();       // JPEG-LS (with the CharLS inside DCMTK)
         DcmRLEDecoderRegistration::registerCodecs();     // RLE
+        // What can be read of a file written wrong, as a viewer wants it: the transfer syntax of the
+        // dataset as it is (not as its meta says), implicit elements in an explicit one, a wrong length
+        // of the meta group or a wrong delimiter, and on past an error where DCMTK can
+        dcmAutoDetectDatasetXfer.set(OFTrue);
+        dcmAcceptUnexpectedImplicitEncoding.set(OFTrue);
+        dcmIgnoreFileMetaInformationGroupLength.set(OFTrue);
+        dcmReplaceWrongDelimitationItem.set(OFTrue);
+        dcmIgnoreParsingErrors.set(OFTrue);
     });
 }
 
@@ -315,9 +323,21 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
         const OPJ_UINT32 samples = image->numcomps >= 3 ? 3 : 1;
         const opj_image_comp_t* c = image->comps;
         const OPJ_UINT32 w = c[0].w, h = c[0].h, prec = c[0].prec, sgnd = c[0].sgnd;
+        // The same precision in all; the color ones may have fewer pixels, subsampled (4:2:2, 4:2:0: their
+        // dx and dy against those of the first one), each of them then over its 2 or 4
         bool same = w > 0 && h > 0 && prec >= 1 && prec <= 16;
+        OPJ_UINT32 rx[3] = { 1, 1, 1 }, ry[3] = { 1, 1, 1 };
+        bool subsampled = false;
         for (OPJ_UINT32 k = 0; k < samples && same; k++)
-            same = c[k].w == w && c[k].h == h && c[k].prec == prec && c[k].sgnd == sgnd && c[k].data;
+        {
+            same = c[k].prec == prec && c[k].sgnd == sgnd && c[k].data && c[0].dx > 0 && c[0].dy > 0 &&
+                   c[k].dx % c[0].dx == 0 && c[k].dy % c[0].dy == 0;
+            if (!same) break;
+            rx[k] = c[k].dx / c[0].dx;
+            ry[k] = c[k].dy / c[0].dy;
+            same = rx[k] >= 1 && ry[k] >= 1 && c[k].w >= (w + rx[k] - 1) / rx[k] && c[k].h >= (h + ry[k] - 1) / ry[k];
+            subsampled = subsampled || rx[k] > 1 || ry[k] > 1;
+        }
         if (same)
         {
             out = new DcmDataset(*ds);
@@ -326,19 +346,26 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
             const bool bytes = prec <= 8 && !sgnd;
             // The values within their range: lossy ones near its ends come out beyond them (65536 is no 0)
             const OPJ_INT32 lo = sgnd ? -(1 << (prec - 1)) : 0, hi = sgnd ? (1 << (prec - 1)) - 1 : (1 << prec) - 1;
-            auto value = [&](OPJ_UINT32 k, size_t i) { const OPJ_INT32 x = c[k].data[i]; return x < lo ? lo : x > hi ? hi : x; };
+            auto value = [&](OPJ_UINT32 k, OPJ_UINT32 x, OPJ_UINT32 y) {
+                const OPJ_INT32 v = c[k].data[static_cast<size_t>(y / ry[k]) * c[k].w + x / rx[k]];
+                return v < lo ? lo : v > hi ? hi : v;
+            };
             if (bytes)
             {
                 std::vector<Uint8> v(n * samples);
-                for (size_t i = 0; i < n; i++)
-                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint8>(value(k, i));
+                for (OPJ_UINT32 y = 0, i = 0; y < h; y++)
+                    for (OPJ_UINT32 x = 0; x < w; x++, i++)
+                        for (OPJ_UINT32 k = 0; k < samples; k++)
+                            v[static_cast<size_t>(i) * samples + k] = static_cast<Uint8>(value(k, x, y));
                 out->putAndInsertUint8Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
             }
             else
             {
                 std::vector<Uint16> v(n * samples);
-                for (size_t i = 0; i < n; i++)
-                    for (OPJ_UINT32 k = 0; k < samples; k++) v[i * samples + k] = static_cast<Uint16>(value(k, i));
+                for (OPJ_UINT32 y = 0, i = 0; y < h; y++)
+                    for (OPJ_UINT32 x = 0; x < w; x++, i++)
+                        for (OPJ_UINT32 k = 0; k < samples; k++)
+                            v[static_cast<size_t>(i) * samples + k] = static_cast<Uint16>(value(k, x, y));
                 out->putAndInsertUint16Array(DCM_PixelData, v.data(), static_cast<unsigned long>(v.size()));
             }
             out->putAndInsertUint16(DCM_SamplesPerPixel, static_cast<Uint16>(samples));
@@ -351,8 +378,9 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
             out->findAndDeleteElement(DCM_NumberOfFrames);
             if (samples == 3)
             {
-                // OpenJPEG undoes the color transform of the codestream: RGB
-                out->putAndInsertString(DCM_PhotometricInterpretation, "RGB");
+                // OpenJPEG undoes the color transform of the codestream: RGB. Subsampled, there is none (it
+                // needs the three of the same size): YCbCr, as the header says (YBR_FULL_422)
+                out->putAndInsertString(DCM_PhotometricInterpretation, subsampled ? "YBR_FULL" : "RGB");
                 out->putAndInsertUint16(DCM_PlanarConfiguration, 0);
             }
             else
@@ -649,6 +677,63 @@ DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 a
     }
     out->findAndDeleteElement(DCM_NumberOfFrames);
     return out;
+}
+
+// A copy of the dataset with what DCMTK needs to render it and the file leaves out or has wrong, as
+// viewers take it: SamplesPerPixel 1 when absent; a PhotometricInterpretation absent or not one of
+// DICOM, MONOCHROME2 (one sample) or RGB; PlanarConfiguration 0 when absent, or with 4:2:2 (which has no
+// planes); PixelRepresentation 0 when absent; compressed with BitsAllocated 12 or so, 16; BitsStored and
+// HighBit within it; color of 32 bits (DCMTK renders it not) as 16, its top ones. Null if nothing is to
+// change. `xfer` in: the one of the dataset; out: the one to render the copy with.
+DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer)
+{
+    std::unique_ptr<DcmDataset> out(new DcmDataset(*ds));
+    bool changed = false;
+    auto set = [&](const DcmTagKey& key, Uint16 v) { out->putAndInsertUint16(key, v); changed = true; };
+    const bool encapsulated = DcmXfer(xfer).usesEncapsulatedFormat();
+    Uint16 samples = 0, planar = 0, representation = 0, allocated = 0, stored = 0, high = 0;
+    if (ds->findAndGetUint16(DCM_SamplesPerPixel, samples).bad() || samples == 0) set(DCM_SamplesPerPixel, samples = 1);
+    OFString photometric;
+    ds->findAndGetOFString(DCM_PhotometricInterpretation, photometric);
+    static const char* const known[] = { "MONOCHROME1", "MONOCHROME2", "PALETTE COLOR", "RGB", "YBR_FULL", "YBR_FULL_422",
+                                         "YBR_PARTIAL_422", "YBR_PARTIAL_420", "YBR_ICT", "YBR_RCT", "ARGB", "CMYK", "HSV" };
+    if (std::none_of(std::begin(known), std::end(known), [&](const char* k) { return photometric == k; }))
+    {
+        out->putAndInsertString(DCM_PhotometricInterpretation, samples == 1 ? "MONOCHROME2" : "RGB");
+        changed = true;
+    }
+    if (samples > 1 && (ds->findAndGetUint16(DCM_PlanarConfiguration, planar).bad() ||
+                        (planar == 1 && photometric.find("_42") != OFString_npos)))
+        set(DCM_PlanarConfiguration, 0);
+    if (ds->findAndGetUint16(DCM_PixelRepresentation, representation).bad()) set(DCM_PixelRepresentation, 0);
+    ds->findAndGetUint16(DCM_BitsAllocated, allocated);
+    if (encapsulated && allocated > 8 && allocated < 16) set(DCM_BitsAllocated, allocated = 16);
+    if (ds->findAndGetUint16(DCM_BitsStored, stored).bad() || stored == 0 || stored > allocated) set(DCM_BitsStored, stored = allocated);
+    if (ds->findAndGetUint16(DCM_HighBit, high).bad() || high >= allocated || high + 1 < stored) set(DCM_HighBit, high = stored - 1);
+    // Color of 32 bits: its top 16 (as DCMTK holds them: in words, the high one second, or first big endian)
+    DcmElement* e = nullptr;
+    Uint16* words = nullptr;
+    if (!encapsulated && allocated == 32 && samples > 1 && out->findAndGetElement(DCM_PixelData, e).good() && e &&
+        e->getUint16Array(words).good() && words)
+    {
+        const bool big = DcmXfer(xfer).isBigEndian();
+        const size_t n = e->getLength() / 4;
+        const int shift = stored > 16 ? stored - 16 : 0;
+        std::vector<Uint16> top(n);
+        for (size_t i = 0; i < n; i++)
+        {
+            const Uint32 v = big ? (static_cast<Uint32>(words[2 * i]) << 16) | words[2 * i + 1]
+                                 : (static_cast<Uint32>(words[2 * i + 1]) << 16) | words[2 * i];
+            top[i] = static_cast<Uint16>((std::min)(v >> shift, 0xFFFFu));
+        }
+        out->findAndDeleteElement(DCM_PixelData);
+        out->putAndInsertUint16Array(DCM_PixelData, top.data(), static_cast<unsigned long>(n));
+        set(DCM_BitsAllocated, 16);
+        set(DCM_BitsStored, 16);
+        set(DCM_HighBit, 15);
+        xfer = EXS_LittleEndianExplicit;              // (its new pixels as this machine holds them)
+    }
+    return changed ? out.release() : nullptr;
 }
 
 // 1-bit pixels, one a byte (0 or 255), as a copy of the dataset with them as 8 bits
@@ -1072,6 +1157,22 @@ std::wstring ShowFrame(Rendered& r, int frame, bool keep)
         im->image = std::make_unique<DicomImage>(decoded ? static_cast<DcmObject*>(decoded.get()) : &ff,
                                                  decoded ? EXS_LittleEndianExplicit : im->xfer, CIF_UsePartialAccessToPixelData | CIF_AcrNemaCompatibility,
                                                  decoded ? 0 : static_cast<unsigned long>(frame), 1);
+    // What the file leaves out or has wrong, as viewers take it: again, from a copy repaired
+    if (im->image->getStatus() != EIS_Normal)
+    {
+        E_TransferSyntax as = decoded ? EXS_LittleEndianExplicit : im->xfer;
+        std::unique_ptr<DcmDataset> fixed(RepairedImage(decoded ? decoded.get() : ff.getDataset(), as));
+        if (fixed)
+        {
+            auto again = std::make_unique<DicomImage>(fixed.get(), as, CIF_UsePartialAccessToPixelData | CIF_AcrNemaCompatibility,
+                                                      decoded ? 0 : static_cast<unsigned long>(frame), 1);
+            if (again->getStatus() == EIS_Normal)
+            {
+                im->image = std::move(again);
+                decoded = std::move(fixed);
+            }
+        }
+    }
     DicomImage& image = *im->image;
     if (image.getStatus() != EIS_Normal)
     {
@@ -1165,6 +1266,14 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     ff.transferInit();
     OFCondition st = ff.read(in, EXS_Unknown, EGL_noChange, DCM_MaxReadLength);
     ff.transferEnd();
+    // Read up to an error (garbage after the image, a file cut short...): what was read, when it has its
+    // pixels (the summary says so)
+    std::wstring readError;
+    if (st.bad() && (ff.getDataset()->tagExists(DCM_PixelData) || HasFloatPixels(ff.getDataset())))
+    {
+        readError = L"  -  read up to an error: " + Widen(st.text());
+        st = EC_Normal;
+    }
     if (st.bad())
     {
         // Deflated files: this DCMTK has no zlib (as the one of I3Dfileformat)
@@ -1232,7 +1341,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
         else r.summary += L"  -  image not shown: " + why;
     }
     else r.summary += L"  -  no image";
-    r.summary += L"  -  compression: " + Compression(tsUid.c_str());
+    r.summary += L"  -  compression: " + Compression(tsUid.c_str()) + readError;
     if (what == Render::Thumbnail) r.imaging.reset();       // only its pixels
     else Annotate(r, ds);
     return r;
