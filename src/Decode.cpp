@@ -371,17 +371,22 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
             out->findAndDeleteElement(DCM_PixelData);
             const size_t n = static_cast<size_t>(w) * h;
             // Monochrome, signed when its header or its codestream says so (the other one wrong: its bits the
-            // same, read as signed; a CT of 0 to 65535 is no CT)
+            // same, read as signed; a CT of 0 to 65535 is no CT). Unsigned in its codestream, its words as they
+            // are, read as signed: its sign not extended from its precision (as dicomread, as the file's own)
             Uint16 representation = 0;
             const bool signedOut = sgnd != 0 || (samples == 1 && ds->findAndGetUint16(DCM_PixelRepresentation, representation).good() &&
                                                  representation == 1);
             const bool bytes = prec <= 8 && !signedOut;
+            // An overlay its header says is in its bits above BitsStored (its codestream of more bits for it):
+            // that bit, and only it, taken from the values (as dicomread does)
+            Uint16 stored = 0;
+            const Uint32 overlay = samples == 1 && ds->findAndGetUint16(DCM_BitsStored, stored).good() ? OverlayBits(ds, stored) : 0;
             // The values within their range: lossy ones near its ends come out beyond them (65536 is no 0)
             const OPJ_INT32 lo = sgnd ? -(1 << (prec - 1)) : 0, hi = sgnd ? (1 << (prec - 1)) - 1 : (1 << prec) - 1;
             auto value = [&](OPJ_UINT32 k, OPJ_UINT32 x, OPJ_UINT32 y) {
                 OPJ_INT32 v = c[k].data[static_cast<size_t>(y / ry[k]) * c[k].w + x / rx[k]];
                 v = v < lo ? lo : v > hi ? hi : v;
-                if (signedOut && !sgnd && v >= (1 << (prec - 1))) v -= 1 << prec;
+                if (overlay && v >= 0) v &= ~static_cast<OPJ_INT32>(overlay);
                 return v;
             };
             if (bytes)
@@ -406,8 +411,9 @@ DcmDataset* DecodeJpeg2000(DcmDataset* ds, bool multiframe, int frame)
             out->putAndInsertUint16(DCM_Rows, static_cast<Uint16>(h));
             out->putAndInsertUint16(DCM_Columns, static_cast<Uint16>(w));
             out->putAndInsertUint16(DCM_BitsAllocated, bytes ? 8 : 16);
-            out->putAndInsertUint16(DCM_BitsStored, static_cast<Uint16>(prec));
-            out->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(prec - 1));
+            const Uint16 bits = signedOut && !sgnd ? 16 : static_cast<Uint16>(prec);
+            out->putAndInsertUint16(DCM_BitsStored, bits);
+            out->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(bits - 1));
             out->putAndInsertUint16(DCM_PixelRepresentation, signedOut ? 1 : 0);
             out->findAndDeleteElement(DCM_NumberOfFrames);
             if (samples == 3)
@@ -1170,6 +1176,57 @@ void RgbJpegAsRgb(DcmDataset* ds)
     }
 }
 
+// The bits of a dataset's pixels at or above `from` that are overlays in them (60xx,0102: as US, or as
+// UN, its two bytes little endian, as some write it): a mask of them, 0 if none
+Uint32 OverlayBits(DcmDataset* ds, Uint16 from)
+{
+    Uint32 mask = 0;
+    for (Uint16 group = 0x6000; group <= 0x601E; group += 2)
+    {
+        DcmElement* e = nullptr;
+        Uint16 position = 0;
+        Uint8* b = nullptr;
+        if (ds->findAndGetElement(DcmTagKey(group, 0x0102), e).bad() || !e) continue;
+        if (e->getUint16(position).bad())
+        {
+            if (e->getLength() < 2 || e->getUint8Array(b).bad() || !b) continue;
+            position = static_cast<Uint16>(b[0] | (b[1] << 8));
+        }
+        if (position >= from && position < 32) mask |= 1u << position;
+    }
+    return mask;
+}
+
+// Monochrome pixels not compressed (or JPEG-LS, or lossless JPEG unsigned), of fewer bits stored than
+// allocated: their values as the file has them, all the bits of each (signed or not, as PixelRepresentation
+// says), not masked to BitsStored nor their sign extended from it, as dicomread and fdicomread read them (a
+// pixel of 4096 in 12 bits stays 4096, not 0). But an overlay in their bits above BitsStored (60xx,0102) is
+// no value of theirs: their bits up to it only, the overlay apart (as dicomread too). Of a dataset read, once
+// (its header shown as it is, before).
+void RawStoredBits(DcmDataset* ds)
+{
+    Uint16 allocated = 0, stored = 0, samples = 1, representation = 0;
+    ds->findAndGetUint16(DCM_SamplesPerPixel, samples);
+    ds->findAndGetUint16(DCM_PixelRepresentation, representation);
+    const E_TransferSyntax xfer = ds->getOriginalXfer();
+    const bool jpegLs = xfer == EXS_JPEGLSLossless || xfer == EXS_JPEGLSLossy;
+    const bool jpegLossless = xfer == EXS_JPEGProcess14 || xfer == EXS_JPEGProcess14SV1;
+    if ((DcmXfer(xfer).usesEncapsulatedFormat() && !jpegLs && !jpegLossless) || samples != 1 || !ds->tagExists(DCM_PixelData) ||
+        ds->findAndGetUint16(DCM_BitsAllocated, allocated).bad() || (allocated != 8 && allocated != 16 && allocated != 32) ||
+        ds->findAndGetUint16(DCM_BitsStored, stored).bad() || stored >= allocated)
+        return;
+    // (JPEG-LS: DCMTK's decoder takes BitsStored for its bytes a sample, the same so. Lossless JPEG: its
+    // decoder takes the precision of its data, but gives its samples unsigned: signed, as BitsStored says)
+    if (jpegLs && (allocated != 16 || stored <= 8)) return;
+    if (jpegLossless && representation != 0) return;
+    Uint16 top = allocated;
+    const Uint32 overlay = OverlayBits(ds, stored);
+    if (overlay) for (top = stored; !(overlay & (1u << top)); top++) {}
+    if (top <= stored) return;
+    ds->putAndInsertUint16(DCM_BitsStored, top);
+    ds->putAndInsertUint16(DCM_HighBit, static_cast<Uint16>(top - 1));
+}
+
 // GE's private syntax (1.2.840.113619.5.2): implicit VR little endian, its pixels big endian. DCMTK
 // turns those of 16 bits; of 8, in words of 16 too, it takes them as they are, each two the other way
 // round: turned, once, when read
@@ -1836,6 +1893,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     r.seriesNumber = seriesNumber.c_str();
 
     if (what == Render::Everything) DumpHeader(ff, r.tags, r.names);
+    RawStoredBits(ds);                              // (after its header, shown as it is)
 
     r.summary = sopClass.empty() ? L"DICOM" : ObjectType(sopClass.c_str());
     if (what != Render::Thumbnail && ds->tagExists(DCM_DirectoryRecordSequence))

@@ -34,6 +34,7 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     OrderBigEndianWords(ds);
     OrderGePixels(ff);
     RgbJpegAsRgb(ds);
+    RawStoredBits(ds);
     const std::wstring none = NoImage(ff);
     if (!none.empty()) return none;
     Sint32 frames = 1;

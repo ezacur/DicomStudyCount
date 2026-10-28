@@ -99,6 +99,8 @@ unsigned long PartialAccess(DcmDataset* ds, E_TransferSyntax xfer);
 void OrderBigEndianWords(DcmDataset* ds);
 void OrderGePixels(DcmFileFormat& ff);
 void RgbJpegAsRgb(DcmDataset* ds);
+Uint32 OverlayBits(DcmDataset* ds, Uint16 from);
+void RawStoredBits(DcmDataset* ds);
 
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
