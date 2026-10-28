@@ -15,6 +15,7 @@ struct Slice
     double center = 0, window = 0;                 // the first window of the header (width 0: none)
     double frameTime = 0;                          // a multi-frame file: ms from frame to frame (0: not known)
     bool isFloat = false;                          // decimal values (Float Pixel Data), in their units
+    bool cutShort = false;                         // its pixels end in the file before the image: zeros after them
 };
 
 bool FirstNumber(const std::string& value, double& out);

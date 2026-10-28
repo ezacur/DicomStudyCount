@@ -227,6 +227,13 @@ static void Quaternion(double R[3][3], double& qb, double& qc, double& qd, doubl
     qd = d;
 }
 
+// What an export says of images whose pixels end in their files before the image does: written, the
+// rest zeros, which are not in the files (so nobody takes them for data)
+static std::wstring CutShort(long n)
+{
+    return std::to_wstring(n) + (n == 1 ? L" of its images is" : L" of its images are") + L" cut short in its file (zeros after its pixels)";
+}
+
 // The pictures of a unit: the window dragged in the preview, that of the header, or that of most of
 // the values (0.5 % to 99.5 %) of up to 8 of its images
 std::wstring WritePictures(IWICImagingFactory* factory, const ExportUnit& u, bool dragged, double center, double width,
@@ -268,12 +275,12 @@ std::wstring WritePictures(IWICImagingFactory* factory, const ExportUnit& u, boo
         const HRESULT hr = SavePng(factory, u.out, Shrink(first, all, lo, hi, first.width, first.height));
         done++;
         wrote = SUCCEEDED(hr);
-        return wrote ? std::wstring() : L"it could not be written";
+        return !wrote ? L"it could not be written" : first.cutShort ? CutShort(1) : std::wstring();
     }
     double delay = u.overTime ? (st.delay > 0 ? st.delay : first.frameTime > 0 ? first.frameTime : 100) : 80;
     GifWriter gif(factory);
     HRESULT hr = gif.Open(u.out);
-    long skipped = 0;
+    long skipped = 0, cut = 0;
     for (size_t k = 0; k < order.size() && SUCCEEDED(hr); k++)
     {
         if (cancel) return L"stopped";
@@ -281,14 +288,19 @@ std::wstring WritePictures(IWICImagingFactory* factory, const ExportUnit& u, boo
         const Slice* use = &first;
         if (k > 0) use = DecodeSlice(order[k].first, order[k].second, false, s).empty() ? &s : nullptr;
         if (use && use->width == first.width && use->height == first.height && use->mono == first.mono)
+        {
             hr = gif.Add(Shrink(*use, all, lo, hi, first.width, first.height), static_cast<int>(delay));
+            if (use->cutShort) cut++;
+        }
         else skipped++;
         done++;
     }
     if (SUCCEEDED(hr)) hr = gif.Close();
     if (FAILED(hr)) return L"it could not be written";
     wrote = true;
-    return skipped ? std::to_wstring(skipped) + L" of its images could not be read (left out)" : std::wstring();
+    std::wstring note = skipped ? std::to_wstring(skipped) + L" of its images could not be read (left out)" : std::wstring();
+    if (cut) note += (note.empty() ? L"" : L"; ") + CutShort(cut);
+    return note;
 }
 
 // A NIfTI-1 volume (.nii): columns, rows, positions and times, the values as stored with their rescale
@@ -388,7 +400,7 @@ std::wstring WriteNifti(const ExportUnit& u, const std::atomic<bool>& cancel, st
     bool ok = fwrite(&hd, sizeof(hd), 1, f) == 1 && fwrite(extension, 4, 1, f) == 1;
     const size_t n = static_cast<size_t>(first.width) * first.height;
     std::vector<BYTE> bytes(n * hd.bitpix / 8);
-    long unread = 0;
+    long unread = 0, cut = 0;
     for (int t = 0; t < T && ok; t++)
         for (int z = 0; z < Z && ok; z++)
         {
@@ -397,6 +409,7 @@ std::wstring WriteNifti(const ExportUnit& u, const std::atomic<bool>& cancel, st
             const Slice* use = &first;
             if (t > 0 || z > 0) use = DecodeSlice(path(z, t).path, path(z, t).frame, true, s).empty() ? &s : nullptr;
             if (!use || use->width != first.width || use->height != first.height || use->mono != first.mono) { use = nullptr; unread++; }
+            else if (use->cutShort) cut++;
             std::fill(bytes.begin(), bytes.end(), static_cast<BYTE>(0));
             for (size_t i = 0; use && i < n; i++)
             {
@@ -426,7 +439,9 @@ std::wstring WriteNifti(const ExportUnit& u, const std::atomic<bool>& cancel, st
     ok = fclose(f) == 0 && ok;
     if (!ok) return L"it could not be written";
     wrote = true;
-    return unread ? std::to_wstring(unread) + L" of its images could not be read (zeros there)" : std::wstring();
+    std::wstring note = unread ? std::to_wstring(unread) + L" of its images could not be read (zeros there)" : std::wstring();
+    if (cut) note += (note.empty() ? L"" : L"; ") + CutShort(cut);
+    return note;
 }
 
 static std::string Base64(const std::vector<BYTE>& in)

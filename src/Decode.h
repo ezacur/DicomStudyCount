@@ -82,12 +82,16 @@ DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 a
 
 DcmDataset* DecodeEncapsulatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
-DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer);
+// (cut: set when its pixels end before the image does, the rest zeros: data that is not in the file)
+DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer, bool* cut = nullptr);
 
 std::unique_ptr<DicomImage> RenderAgain(DcmDataset* ds, E_TransferSyntax xfer, unsigned long flags, unsigned long frame,
-                                        std::unique_ptr<DcmDataset>& kept);
+                                        std::unique_ptr<DcmDataset>& kept, bool* cut = nullptr);
 
-bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size);
+bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size, bool* cut = nullptr);
+
+bool TrimLastFragment(DcmDataset* ds, const char* data, size_t size);
+bool TrimLastFragment(DcmDataset* ds, const std::wstring& path);
 
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 

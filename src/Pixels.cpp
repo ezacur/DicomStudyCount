@@ -24,10 +24,12 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     {
         // (read up to an error before its pixels: found in its bytes, or not readable)
         std::vector<char> bytes;
-        if (!ReadPath(path, bytes) || !RecoverPixelData(ff.getDataset(), bytes.data(), bytes.size())) return L"not readable as DICOM";
+        if (!ReadPath(path, bytes) || !RecoverPixelData(ff.getDataset(), bytes.data(), bytes.size(), &s.cutShort))
+            return L"not readable as DICOM";
     }
     DcmDataset* ds = ff.getDataset();
     const E_TransferSyntax xfer = ds->getOriginalXfer();
+    TrimLastFragment(ds, path);                     // (compressed, and the file ends in them)
     const std::wstring none = NoImage(ff);
     if (!none.empty()) return none;
     Sint32 frames = 1;
@@ -119,7 +121,7 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     {
         std::unique_ptr<DcmDataset> kept;
         auto again = RenderAgain(decoded ? decoded.get() : ds, decoded ? EXS_LittleEndianExplicit : xfer, flags,
-                                 decoded ? 0 : static_cast<unsigned long>(frame), kept);
+                                 decoded ? 0 : static_cast<unsigned long>(frame), kept, &s.cutShort);
         if (again)
         {
             made = std::move(again);
@@ -130,7 +132,7 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     {
         // Its pixels cut short (the file ends before they do): found in its bytes, the rest zeros
         std::vector<char> bytes;
-        if (ReadPath(path, bytes) && RecoverPixelData(ds, bytes.data(), bytes.size()))
+        if (ReadPath(path, bytes) && RecoverPixelData(ds, bytes.data(), bytes.size(), &s.cutShort))
             made = std::make_unique<DicomImage>(ds, EXS_LittleEndianExplicit, flags | CIF_AcrNemaCompatibility,
                                                 static_cast<unsigned long>(frame), 1);
     }

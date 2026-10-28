@@ -713,7 +713,7 @@ DcmDataset* NativeCopy(DcmDataset* ds, const std::vector<Uint8>& bytes, Uint16 a
 // HighBit within it; pixels cut short, the rest zeros (as dicomread does); color of 32 bits (DCMTK renders
 // it not) as 16, its top ones; a palette DCMTK takes not (16 bits, 65536 entries) applied here, as RGB.
 // Null if nothing is to change. `xfer` in: the one of the dataset; out: the one to render the copy with.
-DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer)
+DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer, bool* cut)
 {
     std::unique_ptr<DcmDataset> out(new DcmDataset(*ds));
     bool changed = false;
@@ -791,6 +791,7 @@ DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer)
                 memcpy(all.data(), half, (std::min)(static_cast<size_t>(e->getLength()), want));
                 out->putAndInsertUint16Array(DCM_PixelData, all.data(), static_cast<unsigned long>(all.size()));
                 changed = true;
+                if (cut) *cut = true;
             }
             else if (e->getUint8Array(bytes).good() && bytes)
             {
@@ -798,6 +799,7 @@ DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer)
                 memcpy(all.data(), bytes, (std::min)(static_cast<size_t>(e->getLength()), want));
                 out->putAndInsertUint8Array(DCM_PixelData, all.data(), static_cast<unsigned long>(all.size()));
                 changed = true;
+                if (cut) *cut = true;
             }
         }
     }
@@ -939,10 +941,10 @@ DcmDataset* RepairedImage(DcmDataset* ds, E_TransferSyntax& xfer)
 // compressed, from a copy of the whole dataset decompressed (DCMTK finds its frames then, where it may
 // not one by one). Null if neither; `kept` holds the dataset the image reads.
 std::unique_ptr<DicomImage> RenderAgain(DcmDataset* ds, E_TransferSyntax xfer, unsigned long flags, unsigned long frame,
-                                        std::unique_ptr<DcmDataset>& kept)
+                                        std::unique_ptr<DcmDataset>& kept, bool* cut)
 {
     E_TransferSyntax as = xfer;
-    std::unique_ptr<DcmDataset> fixed(RepairedImage(ds, as));
+    std::unique_ptr<DcmDataset> fixed(RepairedImage(ds, as, cut));
     if (fixed)
     {
         auto image = std::make_unique<DicomImage>(fixed.get(), as, flags | CIF_AcrNemaCompatibility, frame, 1);
@@ -972,7 +974,7 @@ std::unique_ptr<DicomImage> RenderAgain(DcmDataset* ds, E_TransferSyntax xfer, u
 // found by its tag in its bytes, from the end, and taken when its length is that of the image its
 // attributes describe (the bytes there are, cut short, and zeros after them) - as the readers of the bytes
 // themselves do. Little or big endian, explicit or implicit VR. False if there is none such.
-bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size)
+bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size, bool* cut)
 {
     Uint16 rows = 0, columns = 0, samples = 1, allocated = 0;
     Sint32 frames = 1;
@@ -1012,6 +1014,7 @@ bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size)
         // (cut short: the bytes there are, and zeros)
         std::vector<Uint8> raw(want, 0);
         memcpy(raw.data(), b + start, (std::min)(want, size - start));
+        if (cut && size - start < want) *cut = true;
         if (allocated == 8) ds->putAndInsertUint8Array(DCM_PixelData, raw.data(), static_cast<unsigned long>(want));
         else
         {
@@ -1021,6 +1024,48 @@ bool RecoverPixelData(DcmDataset* ds, const char* data, size_t size)
             ds->putAndInsertUint16Array(DCM_PixelData, words.data(), static_cast<unsigned long>(words.size()));
         }
         return true;
+    }
+    return false;
+}
+
+// The last fragment of its pixels, when they are compressed (not the table of offsets): null if none
+static DcmPixelItem* LastFragment(DcmDataset* ds)
+{
+    DcmElement* element = nullptr;
+    if (ds->findAndGetElement(DCM_PixelData, element).bad() || !element) return nullptr;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    DcmPixelItem* last = nullptr;
+    if (!DcmXfer(key).usesEncapsulatedFormat() || pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq ||
+        seq->card() < 2 || seq->getItem(last, seq->card() - 1).bad())
+        return nullptr;
+    return last;
+}
+
+// Compressed pixels the file ends inside of: DCMTK keeps their last fragment at the length it says, the
+// rest of it whatever its memory held before (the image of another file, at times). That fragment as long
+// as the bytes the file has of it. False if there is none such.
+bool TrimLastFragment(DcmDataset* ds, const char* data, size_t size)
+{
+    DcmPixelItem* last = size < 8 ? nullptr : LastFragment(ds);
+    if (!last) return false;
+    const Uint32 length = last->getLength();
+    auto b = reinterpret_cast<const unsigned char*>(data);
+    // (it ends with the delimiter of its sequence: not cut)
+    if (!memcmp(b + size - 8, "\xFE\xFF\xDD\xE0\0\0\0\0", 8)) return false;
+    // (its item tag, from the end, with a length that goes past it; an odd one DCMTK has made even)
+    const size_t from = size > static_cast<size_t>(length) + 8 ? size - length - 8 : 0;      // (it is no further back)
+    for (size_t i = size - 7; i-- > from;)
+    {
+        if (b[i] != 0xFE || b[i + 1] != 0xFF || b[i + 2] != 0x00 || b[i + 3] != 0xE0) continue;
+        const Uint32 said = static_cast<Uint32>(b[i + 4]) | (b[i + 5] << 8) | (b[i + 6] << 16) | (static_cast<Uint32>(b[i + 7]) << 24);
+        if ((said != length && said + 1 != length) || i + 8 + static_cast<size_t>(said) <= size) continue;
+        std::vector<Uint8> have(b + i + 8, b + size);
+        if (have.size() & 1) have.push_back(0);
+        return last->putUint8Array(have.data(), static_cast<unsigned long>(have.size())).good();
     }
     return false;
 }
@@ -1554,6 +1599,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     // Read up to an error (garbage after the image, a file cut short...): what was read, when it has its
     // pixels, or they are found in its bytes (the summary says so)
     std::wstring readError;
+    TrimLastFragment(ff.getDataset(), data.data(), data.size());
     if (st.bad() && (ff.getDataset()->tagExists(DCM_PixelData) || HasFloatPixels(ff.getDataset()) ||
                      RecoverPixelData(ff.getDataset(), data.data(), data.size())))
     {
@@ -1659,6 +1705,30 @@ bool ReadPath(const std::wstring& path, std::vector<char>& data)
     }
     CloseHandle(h);
     return ok;
+}
+
+// The same, from the end of the file (as much of it as that fragment could be) when it does not end with
+// the delimiter of its sequence
+bool TrimLastFragment(DcmDataset* ds, const std::wstring& path)
+{
+    DcmPixelItem* last = LastFragment(ds);
+    if (!last) return false;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {}, at = {};
+    std::vector<char> tail(8);
+    DWORD n = 0;
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart >= 8;
+    auto read = [&](LONGLONG count) {
+        tail.resize(static_cast<size_t>(count));
+        at.QuadPart = size.QuadPart - count;
+        return SetFilePointerEx(h, at, nullptr, FILE_BEGIN) && ReadFile(h, tail.data(), static_cast<DWORD>(count), &n, nullptr) && n == count;
+    };
+    ok = ok && read(8) && memcmp(tail.data(), "\xFE\xFF\xDD\xE0\0\0\0\0", 8) &&
+         read((std::min)(size.QuadPart, static_cast<LONGLONG>(last->getLength()) + 8));
+    CloseHandle(h);
+    return ok && TrimLastFragment(ds, tail.data(), tail.size());
 }
 
 // The whole file in memory, up to 1 GB
