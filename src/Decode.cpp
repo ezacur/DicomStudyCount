@@ -1109,6 +1109,67 @@ DcmDataset* DecodeCutJpeg(DcmDataset* ds, int frame)
     return NativeCopy(whole.get(), out, allocated);
 }
 
+// Lossy JPEG of three components its header says are RGB, whose markers say nothing (no JFIF, no Adobe
+// marker of its transform, components not 1, 2, 3, as those of YCbCr are): libjpeg takes them for YCbCr and
+// turns them, wrong (a slide of a white background magenta). Its components named R, G, B, as libjpeg
+// reads RGB, in each frame, once, when read. Those with JFIF, or numbered 1 to 3, as they are: YCbCr, as
+// devices write it and call RGB.
+void RgbJpegAsRgb(DcmDataset* ds)
+{
+    const E_TransferSyntax xfer = ds->getOriginalXfer();
+    OFString photometric;
+    Uint16 samples = 0;
+    DcmElement* element = nullptr;
+    if ((xfer != EXS_JPEGProcess1 && xfer != EXS_JPEGProcess2_4) || ds->findAndGetUint16(DCM_SamplesPerPixel, samples).bad() ||
+        samples != 3 || ds->findAndGetOFString(DCM_PhotometricInterpretation, photometric).bad() || photometric != "RGB" ||
+        ds->findAndGetElement(DCM_PixelData, element).bad() || !element)
+        return;
+    auto pixels = static_cast<DcmPixelData*>(element);
+    E_TransferSyntax key;
+    const DcmRepresentationParameter* param = nullptr;
+    pixels->getOriginalRepresentationKey(key, param);
+    DcmPixelSequence* seq = nullptr;
+    if (pixels->getEncapsulatedRepresentation(key, param, seq).bad() || !seq) return;
+    for (unsigned long i = 1; i < seq->card(); i++)
+    {
+        DcmPixelItem* item = nullptr;
+        Uint8* b = nullptr;
+        if (seq->getItem(item, i).bad() || !item || item->getUint8Array(b).bad() || !b) continue;
+        const size_t n = item->getLength();
+        if (n < 4 || b[0] != 0xFF || b[1] != 0xD8) continue;          // (a frame begins in it)
+        // Its markers up to its first scan: what they say, and where its component numbers are
+        bool says = false;
+        std::vector<size_t> ids;                                       // (in its SOF, then its SOS)
+        size_t k = 2;
+        while (k + 4 <= n && b[k] == 0xFF)
+        {
+            const Uint8 m = b[k + 1];
+            const size_t length = (static_cast<size_t>(b[k + 2]) << 8) | b[k + 3];
+            if (length < 2 || k + 2 + length > n) break;
+            if (m == 0xE0 && length >= 7 && !memcmp(b + k + 4, "JFIF", 4)) says = true;
+            if (m == 0xEE && length >= 14 && !memcmp(b + k + 4, "Adobe", 5)) says = true;
+            if ((m >= 0xC0 && m <= 0xC3) && length >= 8 + 3u * 3 && b[k + 9] == 3)
+                for (size_t c = 0; c < 3; c++) ids.push_back(k + 10 + 3 * c);
+            if (m == 0xDA)
+            {
+                if (length >= 3 + 2u * 3 && b[k + 4] == 3) for (size_t c = 0; c < 3; c++) ids.push_back(k + 5 + 2 * c);
+                break;
+            }
+            k += 2 + length;
+        }
+        if (says || ids.size() != 6 || (b[ids[0]] == 1 && b[ids[1]] == 2 && b[ids[2]] == 3) ||
+            (b[ids[0]] == 'R' && b[ids[1]] == 'G' && b[ids[2]] == 'B'))
+            return;                                                    // (its first frame says for all)
+        const Uint8 was[3] = { b[ids[0]], b[ids[1]], b[ids[2]] }, now[3] = { 'R', 'G', 'B' };
+        std::vector<Uint8> renamed(b, b + n);
+        for (size_t at : ids)
+            for (int c = 0; c < 3; c++)
+                if (renamed[at] == was[c]) { renamed[at] = now[c]; break; }
+        // (put as its value: DCMTK reads a frame from the file again, not from memory, when it can)
+        item->putUint8Array(renamed.data(), static_cast<unsigned long>(n));
+    }
+}
+
 // GE's private syntax (1.2.840.113619.5.2): implicit VR little endian, its pixels big endian. DCMTK
 // turns those of 16 bits; of 8, in words of 16 too, it takes them as they are, each two the other way
 // round: turned, once, when read
@@ -1731,6 +1792,7 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     OrderBigEndianWords(ff.getDataset());
     im->cutJpeg = trimmed && DcmXfer(ff.getDataset()->getOriginalXfer()).getJPEGProcess8Bit() != 0;
     OrderGePixels(ff);
+    RgbJpegAsRgb(ff.getDataset());
     if (st.bad() && (ff.getDataset()->tagExists(DCM_PixelData) || HasFloatPixels(ff.getDataset()) ||
                      RecoverPixelData(ff.getDataset(), data.data(), data.size())))
     {

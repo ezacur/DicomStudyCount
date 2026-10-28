@@ -33,6 +33,7 @@ std::wstring DecodeSlice(const std::wstring& path, int frame, bool stored, Slice
     const bool cutJpeg = s.cutShort && DcmXfer(ds->getOriginalXfer()).getJPEGProcess8Bit() != 0;
     OrderBigEndianWords(ds);
     OrderGePixels(ff);
+    RgbJpegAsRgb(ds);
     const std::wstring none = NoImage(ff);
     if (!none.empty()) return none;
     Sint32 frames = 1;

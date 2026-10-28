@@ -98,6 +98,7 @@ bool TrimLastFragment(DcmDataset* ds, const std::wstring& path);
 unsigned long PartialAccess(DcmDataset* ds, E_TransferSyntax xfer);
 void OrderBigEndianWords(DcmDataset* ds);
 void OrderGePixels(DcmFileFormat& ff);
+void RgbJpegAsRgb(DcmDataset* ds);
 
 DcmDataset* DecodeDeflatedFrame(DcmDataset* ds, bool multiframe, int frame);
 
