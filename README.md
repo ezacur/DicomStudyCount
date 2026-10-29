@@ -542,7 +542,10 @@ rundll32 .\bin\DicomShell.dll,Explore /report D:\Patients   # what "DICOM > DICO
 
 All of it at once: `-FullClean` (`Uninstall.cmd`), see [Installation](#installation).
 
-The tool never modifies, moves or deletes DICOM files. The problems reports and the index of the counts
+The tool never modifies or deletes DICOM files, and does not move them either: the only exception is
+the quarantine of identical duplicates, which moves copies (never the last one) to a
+`_DicomQuarantine` folder with a log to put them back, and whose interface is disabled (see
+[Notes and limitations](#notes-and-limitations)). The problems reports and the index of the counts
 contain file paths and DICOM UIDs, but no patient names or IDs read from the files (folder names, of
 course, may carry patient information), and they stay on the local machine. The HTML reports of the
 DICOM explorer do carry the patient IDs (and the names, sex and birth dates when *Hide patient
