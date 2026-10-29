@@ -407,17 +407,19 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
 | `bin\explorer4dicoms.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs: `Explorer4Dicoms\` (those of `Explorer4Dicoms.dll`, a file for each part: the count, the DICOM reader, the folder comments and icons, the Explorer columns and views, the index), and those of `DicomShell.dll`, a file for each part - `Shell.h` (what they share), `DicomShell.cpp` (its COM factories and entry points), `HeaderReader`, `Icons`, `Properties`, `Decode`, `Segments` (the SEG and RT Structure Sets: read, found near a file, matched to the plane of an image), `Preview` (its window and interfaces; `Preview*.cpp`, its parts: the tabs, the painting, the stepping, the mouse), `Thumbnails`, `Gather`, `Pixels`, `Export`, `Navigator`, `Plot`, and the DICOM explorer (`Explorer.h`, its class; `Explorer*.cpp`, its parts: the window, the tree, the checks, the navigator, the info, the floating thumbnail, the exports, the report) |
-| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, `New-ListerPlugin.ps1` (the Lister plugin of Total Commander, as a zip it installs), and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
+| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), `New-Release.ps1` (the zip to download), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, `New-ListerPlugin.ps1` (the Lister plugin of Total Commander, as a zip it installs), and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
 | `third_party\` | DCMTK 3.7.1, OpenJPEG 2.5.4, libjxl 0.12.0 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
 
 ## Installation
 
-It is portable: a folder with everything built (`bin\`), nothing to build or download besides.
+It is portable: a folder with everything built (`bin\`), nothing to build or download besides. The
+zip to download, only what it runs with (not the sources):
+<https://github.com/ezacur/explorer4dicoms/releases/latest/download/explorer4dicoms.zip>.
 **Unzip and double-click `Install.cmd`**; to leave the computer as it was, double-click
 `Uninstall.cmd`. Step by step:
 
 1. Put the whole folder in a permanent place, for example `C:\Users\<you>\Tools\explorer4dicoms\`:
-   unzip it there (GitHub: *Code > Download ZIP*), or clone it:
+   unzip there the zip above (or *Code > Download ZIP* of GitHub, with the sources), or clone it:
    ```powershell
    git clone https://github.com/ezacur/explorer4dicoms.git
    ```
