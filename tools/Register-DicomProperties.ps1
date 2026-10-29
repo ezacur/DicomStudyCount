@@ -12,7 +12,9 @@
 param(
     [string]$Dll,
     [switch]$Img,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # The folder of the data of the suite of the user who installs it (its copy of the DLL)
+    [string]$UserData = (Join-Path $env:LOCALAPPDATA 'explorer4dicoms')
 )
 $ErrorActionPreference = 'Stop'
 if (-not (New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
@@ -77,6 +79,11 @@ $hash = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($Dll))[0..7] | ForEach-O
 New-Item -ItemType Directory -Force $dir | Out-Null
 $target = Join-Path $dir "DicomShell-$hash.dll"
 if (-not (Test-Path -LiteralPath $target)) { Copy-Item -LiteralPath $Dll -Destination $target }
+# A -FullClean before may have left the copies of the DLL (in use then) to be deleted at the next
+# restart: installed again, they stay
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'PendingDeletes.ps1')
+$kept = Remove-PendingDeletes -Under $dir, $UserData
+if ($kept) { Write-Host "No longer deleted at the next restart: $kept files and folders of a previous full clean" }
 
 Copy-Item -LiteralPath $schemaSource -Destination $schema -Force
 $hr = [DicomPropsSetup.PropSys]::PSRegisterPropertySchema($schema)

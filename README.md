@@ -412,7 +412,7 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
 | `bin\explorer4dicoms.propdesc` | the definition of those columns |
 | `src\` | the sources of the DLLs: `Explorer4Dicoms\` (those of `Explorer4Dicoms.dll`, a file for each part: the count, the DICOM reader, the folder comments and icons, the Explorer columns and views, the index), and those of `DicomShell.dll`, a file for each part - `Shell.h` (what they share), `DicomShell.cpp` (its COM factories and entry points), `HeaderReader`, `Icons`, `Properties`, `Decode`, `Segments` (the SEG and RT Structure Sets: read, found near a file, matched to the plane of an image), `Preview` (its window and interfaces; `Preview*.cpp`, its parts: the tabs, the painting, the stepping, the mouse), `Thumbnails`, `Gather`, `Pixels`, `Export`, `Navigator`, `Plot`, and the DICOM explorer (`Explorer.h`, its class; `Explorer*.cpp`, its parts: the window, the tree, the checks, the navigator, the info, the floating thumbnail, the exports, the report) |
-| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), `New-Release.ps1` (the zip to download), the registration scripts called by `-Install`, `New-PlaneClouds.ps1`, `New-ListerPlugin.ps1` (the Lister plugin of Total Commander, as a zip it installs), and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
+| `tools\` | `Build.ps1` (builds `bin\` from `src\`, only needed after changing the sources), `New-Release.ps1` (the zip to download), the registration scripts called by `-Install`, `Remove-AtReboot.ps1` and `PendingDeletes.ps1` (what `-FullClean` finds still in use, deleted by Windows at the next restart; `-Install` takes it back), `New-PlaneClouds.ps1`, `New-ListerPlugin.ps1` (the Lister plugin of Total Commander, as a zip it installs), and test helpers (`Test-DicomIcons.ps1`, `Test-DicomPreview.ps1`, `Get-ShellProperties.ps1`; `Test-DicomExplorer.ps1` with `ExplorerTest.cpp`: the DICOM explorer over folders of DICOM files, without its window: the tree, the checks, the thumbnails, the report and the exports, each file written checked) |
 | `third_party\` | DCMTK 3.7.1, OpenJPEG 2.5.4, libjxl 0.12.0 and zlib 1.3.1 (subsets), for the preview and thumbnails; only needed to build `bin\DicomShell.dll` (built once into `build\`, which is not in the repository) |
 
 ## Installation
@@ -469,8 +469,9 @@ It cleans every folder the counts know of (as *Clean*: their comments, icons and
 uninstalls everything, and deletes its data, caches and settings: `%LOCALAPPDATA%\explorer4dicoms`,
 `%TEMP%\explorer4dicoms`, `HKCU\Software\explorer4dicoms`, and (with a UAC prompt)
 `%ProgramFiles%\explorer4dicoms` and `HKLM\SOFTWARE\explorer4dicoms`. It never touches the DICOM files.
-It says what it left: a DLL Explorer still has loaded (restart Explorer or sign out, and run it
-again), a counted folder not found now (a disk not connected), the quarantines (files the counts
+The copies of the DLL that Explorer or the search indexer still have loaded cannot be deleted yet:
+it offers to restart Explorer, which lets them go, and whatever is still there (also if you say no)
+Windows deletes at the next restart (`-Install` before that keeps them). It says what it left: a counted folder not found now (a disk not connected), the quarantines (files the counts
 moved: `-RestoreQuarantine` puts them back). Not touched: the folder of the suite (delete it
 yourself), the thumbnails in the cache of Windows (*Disk Cleanup > Thumbnails*), and the Lister
 plugin if Total Commander installed it.

@@ -201,9 +201,16 @@ if ($Install) {
     if ($Img -or ($propState -and $propState.GetValue('Img') -eq 1)) { $extensions += '.img' }
     $upToDate = $server -and [IO.Path]::GetFileName([string]$server.GetValue('')) -eq "DicomShell-$dllHash.dll" -and
         $preview -and $preview.GetValue('DisableLowILProcessIsolation') -eq 1 -and
-        @($extensions | Where-Object { [string](Get-ItemProperty -LiteralPath "HKLM:\$handlers\$_" -ErrorAction SilentlyContinue).'(default)' -ne '{21329A2B-09B3-4250-9103-9267877321EB}' }).Count -eq 0 -and
+        @($extensions | Where-Object {
+            # (through .NET: a key named "." is the current one for the registry provider of PowerShell)
+            $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$handlers\$_")
+            -not $k -or [string]$k.GetValue('') -ne '{21329A2B-09B3-4250-9103-9267877321EB}' }).Count -eq 0 -and
         (Test-Path -LiteralPath $installedSchema) -and
         ((Get-FileHash -LiteralPath $installedSchema).Hash -eq (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'bin\explorer4dicoms.propdesc')).Hash)
+    # (a -FullClean before may have left the copies of the DLL to be deleted at the next restart: the
+    # elevated part takes that back)
+    . (Join-Path $PSScriptRoot 'tools\PendingDeletes.ps1')
+    $upToDate = $upToDate -and -not @(Get-PendingDeletes -Under (Join-Path $env:ProgramFiles $appName), $appData).Count
     if ($upToDate) { Write-Host 'DICOM columns already installed and up to date' }
     else { Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') (@('-Dll', $shellDll) + @(if ($Img) { '-Img' })) }
     Write-Host 'Installed. Right-click a folder: DICOM >'
@@ -538,21 +545,51 @@ if ($FullClean) {
         else { Write-Host "Not found now (moved, or a disk not connected), left as it is: $r" -ForegroundColor Yellow }
     }
     Invoke-Uninstall -Purge
-    # Its data, caches and settings: what is in use (a DLL Explorer still has loaded) stays, and is said
-    $left = New-Object Collections.Generic.List[string]
-    foreach ($dir in $appData, (Join-Path ([IO.Path]::GetTempPath()) $appName)) {
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $dir) { Get-ChildItem -LiteralPath $dir -Recurse -File -Force | ForEach-Object { $left.Add($_.FullName) } }
+    # Its data, caches and settings
+    $programFolder = Join-Path $env:ProgramFiles $appName
+    function Remove-SuiteData {
+        foreach ($dir in $appData, (Join-Path ([IO.Path]::GetTempPath()) $appName)) {
+            if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        # (the copies of the DLL in %ProgramFiles%: Register-DicomProperties.ps1 -Uninstall deletes those not in use)
+        @($appData, $programFolder | Where-Object { Test-Path -LiteralPath $_ })
     }
     Remove-Item -LiteralPath "HKCU:\Software\$appName" -Recurse -Force -ErrorAction SilentlyContinue
-    foreach ($place in (Join-Path $env:ProgramFiles $appName), "HKLM:\SOFTWARE\$appName") {
-        if (Test-Path -LiteralPath $place) { $left.Add($place) }
+    $left = @(Remove-SuiteData)
+    # What is left is a DLL still loaded by Explorer (icons, thumbnails, preview) or the search indexer
+    # (columns): Explorer restarted lets it go, if wanted
+    if ($left.Count) {
+        Write-Host ''
+        Write-Host 'Explorer still has the DLL of the suite loaded, so it cannot be deleted yet.' -ForegroundColor Yellow
+        $answer = ''
+        try { $answer = Read-Host 'Restart Explorer now to release it? Its windows close and the taskbar reloads (Y/N)' } catch { }
+        if ($answer -match '^\s*[yYsS]') {
+            Get-Process explorer, prevhost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            # (Windows starts the shell again by itself; if not, it is started here)
+            if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+            Start-Sleep -Seconds 2
+            $left = @(Remove-SuiteData)
+        }
     }
+    # Whatever is still there (Explorer not restarted, the search indexer, something that failed): deleted
+    # now if it can be, by Windows at the next restart if not
+    $atRestart = $false
+    if ($left.Count) {
+        Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Remove-AtReboot.ps1') @('-UserData', $appData)
+        . (Join-Path $PSScriptRoot 'tools\PendingDeletes.ps1')
+        $left = @($left | Where-Object { Test-Path -LiteralPath $_ })
+        $atRestart = $left.Count -gt 0 -and @(Get-PendingDeletes -Under $left).Count -gt 0
+    }
+    if (Test-Path -LiteralPath "HKLM:\SOFTWARE\$appName") { $left += "HKLM:\SOFTWARE\$appName" }
     Write-Host ''
     Write-Host ("Full clean: {0:N0} counted folders cleaned, the suite uninstalled, its data and settings deleted." -f $roots.Count)
-    if ($left.Count) {
-        Write-Host 'Still there (in use by Explorer, or administrator rights refused): restart Explorer or sign out, and run -FullClean again:' -ForegroundColor Yellow
+    if ($left.Count -and $atRestart) {
+        Write-Host 'Still in use, deleted by Windows at the next restart (installing again before keeps them):' -ForegroundColor Yellow
+        $left | ForEach-Object { Write-Host "  $_" }
+    }
+    elseif ($left.Count) {
+        Write-Host 'Still there (administrator rights refused): restart the computer and run -FullClean again:' -ForegroundColor Yellow
         $left | ForEach-Object { Write-Host "  $_" }
     }
     if ($quarantines.Count) {

@@ -14,7 +14,8 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # (release\ is not in the repository: the zip goes to the GitHub release)
 if (-not $Out) { $Out = Join-Path $root 'release\explorer4dicoms.zip' }
 $files = @('explorer4dicoms.ps1', 'Install.cmd', 'Uninstall.cmd', 'README.md', 'tutorial.html',
-           'tools\Register-DicomIcons.ps1', 'tools\Register-DicomProperties.ps1', 'tools\New-ListerPlugin.ps1')
+           'tools\Register-DicomIcons.ps1', 'tools\Register-DicomProperties.ps1', 'tools\Remove-AtReboot.ps1',
+           'tools\PendingDeletes.ps1', 'tools\New-ListerPlugin.ps1')
 $files += Get-ChildItem (Join-Path $root 'bin'), (Join-Path $root 'lib') -File | ForEach-Object { $_.FullName.Substring($root.Length + 1) }
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 if (Test-Path -LiteralPath $Out) { Remove-Item -LiteralPath $Out -Force }
