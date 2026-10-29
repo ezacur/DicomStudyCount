@@ -60,6 +60,13 @@ if ($Uninstall) {
     Remove-Key "SOFTWARE\Classes\CLSID\$clsid"
     Remove-Key "SOFTWARE\Classes\CLSID\$previewClsid"
     Remove-Key $state
+    # The copies of the DLL that nothing has loaded (the rest go on a later -Uninstall), and the folder
+    # and the key of the suite once empty
+    Get-ChildItem -LiteralPath $dir -Filter 'DicomShell-*.dll' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    if ((Test-Path -LiteralPath $dir) -and -not (Get-ChildItem -LiteralPath $dir -Force)) { Remove-Item -LiteralPath $dir -Force }
+    $suite = $hklm.OpenSubKey('SOFTWARE\explorer4dicoms')
+    if ($suite -and -not $suite.SubKeyCount -and -not $suite.ValueCount) { $suite.Close(); $hklm.DeleteSubKey('SOFTWARE\explorer4dicoms') }
     Write-Host 'DICOM properties unregistered (Explorer frees the DLL when it restarts).'
     return
 }

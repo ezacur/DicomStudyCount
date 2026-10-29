@@ -6,6 +6,7 @@
 *.cs  text eol=crlf
 *.dll binary
 *.propdesc text eol=crlf
+*.cmd text eol=crlf
 *.png binary
 # Code of others, kept byte for byte as it came (no end-of-line conversion)
 third_party/** -text

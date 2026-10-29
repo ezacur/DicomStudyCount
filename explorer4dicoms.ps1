@@ -25,6 +25,9 @@
     .\explorer4dicoms.ps1 -Install      # context menu + background watcher (-Watch) at logon
     .\explorer4dicoms.ps1 -Install -Img # also DICOM files named .img (remembered)
     .\explorer4dicoms.ps1 -Uninstall
+    .\explorer4dicoms.ps1 -FullClean    # as before the suite: every count cleaned, uninstalled, its data deleted
+.NOTES
+    From a zip: Install.cmd and Uninstall.cmd (-FullClean) of this folder do it with a double click.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
@@ -85,7 +88,12 @@ param(
     [switch]$Img,
 
     [Parameter(ParameterSetName = 'Uninstall', Mandatory = $true)]
-    [switch]$Uninstall
+    [switch]$Uninstall,
+
+    # Leaves the computer as before the suite: -Clean on every counted folder, -Uninstall, and its data,
+    # caches and settings deleted (never the DICOM files, nor the quarantines)
+    [Parameter(ParameterSetName = 'FullClean', Mandatory = $true)]
+    [switch]$FullClean
 )
 
 $ErrorActionPreference = 'Stop'
@@ -205,7 +213,7 @@ if ($Install) {
     return
 }
 
-if ($Uninstall) {
+function Invoke-Uninstall([switch]$Purge) {
     Remove-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
     Stop-Watcher
     foreach ($parent in $menuParents) {
@@ -215,10 +223,17 @@ if ($Uninstall) {
     Remove-Item -LiteralPath "HKCU:\Software\$appName\Explorer" -Recurse -Force -ErrorAction SilentlyContinue
     # The reports of the explorer, in a temporary folder of their own
     Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "$appName\reports") -Recurse -Force -ErrorAction SilentlyContinue
-    if ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\$appName\PropertyHandler")) {
+    # (with -Purge also the copies of the DLL in %ProgramFiles%, when they are all that is left there)
+    if ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\$appName\PropertyHandler") -or
+        ($Purge -and ([Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\$appName") -or
+                      (Test-Path -LiteralPath (Join-Path $env:ProgramFiles $appName))))) {
         Invoke-Elevated (Join-Path $PSScriptRoot 'tools\Register-DicomProperties.ps1') @('-Uninstall')
     }
     Write-Host 'Uninstalled.'
+}
+
+if ($Uninstall) {
+    Invoke-Uninstall
     return
 }
 
@@ -457,6 +472,98 @@ function Test-HasDicomComments([string]$dir) {
     return $false
 }
 
+# Leaves Explorer as if the folder and its subfolders had never been counted (-Clean)
+function Invoke-Clean([string]$root) {
+    Stop-CountsOn $root
+    # Comments, icons, folder type and the attributes added to the folders
+    $cleared = 0
+    foreach ($ini in Get-DesktopIniFiles $root) { if ([Explorer4Dicoms.FolderComments]::Clear($ini.DirectoryName)) { $cleared++ } }
+    # The count also added the column to the parent folder: removed there too, unless other
+    # folders in it still have comments
+    $parent = Split-Path -Path $root -Parent
+    $parentToo = $parent -and -not (Test-HasDicomComments $parent)
+    Hide-CommentColumn $root -Parent:$parentToo
+    $views = [Explorer4Dicoms.ViewBags]::RemoveCommentColumn($root, $true)
+    if ($parentToo) { $views += [Explorer4Dicoms.ViewBags]::RemoveCommentColumn($parent, $false) }
+    # Copies in other locations will no longer point here, and the reports of the counts made
+    # inside the folder are deleted
+    $forgotten = [Explorer4Dicoms.CountedData]::ForgetIndex($indexDir, $root)
+    [void][Explorer4Dicoms.CountedData]::ForgetCopies($copiesDir, $root)
+    $reports = 0
+    foreach ($file in Get-ChildItem -LiteralPath $reportDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+        try { $reportRoot = (Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json).Root } catch { continue }
+        if ($reportRoot -and [Explorer4Dicoms.Paths]::IsUnder($reportRoot, $root)) {
+            Remove-Item -LiteralPath $file.FullName -Force
+            $reports++
+        }
+    }
+    Write-Host "Cleaned $root"
+    Write-Host ("  Folders with comments and icons removed: {0:N0}" -f $cleared)
+    Write-Host ("  Saved Explorer views without the Comments column: {0:N0}" -f $views)
+    Write-Host ("  Files forgotten in the index of counted locations: {0:N0}" -f $forgotten)
+    Write-Host ("  Problems reports deleted: {0:N0}" -f $reports)
+}
+
+# The folders the counts know of (their index, copies and problems reports), outermost first
+function Get-CountedRoots {
+    $roots = New-Object Collections.Generic.List[string]
+    foreach ($dir in $indexDir, $copiesDir) {
+        foreach ($file in Get-ChildItem -LiteralPath $dir -Filter '*.tsv' -ErrorAction SilentlyContinue) {
+            # (their first line: "#root<TAB>folder")
+            $f = @((Get-Content -LiteralPath $file.FullName -TotalCount 1 -Encoding UTF8 -ErrorAction SilentlyContinue) -split "`t")
+            if ($f.Count -eq 2 -and $f[0] -eq '#root' -and $f[1]) { $roots.Add($f[1]) }
+        }
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $reportDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+        try { $r = (Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json).Root; if ($r) { $roots.Add($r) } } catch { }
+    }
+    $outer = New-Object Collections.Generic.List[string]
+    foreach ($r in $roots | Sort-Object Length, { $_ } -Unique) {
+        if (-not @($outer | Where-Object { [Explorer4Dicoms.Paths]::IsUnder($r, $_) }).Count) { $outer.Add($r) }
+    }
+    $outer
+}
+
+# Leaves the computer as before the suite (-FullClean): every counted folder cleaned, everything
+# uninstalled, and its data, caches and settings deleted. Never the DICOM files, nor the quarantines
+# (files the counts moved there: they are said, to restore or delete by hand).
+if ($FullClean) {
+    Stop-Watcher
+    $roots = @(Get-CountedRoots)
+    $quarantines = New-Object Collections.Generic.List[string]
+    foreach ($r in $roots) {
+        $base = Get-QuarantineBase $r
+        if (Test-Path -LiteralPath $base) { $quarantines.Add($base) }
+        if (Test-Path -LiteralPath $r -PathType Container) { Invoke-Clean $r }
+        else { Write-Host "Not found now (moved, or a disk not connected), left as it is: $r" -ForegroundColor Yellow }
+    }
+    Invoke-Uninstall -Purge
+    # Its data, caches and settings: what is in use (a DLL Explorer still has loaded) stays, and is said
+    $left = New-Object Collections.Generic.List[string]
+    foreach ($dir in $appData, (Join-Path ([IO.Path]::GetTempPath()) $appName)) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $dir) { Get-ChildItem -LiteralPath $dir -Recurse -File -Force | ForEach-Object { $left.Add($_.FullName) } }
+    }
+    Remove-Item -LiteralPath "HKCU:\Software\$appName" -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($place in (Join-Path $env:ProgramFiles $appName), "HKLM:\SOFTWARE\$appName") {
+        if (Test-Path -LiteralPath $place) { $left.Add($place) }
+    }
+    Write-Host ''
+    Write-Host ("Full clean: {0:N0} counted folders cleaned, the suite uninstalled, its data and settings deleted." -f $roots.Count)
+    if ($left.Count) {
+        Write-Host 'Still there (in use by Explorer, or administrator rights refused): restart Explorer or sign out, and run -FullClean again:' -ForegroundColor Yellow
+        $left | ForEach-Object { Write-Host "  $_" }
+    }
+    if ($quarantines.Count) {
+        Write-Host 'Quarantines left as they are (files the counts moved there; -RestoreQuarantine puts a batch back):' -ForegroundColor Yellow
+        $quarantines | ForEach-Object { Write-Host "  $_" }
+    }
+    Write-Host 'Not touched: this folder (delete it yourself), the thumbnails Windows keeps in its cache (Disk Cleanup >'
+    Write-Host 'Thumbnails), and the Lister plugin if Total Commander installed it (its plugins folder and wincmd.ini).'
+    return
+}
+
 if ($RestoreQuarantine) {
     $r = Restore-Quarantine $RestoreQuarantine.TrimEnd('\')
     Write-Host ("Restored {0:N0} files ({1:N0} skipped: already back or missing)" -f $r.Restored, $r.Skipped)
@@ -545,34 +652,7 @@ try {
     }
 
     if ($Clean) {
-        Stop-CountsOn $root
-        # Comments, icons, folder type and the attributes added to the folders
-        $cleared = 0
-        foreach ($ini in Get-DesktopIniFiles $root) { if ([Explorer4Dicoms.FolderComments]::Clear($ini.DirectoryName)) { $cleared++ } }
-        # The count also added the column to the parent folder: removed there too, unless other
-        # folders in it still have comments
-        $parent = Split-Path -Path $root -Parent
-        $parentToo = $parent -and -not (Test-HasDicomComments $parent)
-        Hide-CommentColumn $root -Parent:$parentToo
-        $views = [Explorer4Dicoms.ViewBags]::RemoveCommentColumn($root, $true)
-        if ($parentToo) { $views += [Explorer4Dicoms.ViewBags]::RemoveCommentColumn($parent, $false) }
-        # Copies in other locations will no longer point here, and the reports of the counts made
-        # inside the folder are deleted
-        $forgotten = [Explorer4Dicoms.CountedData]::ForgetIndex($indexDir, $root)
-        [void][Explorer4Dicoms.CountedData]::ForgetCopies($copiesDir, $root)
-        $reports = 0
-        foreach ($file in Get-ChildItem -LiteralPath $reportDir -Filter '*.json' -ErrorAction SilentlyContinue) {
-            try { $reportRoot = (Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json).Root } catch { continue }
-            if ($reportRoot -and [Explorer4Dicoms.Paths]::IsUnder($reportRoot, $root)) {
-                Remove-Item -LiteralPath $file.FullName -Force
-                $reports++
-            }
-        }
-        Write-Host "Cleaned $root"
-        Write-Host ("  Folders with comments and icons removed: {0:N0}" -f $cleared)
-        Write-Host ("  Saved Explorer views without the Comments column: {0:N0}" -f $views)
-        Write-Host ("  Files forgotten in the index of counted locations: {0:N0}" -f $forgotten)
-        Write-Host ("  Problems reports deleted: {0:N0}" -f $reports)
+        Invoke-Clean $root
         return
     }
 

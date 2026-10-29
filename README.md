@@ -401,6 +401,7 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 | Path | What |
 |---|---|
 | `explorer4dicoms.ps1` | the tool: context menu, count, tree window, install |
+| `Install.cmd`, `Uninstall.cmd` | install it from this folder with a double click (also from a zip), and leave the computer as before it (`-FullClean`) |
 | `lib\TreeWindow.ps1` | its tree window (*Show tree*), loaded by it only for that |
 | `bin\Explorer4Dicoms.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
@@ -411,19 +412,23 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 
 ## Installation
 
-1. Copy (or clone) the whole folder to a permanent place, for example
-   `C:\Users\<you>\Tools\explorer4dicoms\`. The context menu points to that path, so run `-Install`
-   again if you move it.
+It is portable: a folder with everything built (`bin\`), nothing to build or download besides.
+**Unzip and double-click `Install.cmd`**; to leave the computer as it was, double-click
+`Uninstall.cmd`. Step by step:
+
+1. Put the whole folder in a permanent place, for example `C:\Users\<you>\Tools\explorer4dicoms\`:
+   unzip it there (GitHub: *Code > Download ZIP*), or clone it:
    ```powershell
    git clone https://github.com/ezacur/explorer4dicoms.git
    ```
-2. If it was downloaded as a zip, unblock its files:
+   The context menu points to that folder, so install again if you move it.
+2. Double-click `Install.cmd` (Windows may ask whether to run a file downloaded from the Internet). It
+   removes the "downloaded from the Internet" mark from the files of the folder (from a zip Windows
+   would not run them otherwise) and installs the context menu, the background watcher, and the icons
+   and columns of the DICOM files (a UAC prompt for the columns; restart Explorer to see them). The
+   same from PowerShell:
    ```powershell
-   Get-ChildItem -Recurse | Unblock-File
-   ```
-3. Install the context menu, the background watcher, and the icons and columns of the DICOM files
-   (a UAC prompt for the columns; restart Explorer to see them):
-   ```powershell
+   Get-ChildItem -Recurse | Unblock-File     # only when it came as a zip
    powershell -NoProfile -ExecutionPolicy Bypass -File .\explorer4dicoms.ps1 -Install
    ```
    It covers `.dcm`, `.ima`, `.dicom` and files without extension; add `-Img` for DICOM files named
@@ -442,10 +447,25 @@ On Windows 11 the **DICOM** submenu is under **Show more options** (or Shift+F10
 folder (a new version, a `git pull`), run `-Install` again: it registers the new DLLs, and asks for
 administrator rights only if the columns changed.
 
-To remove the context menu and the watcher:
+To remove the context menu, the watcher, and the icons, preview and columns of the DICOM files
+(the counts stay written in their folders, and its data in `%LOCALAPPDATA%`):
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\explorer4dicoms.ps1 -Uninstall
 ```
+
+To leave the computer as it was before the suite (`Uninstall.cmd`, which asks first):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\explorer4dicoms.ps1 -FullClean
+```
+It cleans every folder the counts know of (as *Clean*: their comments, icons and the Comments column),
+uninstalls everything, and deletes its data, caches and settings: `%LOCALAPPDATA%\explorer4dicoms`,
+`%TEMP%\explorer4dicoms`, `HKCU\Software\explorer4dicoms`, and (with a UAC prompt)
+`%ProgramFiles%\explorer4dicoms` and `HKLM\SOFTWARE\explorer4dicoms`. It never touches the DICOM files.
+It says what it left: a DLL Explorer still has loaded (restart Explorer or sign out, and run it
+again), a counted folder not found now (a disk not connected), the quarantines (files the counts
+moved: `-RestoreQuarantine` puts them back). Not touched: the folder of the suite (delete it
+yourself), the thumbnails in the cache of Windows (*Disk Cleanup > Thumbnails*), and the Lister
+plugin if Total Commander installed it.
 
 ## Usage
 
@@ -511,6 +531,8 @@ rundll32 .\bin\DicomShell.dll,Explore /report D:\Patients   # what "DICOM > DICO
 | Icons, thumbnails and preview of the DICOM files | `%LOCALAPPDATA%\explorer4dicoms\shellext\` (a copy of `bin\DicomShell.dll`), `HKCU\...\PreviewHandlers`, `HKCU\Software\Classes` (its CLSIDs, the `Explorer4Dicoms.*` file types, `.dcm`, `.ima`, `.dicom` and `.` when no other program owned them, the icon, thumbnail and preview handlers over the class of the program that owns one, and `SystemFileAssociations\.dcm`, `.ima`, `.dicom`), `HKCU\Software\explorer4dicoms\Chain` (what those programs had), and `HKCU\Software\explorer4dicoms\Preview` (the split of the preview, its *Overlay* check box, and its tab for each folder) | `-Uninstall` (Explorer frees the DLL when it restarts) |
 | Columns of the DICOM files | `%ProgramFiles%\explorer4dicoms\` (the DLL and the column schema), `HKLM\SOFTWARE\Classes\CLSID` (the property handler, and the medium integrity of the preview), the property handlers of `.dcm`, `.ima`, `.dicom` and `.` (and `.img` with `-Img`; the one another program had is kept in `HKLM\SOFTWARE\explorer4dicoms\PropertyHandler\Chain` and gets its files back) and the registered schema | `-Uninstall` (asks for administrator rights) |
 | Copies of every file ("duplicated in") | `%LOCALAPPDATA%\explorer4dicoms\duplicates\` (one TSV per counted folder, only the files with copies) | `-Clean`, or delete the folder |
+
+All of it at once: `-FullClean` (`Uninstall.cmd`), see [Installation](#installation).
 
 The tool never modifies, moves or deletes DICOM files. The problems reports and the index of the counts
 contain file paths and DICOM UIDs, but no patient names or IDs read from the files (folder names, of
