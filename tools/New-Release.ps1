@@ -21,6 +21,7 @@ if ($Tutorial) {
 }
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 if (Test-Path -LiteralPath $Out) { Remove-Item -LiteralPath $Out -Force }
+New-Item -ItemType Directory -Force (Split-Path -Parent ([IO.Path]::GetFullPath($Out))) | Out-Null
 $zip = [IO.Compression.ZipFile]::Open($Out, 'Create')
 try {
     # (names with '/', as zips have them: Windows PowerShell 5.1 would write '\')
