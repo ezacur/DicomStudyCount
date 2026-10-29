@@ -1,3 +1,5 @@
 # The DLLs of bin\ are in the repository on purpose (no build needed to use the tool).
 # DCMTK built from third_party\ by tools\Build.ps1 (static libraries, kept between builds)
 build/
+# The zip of tools\New-Release.ps1, for the GitHub release
+release/

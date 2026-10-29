@@ -5,14 +5,14 @@
     Lister plugin, README.md) and the tutorial (tutorial.html, one file), in a folder explorer4dicoms\.
     Unzipped, Install.cmd installs it.
 .EXAMPLE
-    .\tools\New-Release.ps1                         # build\explorer4dicoms.zip
+    .\tools\New-Release.ps1                         # release\explorer4dicoms.zip
     .\tools\New-Release.ps1 -Out C:\temp\explorer4dicoms.zip
 #>
 param([string]$Out)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-# (build\ is not in the repository)
-if (-not $Out) { $Out = Join-Path $root 'build\explorer4dicoms.zip' }
+# (release\ is not in the repository: the zip goes to the GitHub release)
+if (-not $Out) { $Out = Join-Path $root 'release\explorer4dicoms.zip' }
 $files = @('explorer4dicoms.ps1', 'Install.cmd', 'Uninstall.cmd', 'README.md', 'tutorial.html',
            'tools\Register-DicomIcons.ps1', 'tools\Register-DicomProperties.ps1', 'tools\New-ListerPlugin.ps1')
 $files += Get-ChildItem (Join-Path $root 'bin'), (Join-Path $root 'lib') -File | ForEach-Object { $_.FullName.Substring($root.Length + 1) }
