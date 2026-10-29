@@ -24,13 +24,16 @@ found: studies split across folders, duplicated images, incomplete series and co
 locations. Folders with DICOM get an archive box icon in the color of their study. **DICOM > Show
 tree** opens the whole folder tree with one color per study.
 
-![Comments column in Explorer](docs/explorer-comments.png)
+![Comments column in Explorer](readme_explorer-comments.png)
 
-![DICOM tree](docs/tree.png)
+![DICOM tree](readme_tree.png)
 
-![Problems](docs/problems.png)
+![Problems](readme_problems.png)
 
 *Screenshots made with public DICOM test data (OHIF, NCI Imaging Data Commons, NEMA, Weasis), arranged as a real archive is: no patient of ours.*
+
+A tutorial in Spanish, with screenshots and videos of every part: [`tutorial.html`](tutorial.html), one
+file that needs nothing else (download it and open it in a browser).
 
 ## Features
 
@@ -402,6 +405,8 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 |---|---|
 | `explorer4dicoms.ps1` | the tool: context menu, count, tree window, install |
 | `Install.cmd`, `Uninstall.cmd` | install it from this folder with a double click (also from a zip), and leave the computer as before it (`-FullClean`) |
+| `tutorial.html` | the tutorial in Spanish, its images and videos inside it (public test data) |
+| `readme_*.png` | the screenshots of this README |
 | `lib\TreeWindow.ps1` | its tree window (*Show tree*), loaded by it only for that |
 | `bin\Explorer4Dicoms.dll` | its C# part: DICOM header reader, count, folder comments and icons, Explorer columns |
 | `bin\DicomShell.dll` | the icons, columns and preview of the DICOM files (C++, loaded by Explorer) |
@@ -414,7 +419,7 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 
 It is portable: a folder with everything built (`bin\`), nothing to build or download besides. The
 zip to download, only what it runs with (not the sources) and a tutorial in Spanish
-(`tutorial.html`, one file with its images and videos inside, made with public test data):
+(`tutorial.html`):
 <https://github.com/ezacur/explorer4dicoms/releases/latest/download/explorer4dicoms.zip>.
 **Unzip and double-click `Install.cmd`**; to leave the computer as it was, double-click
 `Uninstall.cmd`. Step by step:
