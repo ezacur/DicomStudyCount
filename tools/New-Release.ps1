@@ -3,7 +3,7 @@
     Makes the zip to download and use the suite: only what it runs with (explorer4dicoms.ps1,
     Install.cmd, Uninstall.cmd, bin\, lib\, the scripts of tools\ that -Install calls and the one of the
     Lister plugin, README.md), in a folder explorer4dicoms\. Unzipped, Install.cmd installs it. With
-    -Tutorial, also tutorial\ when it is there (it is not in the repository).
+    -Tutorial, also tutorial\ (it is not in the repository; its screenshots must show public data only).
 .EXAMPLE
     .\tools\New-Release.ps1                         # %TEMP%\explorer4dicoms.zip
     .\tools\New-Release.ps1 -Tutorial -Out C:\temp\explorer4dicoms.zip

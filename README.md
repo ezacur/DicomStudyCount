@@ -413,7 +413,8 @@ goes to `%LOCALAPPDATA%\explorer4dicoms\`, and the reports of the DICOM explorer
 ## Installation
 
 It is portable: a folder with everything built (`bin\`), nothing to build or download besides. The
-zip to download, only what it runs with (not the sources):
+zip to download, only what it runs with (not the sources) and a tutorial in Spanish
+(`tutorial\index.html`, its screenshots made with public test data):
 <https://github.com/ezacur/explorer4dicoms/releases/latest/download/explorer4dicoms.zip>.
 **Unzip and double-click `Install.cmd`**; to leave the computer as it was, double-click
 `Uninstall.cmd`. Step by step:
