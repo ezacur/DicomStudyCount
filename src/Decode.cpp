@@ -1858,11 +1858,11 @@ Rendered RenderDicom(const std::vector<char>& data, Render what)
     }
     if (st.bad())
     {
-        // Deflated files: this DCMTK has no zlib (as the one of I3Dfileformat)
+        // Deflated files whose deflated part DCMTK could not inflate (broken, or cut short)
         const char deflate[] = "1.2.840.10008.1.2.1.99";
         bool deflated = std::search(data.begin(), data.begin() + (data.size() < 4096 ? data.size() : 4096),
                                     deflate, deflate + sizeof(deflate) - 1) != data.begin() + (data.size() < 4096 ? data.size() : 4096);
-        r.summary = deflated ? L"Deflated DICOM: not shown by this preview" : L"Not readable as DICOM: " + Widen(st.text());
+        r.summary = deflated ? L"Deflated DICOM not readable: " + Widen(st.text()) : L"Not readable as DICOM: " + Widen(st.text());
         return r;
     }
     // (its pixels there, but cut short: the bytes there are, and zeros)

@@ -54,7 +54,7 @@ if ($Zlib -or ($Cpp -and -not (Test-Path (Join-Path $zlibInstall 'lib\zlib_o.lib
     $Dcmtk = $true                                  # (DCMTK again, with it)
 }
 
-# DCMTK from third_party\dcmtk-*, as static libraries: the subset and options of I3Dfileformat
+# DCMTK from third_party\dcmtk-*, as static libraries: a subset of its modules
 # (builtin dictionary, no OpenSSL / PNG / TIFF / XML / iconv, wide file names) with zlib (deflated
 # datasets) and oficonv (the character sets of DICOM text; its tables built in, no data files), and
 # the static C runtime (/MT), the one of DicomShell.dll, which must not need a VC++ redistributable.

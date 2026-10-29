@@ -145,6 +145,15 @@ tree** opens the whole folder tree with one color per study.
   Foundation): H.264 comes with Windows; MPEG-2 and HEVC need the *MPEG-2 Video Extension* and the
   *HEVC Video Extensions* of the Microsoft Store, and it says so when they are missing. Files without
   pixels (reports, PDFs, presentation states) say so.
+  The **pixel values** are those of the file, as `dicomread` of MATLAB gives them (checked over a
+  corpus of 666,679 files, the same image in 644,970 and in the rest for known reasons): the stored
+  word as it is, without cutting it to BitsStored nor extending its sign (an MR saturated at 4096 with
+  12 bits stored stays bright, instead of black dots), but for the overlay planes hidden in its high
+  bits, taken out from their bit up. Also: JPEG 2000 signed when its codestream or its header says so;
+  32-bit big-endian words and the private syntax of GE in their order; an RGB JPEG whose markers say
+  nothing, as RGB; 1-bit images as 0 and 1. A file cut short shows as much of its image as it has
+  and zeros after it, never pixels made up or of another file, and says
+  so; its exports say it too. Uncompressed pixel data shorter than one image is no image.
   Windows runs it in a process of its own (`prevhost.exe`), at medium integrity rather than the
   usual low one: the low one cannot reach the Explorer window, and the *Columns* tab needs it.
 - **In Total Commander's Lister** (F3, and Ctrl+Q in a panel): the same preview, as a Lister plugin.
@@ -380,6 +389,8 @@ tree** opens the whole folder tree with one color per study.
   `bin\`.
 - Administrator rights only for the columns of the DICOM files (Windows registers them for the whole
   machine); everything else is installed for the current user (`HKCU`).
+- To build the DLLs again (`tools\Build.ps1`), only the Visual Studio C++ build tools (x64): the
+  libraries they use are in `third_party\`, nothing from outside the repository, from any folder.
 
 ## The folder
 

@@ -25,7 +25,7 @@ makes from `zconf.h.cmakein` and would otherwise rename in this folder) and `win
 `test`, `examples`, documentation and the other platforms. Licence: zlib (`zlib-1.3.1\LICENSE`).
 
 `dcmtk-3.7.1` comes from the official repository, tag `DCMTK-3.7.1` (cloned 2026-10-27), with the same
-subset as the 3.7.0 before it (the one of `C:\repos\I3Dfileformat`); see its `ORIGIN.txt` for the commit
+subset as the 3.7.0 before it; see its `ORIGIN.txt` for the commit
 and what was left out. Licence: BSD-style (`dcmtk-3.7.1\COPYRIGHT`), with the IJG and CharLS notices inside.
 
 `libjxl-0.12.0` comes from the official repository, `git clone --depth 1 --branch v0.12.0
