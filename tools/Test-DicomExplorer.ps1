@@ -56,11 +56,14 @@ try {
     $exe = Join-Path $work 'ExplorerTest.exe'
     $sources = ((@(Join-Path $root 'tools\ExplorerTest.cpp') + (Get-ChildItem (Join-Path $root 'src') -Filter *.cpp).FullName) |
         ForEach-Object { '"{0}"' -f $_ }) -join ' '
-    $cl = ('cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DOPJ_STATIC /DJXL_STATIC_DEFINE /external:W0 /external:I "{0}" /external:I "{1}"' +
+    $cl = ('/nologo /MP /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DOPJ_STATIC /DJXL_STATIC_DEFINE /external:W0 /external:I "{0}" /external:I "{1}"' +
            ' /external:I "{6}" /external:I "{7}" {2} /Fo"{3}\\" /Fe"{4}" /link {5} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib') -f
         (Join-Path $dcmtkInstall 'include'), $openJpegInclude, $sources, $work, $exe, $libs,
         (Join-Path $zlibInstall 'include'), (Join-Path $jxlInstall 'include')
-    cmd /c "`"$vcvars`" >nul 2>nul && $cl 2>&1" | Where-Object { $_ -match 'error|warning' } | ForEach-Object { Write-Host $_ }
+    # (in a response file: from a deep folder the line passes the 8191 characters of cmd)
+    $rsp = Join-Path $work 'cl.rsp'
+    [IO.File]::WriteAllText($rsp, $cl, [Text.Encoding]::Unicode)
+    cmd /c "`"$vcvars`" >nul 2>nul && cl @`"$rsp`" 2>&1" | Where-Object { $_ -match 'error|warning' } | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "The test did not build ($LASTEXITCODE)" }
 
     # (DCMTK writes its warnings about odd files to stderr: not wanted here, and in Windows PowerShell 5.1

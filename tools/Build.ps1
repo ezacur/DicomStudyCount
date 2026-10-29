@@ -185,11 +185,14 @@ if ($Cpp) {
         $openJpegInclude = (Get-ChildItem (Join-Path $openJpegInstall 'include') -Directory | Select-Object -First 1).FullName
         # (all the parts of src\, at once: /MP)
         $sources = (Get-ChildItem (Join-Path $root 'src') -Filter *.cpp | ForEach-Object { '"{0}"' -f $_.FullName }) -join ' '
-        $cl = ('cl /nologo /MP /std:c++17 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DOPJ_STATIC /DJXL_STATIC_DEFINE /external:W0 /external:I "{3}"' +
+        $cl = ('/nologo /MP /std:c++17 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DOPJ_STATIC /DJXL_STATIC_DEFINE /external:W0 /external:I "{3}"' +
                ' /external:I "{5}" /external:I "{6}" /external:I "{7}" /LD {0} /Fo"{1}/" /Fe"{2}" /link {4} ws2_32.lib netapi32.lib advapi32.lib iphlpapi.lib delayimp.lib /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll') -f
             $sources, $work, (Join-Path $work 'DicomShell.dll'), (Join-Path $dcmtkInstall 'include'), $libs,
             $openJpegInclude, (Join-Path $zlibInstall 'include'), (Join-Path $jxlInstall 'include')
-        cmd /c "`"$vcvars`" >nul 2>nul && $cl 2>&1" | ForEach-Object { Write-Host $_ }
+        # (in a response file: from a deep folder the line passes the 8191 characters of cmd)
+        $rsp = Join-Path $work 'cl.rsp'
+        [IO.File]::WriteAllText($rsp, $cl, [Text.Encoding]::Unicode)
+        cmd /c "`"$vcvars`" >nul 2>nul && cl @`"$rsp`" 2>&1" | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { throw "C++ build failed ($LASTEXITCODE)" }
         Copy-Item -LiteralPath (Join-Path $work 'DicomShell.dll') -Destination (Join-Path $bin 'DicomShell.dll') -Force
         Write-Host "Built $(Join-Path $bin 'DicomShell.dll')"
