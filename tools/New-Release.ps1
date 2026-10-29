@@ -7,12 +7,14 @@
     one file that needs nothing else (tutorial\ is not in the repository; its screenshots must show public
     data only).
 .EXAMPLE
-    .\tools\New-Release.ps1                         # %TEMP%\explorer4dicoms.zip
-    .\tools\New-Release.ps1 -Tutorial -Out C:\temp\explorer4dicoms.zip
+    .\tools\New-Release.ps1 -Tutorial               # build\explorer4dicoms.zip
+    .\tools\New-Release.ps1 -Out C:\temp\explorer4dicoms.zip
 #>
-param([string]$Out = (Join-Path ([IO.Path]::GetTempPath()) 'explorer4dicoms.zip'), [switch]$Tutorial)
+param([string]$Out, [switch]$Tutorial)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+# (build\ is not in the repository)
+if (-not $Out) { $Out = Join-Path $root 'build\explorer4dicoms.zip' }
 $files = @('explorer4dicoms.ps1', 'Install.cmd', 'Uninstall.cmd', 'README.md',
            'tools\Register-DicomIcons.ps1', 'tools\Register-DicomProperties.ps1', 'tools\New-ListerPlugin.ps1')
 $files += Get-ChildItem (Join-Path $root 'bin'), (Join-Path $root 'lib') -File | ForEach-Object { $_.FullName.Substring($root.Length + 1) }
